@@ -110,7 +110,6 @@ async fn stream_ffmpeg(
     let fps = config.fps.to_string();
     let desktop_duplication_fps = (u32::from(config.fps) * 5 / 4).to_string();
     let gop = (u32::from(config.fps) * 2).to_string();
-    let (level, _) = config.h264_level();
     let scale = if config.ffmpeg_capture_mode == "ddagrab" {
         format!(
             "scale_d3d11=width={}:height={}:format=nv12,setpts=N/({}*TB)",
@@ -203,8 +202,6 @@ async fn stream_ffmpeg(
         [
             "-profile:v",
             profile,
-            "-level:v",
-            level,
             "-rc",
             "cbr",
             "-b:v",

@@ -130,6 +130,10 @@ impl HostConfig {
         };
         let scale = (viewport_width as f64 / source_width as f64)
             .min(viewport_height as f64 / source_height as f64)
+            // width/height are the validated encoder ceiling. High-DPI Safari
+            // viewports can exceed the source's safe H.264/NVENC level.
+            .min(self.width as f64 / source_width as f64)
+            .min(self.height as f64 / source_height as f64)
             .min(1.0);
         let even = |value: f64| ((value.floor() as u32).max(2) / 2) * 2;
         let mut session = self.as_ref().clone();
@@ -216,5 +220,12 @@ mod tests {
     fn fits_complete_display_inside_landscape_browser() {
         let fitted = config().for_viewport(Some(844), Some(339));
         assert_eq!((fitted.width, fitted.height), (542, 338));
+    }
+
+    #[test]
+    fn caps_high_dpi_browser_at_encoder_ceiling() {
+        let fitted = config().for_viewport(Some(5120), Some(3200));
+        assert_eq!((fitted.width, fitted.height), (1920, 1200));
+        assert_eq!(fitted.h264_level(), ("5.0", "32"));
     }
 }
