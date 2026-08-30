@@ -66,9 +66,15 @@ non-local deployment, terminate TLS at Nginx and use `https://`/`wss://` only.
 The launcher's NVIDIA path follows Sunshine's low-latency encode architecture: capture the
 complete physical primary display with DXGI Desktop Duplication → D3D11 GPU scaling/NV12 →
 NVENC H.264 sized to the browser's physical video area → WebRTC. The output preserves the
-display aspect ratio, never crops the source, and is capped at the configured 1920x1200 encoder
-ceiling for high-DPI browser compatibility. It uses a one-frame CBR buffer, two encoder surfaces,
-forced IDR frames and zero-latency tuning. Capture, D3D11 conversion, NVENC and WASAPI are
+display aspect ratio, never crops the source, and can stream the full physical primary-display
+resolution to a high-DPI browser. Bitrate scales with the requested pixel count up to 20 Mbps,
+which keeps 60 FPS ahead of the WebRTC sender instead of queuing oversized encoded frames.
+It uses NVENC's quality-oriented low-latency P4 preset, spatial AQ, a one-frame CBR buffer, two
+encoder surfaces, forced IDR frames and zero-latency tuning. A one-frame backpressured handoff
+prevents a stale-frame queue while preserving every encoded H.264 reference frame. The
+source-driven sender avoids
+the frame-loss beat pattern caused by sampling capture with a second independent timer.
+Capture, D3D11 conversion, NVENC and WASAPI are
 gated by WebRTC connection state: none of them starts while the Host is idle, and a normal
 disconnect stops them immediately. The browser requests the smallest supported playout
 buffer, and the Host uses exact 60 Hz timestamps to minimize frame jitter.

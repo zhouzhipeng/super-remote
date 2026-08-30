@@ -139,6 +139,12 @@ impl HostConfig {
         let mut session = self.as_ref().clone();
         session.width = even(source_width as f64 * scale);
         session.height = even(source_height as f64 * scale);
+        let ceiling_pixels = u64::from(self.width) * u64::from(self.height);
+        let session_pixels = u64::from(session.width) * u64::from(session.height);
+        let minimum_bitrate = u64::from(self.bitrate).min(8_000_000);
+        session.bitrate = (u64::from(self.bitrate) * session_pixels)
+            .div_ceil(ceiling_pixels)
+            .clamp(minimum_bitrate, u64::from(self.bitrate)) as u32;
         Arc::new(session)
     }
 
@@ -193,10 +199,10 @@ mod tests {
             device_id: "device".into(),
             device_name: "desktop".into(),
             device_token: "x".repeat(24),
-            width: 1920,
-            height: 1200,
+            width: 2560,
+            height: 1600,
             fps: 60,
-            bitrate: 14_000_000,
+            bitrate: 20_000_000,
             monitor_index: 0,
             h264_file: None,
             ffmpeg_path: None,
@@ -214,6 +220,7 @@ mod tests {
     fn fits_complete_display_inside_portrait_browser() {
         let fitted = config().for_viewport(Some(390), Some(793));
         assert_eq!((fitted.width, fitted.height), (390, 242));
+        assert_eq!(fitted.bitrate, 8_000_000);
     }
 
     #[test]
@@ -223,9 +230,10 @@ mod tests {
     }
 
     #[test]
-    fn caps_high_dpi_browser_at_encoder_ceiling() {
+    fn high_dpi_browser_receives_full_physical_display() {
         let fitted = config().for_viewport(Some(5120), Some(3200));
-        assert_eq!((fitted.width, fitted.height), (1920, 1200));
-        assert_eq!(fitted.h264_level(), ("5.0", "32"));
+        assert_eq!((fitted.width, fitted.height), (2560, 1600));
+        assert_eq!(fitted.bitrate, 20_000_000);
+        assert_eq!(fitted.h264_level(), ("5.1", "33"));
     }
 }

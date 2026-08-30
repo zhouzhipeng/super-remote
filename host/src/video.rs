@@ -14,10 +14,8 @@ use rtc::{
     media::{Sample, io::h26x_reader::H26xSampleReader},
     rtp_transceiver::PayloadType,
 };
-use tokio::{
-    sync::{mpsc, mpsc::error::TrySendError, watch},
-    time::MissedTickBehavior,
-};
+use tokio::sync::{mpsc, oneshot, watch};
+use tracing::info;
 use webrtc::media_stream::{Track, track_local::static_sample::TrackLocalStaticSample};
 
 use crate::{config::HostConfig, stats::HostStats};
@@ -108,8 +106,12 @@ async fn stream_ffmpeg(
     let bitrate = config.bitrate.to_string();
     let buffer_size = (config.bitrate / u32::from(config.fps)).to_string();
     let fps = config.fps.to_string();
-    let desktop_duplication_fps = (u32::from(config.fps) * 5 / 4).to_string();
-    let gop = (u32::from(config.fps) * 2).to_string();
+    // Poll Desktop Duplication slightly faster than the RTP cadence. Display
+    // refresh and Windows timer quantization otherwise leave a 60 Hz request at
+    // roughly 55-57 delivered frames/s. The latest-frame slot below absorbs the
+    // excess without building a queue.
+    let desktop_duplication_fps = (u32::from(config.fps) * 67 / 60).to_string();
+    let gop = config.fps.to_string();
     let scale = if config.ffmpeg_capture_mode == "ddagrab" {
         format!(
             "scale_d3d11=width={}:height={}:format=nv12,setpts=N/({}*TB)",
@@ -181,7 +183,7 @@ async fn stream_ffmpeg(
         "h264_nvenc" => args.extend(
             [
                 "-preset",
-                "p1",
+                "p4",
                 "-tune",
                 "ull",
                 "-delay",
@@ -191,6 +193,18 @@ async fn stream_ffmpeg(
                 "-zerolatency",
                 "1",
                 "-forced-idr",
+                "1",
+                "-rc-lookahead",
+                "0",
+                "-spatial-aq",
+                "1",
+                "-aq-strength",
+                "8",
+                "-temporal-aq",
+                "0",
+                "-strict_gop",
+                "1",
+                "-slices",
                 "1",
             ]
             .map(str::to_owned),
@@ -230,25 +244,44 @@ async fn stream_ffmpeg(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("FFmpeg stdout was not piped"))?;
-    // Keep a two-frame producer/consumer cushion. Desktop Duplication and NVENC
-    // can deliver adjacent frames in small bursts; pacing this queue at the RTP
-    // clock prevents those bursts from becoming browser-visible jitter.
-    let (frame_tx, mut frame_rx) = mpsc::channel::<Bytes>(2);
+    // A one-frame handoff adds at most one frame of buffering. Blocking the
+    // producer when it is full applies backpressure before NVENC can build a
+    // backlog and, critically, never removes a reference P-frame from the H.264
+    // chain. RTP frame batching keeps this handoff empty during normal operation.
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Bytes>(1);
+    let (initial_frame_tx, initial_frame_rx) = oneshot::channel();
     let reader_active = active.clone();
     std::thread::Builder::new()
         .name("desktop-h264-reader".into())
-        .spawn(move || read_latest_ffmpeg_frame(stdout, frame_tx, reader_active))?;
+        .spawn(move || {
+            read_latest_ffmpeg_frame(stdout, initial_frame_tx, frame_tx, reader_active)
+        })?;
 
     let duration = Duration::from_secs_f64(1.0 / f64::from(config.fps));
     let ssrc = track_ssrc(&track).await?;
-    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + duration, duration);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // The initial IDR carries the SPS/PPS needed to configure a browser decoder.
+    // Deliver it reliably before switching to replaceable low-latency frames.
+    let initial_data = initial_frame_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("FFmpeg stopped before its initial keyframe"))?;
+    track
+        .sample_writer(ssrc, payload_type)
+        .write_sample(&Sample {
+            data: initial_data,
+            duration,
+            ..Default::default()
+        })
+        .await?;
+    stats.frames_sent.fetch_add(1, Ordering::Relaxed);
+    let mut sent_in_window = 0u64;
+    let mut max_write_time = Duration::ZERO;
+    let mut report_at = tokio::time::Instant::now() + Duration::from_secs(5);
     let result = async {
         while active.load(Ordering::Acquire) {
             let Some(data) = frame_rx.recv().await else {
                 break;
             };
-            ticker.tick().await;
+            let write_started = tokio::time::Instant::now();
             track
                 .sample_writer(ssrc, payload_type)
                 .write_sample(&Sample {
@@ -257,7 +290,21 @@ async fn stream_ffmpeg(
                     ..Default::default()
                 })
                 .await?;
+            max_write_time = max_write_time.max(write_started.elapsed());
             stats.frames_sent.fetch_add(1, Ordering::Relaxed);
+            sent_in_window += 1;
+            if tokio::time::Instant::now() >= report_at {
+                info!(
+                    width = config.width,
+                    height = config.height,
+                    sent_frames = sent_in_window,
+                    max_rtp_write_us = max_write_time.as_micros(),
+                    "video pipeline five-second window"
+                );
+                sent_in_window = 0;
+                max_write_time = Duration::ZERO;
+                report_at += Duration::from_secs(5);
+            }
         }
         anyhow::Ok(())
     }
@@ -268,11 +315,13 @@ async fn stream_ffmpeg(
 
 fn read_latest_ffmpeg_frame(
     stdout: std::process::ChildStdout,
+    initial_frame_tx: oneshot::Sender<Bytes>,
     frame_tx: mpsc::Sender<Bytes>,
     active: Arc<AtomicBool>,
 ) {
     let mut reader = H26xSampleReader::new(BufReader::new(stdout), 4 * 1024 * 1024, false);
     let mut prefix = BytesMut::new();
+    let mut initial_frame_tx = Some(initial_frame_tx);
     while active.load(Ordering::Acquire) {
         let Ok(sample) = reader.next_sample() else {
             break;
@@ -287,9 +336,21 @@ fn read_latest_ffmpeg_frame(
             prefix.reserve(4 + sample.data.len());
             prefix.put_slice(&[0, 0, 0, 1]);
             prefix.put_slice(&sample.data);
-            match frame_tx.try_send(prefix.split().freeze()) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Closed(_)) => break,
+            let data = prefix.split().freeze();
+            if nal_type == 5
+                && let Some(sender) = initial_frame_tx.take()
+            {
+                if sender.send(data).is_err() {
+                    break;
+                }
+                continue;
+            }
+            if initial_frame_tx.is_some() {
+                // Do not expose undecodable delta frames before the first IDR.
+                continue;
+            }
+            if frame_tx.blocking_send(data).is_err() {
+                break;
             }
         } else {
             prefix.reserve(4 + sample.data.len());

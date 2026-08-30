@@ -101,11 +101,60 @@ def display_geometry() -> tuple[int, int, int, int]:
         user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
     except (AttributeError, OSError):
         user32.SetProcessDPIAware()
+    # EnumDisplaySettings reports the primary display's physical current mode
+    # even if another imported Windows component fixed the process at a
+    # DPI-virtualized awareness level before this call.
+    class Point(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    class DevMode(ctypes.Structure):
+        _fields_ = [
+            ("dmDeviceName", ctypes.c_wchar * 32),
+            ("dmSpecVersion", ctypes.c_ushort),
+            ("dmDriverVersion", ctypes.c_ushort),
+            ("dmSize", ctypes.c_ushort),
+            ("dmDriverExtra", ctypes.c_ushort),
+            ("dmFields", ctypes.c_ulong),
+            ("dmPosition", Point),
+            ("dmDisplayOrientation", ctypes.c_ulong),
+            ("dmDisplayFixedOutput", ctypes.c_ulong),
+            ("dmColor", ctypes.c_short),
+            ("dmDuplex", ctypes.c_short),
+            ("dmYResolution", ctypes.c_short),
+            ("dmTTOption", ctypes.c_short),
+            ("dmCollate", ctypes.c_short),
+            ("dmFormName", ctypes.c_wchar * 32),
+            ("dmLogPixels", ctypes.c_ushort),
+            ("dmBitsPerPel", ctypes.c_ulong),
+            ("dmPelsWidth", ctypes.c_ulong),
+            ("dmPelsHeight", ctypes.c_ulong),
+            ("dmDisplayFlags", ctypes.c_ulong),
+            ("dmDisplayFrequency", ctypes.c_ulong),
+            ("dmICMMethod", ctypes.c_ulong),
+            ("dmICMIntent", ctypes.c_ulong),
+            ("dmMediaType", ctypes.c_ulong),
+            ("dmDitherType", ctypes.c_ulong),
+            ("dmReserved1", ctypes.c_ulong),
+            ("dmReserved2", ctypes.c_ulong),
+            ("dmPanningWidth", ctypes.c_ulong),
+            ("dmPanningHeight", ctypes.c_ulong),
+        ]
+
+    mode = DevMode()
+    mode.dmSize = ctypes.sizeof(DevMode)
+    if not user32.EnumDisplaySettingsW(None, -1, ctypes.byref(mode)):
+        raise RuntimeError("无法读取主显示器的物理显示模式")
+    primary_width = int(mode.dmPelsWidth)
+    primary_height = int(mode.dmPelsHeight)
+    logical_width = int(user32.GetSystemMetrics(0))
+    logical_height = int(user32.GetSystemMetrics(1))
+    scale_x = primary_width / logical_width
+    scale_y = primary_height / logical_height
     return (
-        int(user32.GetSystemMetrics(0)),
-        int(user32.GetSystemMetrics(1)),
-        int(user32.GetSystemMetrics(78)),
-        int(user32.GetSystemMetrics(79)),
+        primary_width,
+        primary_height,
+        round(int(user32.GetSystemMetrics(78)) * scale_x),
+        round(int(user32.GetSystemMetrics(79)) * scale_y),
     )
 
 
@@ -192,17 +241,21 @@ def main() -> int:
     if os.name != "nt":
         raise RuntimeError("这个启动脚本当前只支持 Windows")
     RUN_DIR.mkdir(parents=True, exist_ok=True)
+    # Establish per-monitor DPI awareness before importing qrcode/Pillow. Pillow
+    # may otherwise lock Python to system-DPI awareness, making GetSystemMetrics
+    # return the scaled logical desktop (for example 1512x950) instead of the
+    # primary display's physical 2560x1600 pixels.
+    primary_width, primary_height, desktop_width, desktop_height = display_geometry()
+    if min(primary_width, primary_height, desktop_width, desktop_height) <= 0:
+        raise RuntimeError("无法读取显示器尺寸")
     ffmpeg = find_ffmpeg()
     encoder, capture_mode = select_hardware_pipeline(ffmpeg)
     qrcode = ensure_qrcode()
     ip = lan_ip()
-    primary_width, primary_height, desktop_width, desktop_height = display_geometry()
-    if min(primary_width, primary_height, desktop_width, desktop_height) <= 0:
-        raise RuntimeError("无法读取显示器尺寸")
     # Capture the complete physical primary display. The Host uploads it to
     # D3D11 and scales to each browser's requested size on the GPU before NVENC, so the
     # browser receives the whole desktop instead of its top-left region.
-    width, height = 1920, 1200
+    width, height = primary_width, primary_height
 
     secrets_file = RUN_DIR / "secrets.json"
     if secrets_file.exists():
@@ -217,7 +270,7 @@ def main() -> int:
 
     run(["npm.cmd", "--prefix", "web", "install", "--no-audit", "--no-fund"])
     run(["npm.cmd", "--prefix", "web", "run", "build"])
-    run(["cargo", "build", "-p", "remote-signaling", "-p", "remote-host"])
+    run(["cargo", "build", "--release", "-p", "remote-signaling", "-p", "remote-host"])
 
     base_url = f"http://{ip}:{PORT}"
     host_config = RUN_DIR / "remote-host.toml"
@@ -227,7 +280,7 @@ def main() -> int:
         f'device_id = "{DEVICE_ID}"\n'
         'device_name = "这台 Windows 电脑"\n'
         f'device_token = "{credentials["device_token"]}"\n'
-        f'width = {width}\nheight = {height}\nfps = 60\nbitrate = 14000000\nmonitor_index = 0\n'
+        f'width = {width}\nheight = {height}\nfps = 60\nbitrate = 20000000\nmonitor_index = 0\n'
         f'ffmpeg_path = "{escaped_ffmpeg}"\n'
         f'ffmpeg_encoder = "{encoder}"\n'
         f'ffmpeg_capture_mode = "{capture_mode}"\n'
@@ -253,7 +306,7 @@ def main() -> int:
     host_log = (RUN_DIR / "host.log").open("ab", buffering=0)
     creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
     signaling = subprocess.Popen(
-        [str(ROOT / "target" / "debug" / "remote-signaling.exe")],
+        [str(ROOT / "target" / "release" / "remote-signaling.exe")],
         cwd=ROOT,
         env=env,
         stdout=signaling_log,
@@ -265,7 +318,7 @@ def main() -> int:
         wait_for_health(base_url, signaling)
         access_token = permanent_access_token(credentials["jwt_secret"])
         host = subprocess.Popen(
-            [str(ROOT / "target" / "debug" / "remote-host.exe"), str(host_config)],
+            [str(ROOT / "target" / "release" / "remote-host.exe"), str(host_config)],
             cwd=ROOT,
             env=env,
             stdout=host_log,

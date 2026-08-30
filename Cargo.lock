@@ -3402,8 +3402,6 @@ dependencies = [
 [[package]]
 name = "webrtc"
 version = "0.20.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7330857e1e10fcbfa5f358f152cc01f22a05bb523875c0547677db0f24538dcd"
 dependencies = [
  "async-broadcast",
  "async-channel",

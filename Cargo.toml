@@ -23,3 +23,10 @@ toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
+
+[patch.crates-io]
+# Upstream submits every RTP packet through the peer-driver channel separately.
+# A 4 MP H.264 frame contains dozens of packets, so that path starves a 60 FPS
+# desktop stream. This local patch preserves upstream behavior but batches all
+# packets belonging to one encoded frame into one ordered driver event.
+webrtc = { path = "vendor/webrtc" }
