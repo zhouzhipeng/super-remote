@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, bail};
@@ -102,6 +103,41 @@ impl HostConfig {
         }
     }
 
+    /// Select the largest even-sized stream that fits the browser's physical
+    /// video area while preserving the captured display's aspect ratio.
+    pub fn for_viewport(
+        self: &Arc<Self>,
+        viewport_width: Option<u32>,
+        viewport_height: Option<u32>,
+    ) -> Arc<Self> {
+        let (Some(viewport_width), Some(viewport_height)) = (viewport_width, viewport_height)
+        else {
+            return self.clone();
+        };
+        if viewport_width == 0 || viewport_height == 0 {
+            return self.clone();
+        }
+
+        let source_width = if self.ffmpeg_capture_width > 0 {
+            self.ffmpeg_capture_width
+        } else {
+            self.width
+        };
+        let source_height = if self.ffmpeg_capture_height > 0 {
+            self.ffmpeg_capture_height
+        } else {
+            self.height
+        };
+        let scale = (viewport_width as f64 / source_width as f64)
+            .min(viewport_height as f64 / source_height as f64)
+            .min(1.0);
+        let even = |value: f64| ((value.floor() as u32).max(2) / 2) * 2;
+        let mut session = self.as_ref().clone();
+        session.width = even(source_width as f64 * scale);
+        session.height = even(source_height as f64 * scale);
+        Arc::new(session)
+    }
+
     pub fn h264_level(&self) -> (&'static str, &'static str) {
         let macroblocks_per_second = u64::from(self.width.div_ceil(16))
             * u64::from(self.height.div_ceil(16))
@@ -141,4 +177,44 @@ fn default_ffmpeg_encoder() -> String {
 
 fn default_ffmpeg_capture_mode() -> String {
     "gdigrab".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> Arc<HostConfig> {
+        Arc::new(HostConfig {
+            server_url: String::new(),
+            device_id: "device".into(),
+            device_name: "desktop".into(),
+            device_token: "x".repeat(24),
+            width: 1920,
+            height: 1200,
+            fps: 60,
+            bitrate: 14_000_000,
+            monitor_index: 0,
+            h264_file: None,
+            ffmpeg_path: None,
+            ffmpeg_encoder: "h264_nvenc".into(),
+            ffmpeg_capture_mode: "gdigrab".into(),
+            ffmpeg_capture_x: 0,
+            ffmpeg_capture_y: 0,
+            ffmpeg_capture_width: 2560,
+            ffmpeg_capture_height: 1600,
+            ice_servers: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn fits_complete_display_inside_portrait_browser() {
+        let fitted = config().for_viewport(Some(390), Some(793));
+        assert_eq!((fitted.width, fitted.height), (390, 242));
+    }
+
+    #[test]
+    fn fits_complete_display_inside_landscape_browser() {
+        let fitted = config().for_viewport(Some(844), Some(339));
+        assert_eq!((fitted.width, fitted.height), (542, 338));
+    }
 }

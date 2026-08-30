@@ -29,10 +29,40 @@ async function sessionView(deviceId: string): Promise<void> {
   app.innerHTML = `<main class="remote"><video id="remote" autoplay muted playsinline tabindex="0"></video><div class="toolbar"><button id="back" class="secondary">断开</button><button id="sound">开启声音</button><button id="fullscreen" class="secondary">全屏</button><span id="state">正在连接</span><span id="stats"></span></div></main>`;
   const video = app.querySelector<HTMLVideoElement>("#remote")!;
   const state = app.querySelector<HTMLSpanElement>("#state")!;
-  const session = new RemoteSession(video, app.querySelector("#stats")!);
-  session.addEventListener("state", (event) => { state.textContent = stateLabel((event as CustomEvent<string>).detail); });
-  session.addEventListener("error", (event) => { state.textContent = String((event as CustomEvent).detail); });
-  app.querySelector("#back")!.addEventListener("click", () => { session.close(); void devicesView(); });
+  const stats = app.querySelector<HTMLElement>("#stats")!;
+  let disposed = false;
+  const createRemoteSession = (): RemoteSession => {
+    const next = new RemoteSession(video, stats);
+    next.addEventListener("state", (event) => { state.textContent = stateLabel((event as CustomEvent<string>).detail); });
+    next.addEventListener("error", (event) => { state.textContent = String((event as CustomEvent).detail); });
+    return next;
+  };
+  let session = createRemoteSession();
+  let connectedArea = physicalVideoArea(video);
+  // Browser chrome, rotation and fullscreen can all change the number of physical
+  // pixels available to the video. Debounce a reconnect so the Host restarts the
+  // encoder at the new fitted resolution instead of stretching an old stream.
+  let resizeTimer = 0;
+  const resizeObserver = new ResizeObserver(() => {
+    window.clearTimeout(resizeTimer);
+    resizeTimer = window.setTimeout(() => {
+      if (disposed || session.state !== "connected") return;
+      const area = physicalVideoArea(video);
+      if (Math.abs(area.width - connectedArea.width) < 64 && Math.abs(area.height - connectedArea.height) < 64) return;
+      connectedArea = area;
+      session.close();
+      session = createRemoteSession();
+      void session.connect(deviceId).catch((error) => { state.textContent = error instanceof Error ? error.message : String(error); });
+    }, 700);
+  });
+  resizeObserver.observe(video);
+  app.querySelector("#back")!.addEventListener("click", () => {
+    disposed = true;
+    resizeObserver.disconnect();
+    window.clearTimeout(resizeTimer);
+    session.close();
+    void devicesView();
+  });
   const soundButton = app.querySelector<HTMLButtonElement>("#sound")!;
   soundButton.addEventListener("click", () => {
     const muted = !video.muted;
@@ -42,6 +72,12 @@ async function sessionView(deviceId: string): Promise<void> {
   });
   app.querySelector("#fullscreen")!.addEventListener("click", () => app.querySelector(".remote")?.requestFullscreen());
   try { await session.connect(deviceId); } catch (error) { state.textContent = error instanceof Error ? error.message : String(error); }
+}
+
+function physicalVideoArea(video: HTMLVideoElement): { width: number; height: number } {
+  const rect = video.getBoundingClientRect();
+  const pixelRatio = Math.max(1, window.devicePixelRatio || 1);
+  return { width: Math.floor(rect.width * pixelRatio), height: Math.floor(rect.height * pixelRatio) };
 }
 
 function stateLabel(state: string): string {

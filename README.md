@@ -64,8 +64,9 @@ Open `http://127.0.0.1:8080`, sign in, select the online device and connect. For
 non-local deployment, terminate TLS at Nginx and use `https://`/`wss://` only.
 
 The launcher's NVIDIA path follows Sunshine's low-latency encode architecture: capture the
-complete primary display at its Windows-scaled 1920x1200 size → upload to D3D11 for NV12
-conversion → NVENC H.264 → WebRTC. It uses a one-frame CBR buffer, one encoder surface,
+complete physical primary display → upload to D3D11 for GPU scaling and NV12 conversion →
+NVENC H.264 sized to the browser's physical video area → WebRTC. The output preserves the
+display aspect ratio and never crops the source. It uses a one-frame CBR buffer, one encoder surface,
 forced IDR frames and zero-latency tuning. Capture, D3D11 conversion, NVENC and WASAPI are
 gated by WebRTC connection state: none of them starts while the Host is idle, and a normal
 disconnect stops them immediately. The browser requests the smallest supported playout

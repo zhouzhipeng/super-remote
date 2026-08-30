@@ -47,7 +47,12 @@ async fn main() -> anyhow::Result<()> {
             ServerSignal::SessionRequested { session_id, .. } => {
                 info!(%session_id, "session requested");
             }
-            ServerSignal::WebrtcOffer { session_id, sdp } => {
+            ServerSignal::WebrtcOffer {
+                session_id,
+                sdp,
+                viewport_width,
+                viewport_height,
+            } => {
                 // MVP is a single-controller desktop. A fresh connection replaces stale or
                 // background mobile tabs immediately so hardware encoders cannot accumulate.
                 let previous = sessions
@@ -60,7 +65,13 @@ async fn main() -> anyhow::Result<()> {
                     item.stop_media();
                     let _ = item.peer.close().await;
                 }
-                match rtc::accept_offer(config.clone(), session_id, sdp, outbound_tx.clone()).await
+                match rtc::accept_offer(
+                    config.for_viewport(viewport_width, viewport_height),
+                    session_id,
+                    sdp,
+                    outbound_tx.clone(),
+                )
+                .await
                 {
                     Ok(session) => {
                         sessions.lock().await.insert(session_id, session);

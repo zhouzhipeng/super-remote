@@ -73,7 +73,11 @@ export class RemoteSession extends EventTarget {
     };
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
-    this.#signaling.send({ type: "webrtc_offer", session_id: this.#sessionId, session_token: this.#sessionToken, sdp: offer.sdp ?? "" });
+    const viewport = this.#physicalVideoArea();
+    this.#signaling.send({
+      type: "webrtc_offer", session_id: this.#sessionId, session_token: this.#sessionToken,
+      sdp: offer.sdp ?? "", viewport_width: viewport.width, viewport_height: viewport.height,
+    });
   }
 
   setMuted(muted: boolean): Promise<void> {
@@ -131,6 +135,15 @@ export class RemoteSession extends EventTarget {
       try { lowLatency.jitterBufferTarget = 0; } catch { /* browser-controlled fallback */ }
       try { lowLatency.playoutDelayHint = 0; } catch { /* older browser fallback */ }
     }
+  }
+
+  #physicalVideoArea(): { width: number; height: number } {
+    const rect = this.video.getBoundingClientRect();
+    const pixelRatio = Math.max(1, window.devicePixelRatio || 1);
+    return {
+      width: Math.max(2, Math.floor(rect.width * pixelRatio)),
+      height: Math.max(2, Math.floor(rect.height * pixelRatio)),
+    };
   }
 
   async #report(stage: string): Promise<void> {

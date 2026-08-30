@@ -199,9 +199,9 @@ def main() -> int:
     primary_width, primary_height, desktop_width, desktop_height = display_geometry()
     if min(primary_width, primary_height, desktop_width, desktop_height) <= 0:
         raise RuntimeError("无法读取显示器尺寸")
-    # gdigrab observes this scaled desktop as 1920x1200, covering the complete
-    # primary display without a crop. Keeping that exact size avoids a blurry
-    # resampling pass while still exceeding 1080p.
+    # Capture the complete physical primary display. The Host uploads it to
+    # D3D11 and scales to each browser's requested size on the GPU before NVENC, so the
+    # browser receives the whole desktop instead of its top-left region.
     width, height = 1920, 1200
 
     secrets_file = RUN_DIR / "secrets.json"
@@ -232,8 +232,8 @@ def main() -> int:
         f'ffmpeg_encoder = "{encoder}"\n'
         f'ffmpeg_capture_mode = "{capture_mode}"\n'
         f'ffmpeg_capture_x = 0\nffmpeg_capture_y = 0\n'
-        f'ffmpeg_capture_width = {width}\n'
-        f'ffmpeg_capture_height = {height}\n',
+        f'ffmpeg_capture_width = {primary_width}\n'
+        f'ffmpeg_capture_height = {primary_height}\n',
         encoding="utf-8",
     )
 

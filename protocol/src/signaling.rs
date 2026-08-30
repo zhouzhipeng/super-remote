@@ -14,6 +14,10 @@ pub enum ClientSignal {
         session_id: Uuid,
         session_token: String,
         sdp: String,
+        #[serde(default)]
+        viewport_width: Option<u32>,
+        #[serde(default)]
+        viewport_height: Option<u32>,
     },
     WebrtcAnswer {
         session_id: Uuid,
@@ -48,6 +52,10 @@ pub enum ServerSignal {
     WebrtcOffer {
         session_id: Uuid,
         sdp: String,
+        #[serde(default)]
+        viewport_width: Option<u32>,
+        #[serde(default)]
+        viewport_height: Option<u32>,
     },
     WebrtcAnswer {
         session_id: Uuid,

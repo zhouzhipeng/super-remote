@@ -106,6 +106,8 @@ async fn handle_signal(
             session_id,
             session_token,
             sdp,
+            viewport_width,
+            viewport_height,
         } if principal.role == Role::User => {
             if !state
                 .authorize_offer(session_id, &principal.subject, &session_token)
@@ -117,7 +119,12 @@ async fn handle_signal(
                 .route_to_device(
                     session_id,
                     &principal.subject,
-                    ServerSignal::WebrtcOffer { session_id, sdp },
+                    ServerSignal::WebrtcOffer {
+                        session_id,
+                        sdp,
+                        viewport_width,
+                        viewport_height,
+                    },
                 )
                 .await
         }

@@ -14,7 +14,7 @@ export interface DeviceSummary {
 }
 
 export type ClientSignal =
-  | { type: "webrtc_offer"; session_id: string; session_token: string; sdp: string }
+  | { type: "webrtc_offer"; session_id: string; session_token: string; sdp: string; viewport_width: number; viewport_height: number }
   | { type: "webrtc_ice"; session_id: string; candidate: string; sdp_mid: string | null; sdp_mline_index: number | null; username_fragment: string | null }
   | { type: "session_close"; session_id: string }
   | { type: "ping"; nonce: number };
