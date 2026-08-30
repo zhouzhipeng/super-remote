@@ -72,6 +72,10 @@ forced IDR frames and zero-latency tuning. Capture, D3D11 conversion, NVENC and 
 gated by WebRTC connection state: none of them starts while the Host is idle, and a normal
 disconnect stops them immediately. The browser requests the smallest supported playout
 buffer, and the Host uses exact 60 Hz timestamps to minimize frame jitter.
+Pointer movement bypasses animation-frame batching and uses raw pointer updates when the
+browser supports them. Click coordinates and button transitions are injected as one Win32
+batch, while keyboard transitions remain reliable and ordered. The toolbar reports sampled
+post-injection input RTT so input latency can be verified independently from video latency.
 Software encoder fallback is intentionally disabled; the application will not claim or
 simulate hardware acceleration.
 System playback audio uses event-driven WASAPI loopback capture and 48 kHz stereo Opus

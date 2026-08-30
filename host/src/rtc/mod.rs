@@ -146,7 +146,15 @@ impl PeerConnectionEventHandler for Handler {
                 match event {
                     DataChannelEvent::OnMessage(message) if !message.is_string => {
                         match input::inject_packet(&message.data) {
-                            Ok(()) => stats.input_ok(),
+                            Ok(input) => {
+                                stats.input_ok();
+                                // Bit 0 requests a tiny post-injection echo. It lets the
+                                // browser report real input round-trip latency without
+                                // delaying this receive loop or every high-rate move.
+                                if input.flags & 1 != 0 {
+                                    let _ = channel.try_send(message.data.clone()).await;
+                                }
+                            }
                             Err(error) => {
                                 stats.input_invalid();
                                 warn!(%error, %label, "rejected input packet");

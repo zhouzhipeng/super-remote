@@ -3,6 +3,7 @@ export class StatsMonitor {
   #lastBytes = 0;
   #lastAudioBytes = 0;
   #lastTime = 0;
+  #inputLatencyMs: number | null = null;
 
   constructor(private readonly peer: RTCPeerConnection, private readonly output: HTMLElement) {}
 
@@ -12,6 +13,8 @@ export class StatsMonitor {
   }
 
   stop(): void { clearInterval(this.#timer); }
+
+  setInputLatency(milliseconds: number): void { this.#inputLatencyMs = milliseconds; }
 
   async #refresh(): Promise<void> {
     const reports = await this.peer.getStats();
@@ -44,6 +47,7 @@ export class StatsMonitor {
     this.#lastAudioBytes = audioBytes;
     this.#lastTime = now;
     const loss = packetsLost + packetsReceived > 0 ? (packetsLost / (packetsLost + packetsReceived)) * 100 : 0;
-    this.output.textContent = `FPS ${fps.toFixed(0)}  |  ${bitrate.toFixed(1)} Mbps  |  音频 ${audioKbps.toFixed(0)} kbps  |  RTT ${rttMs.toFixed(0)} ms  |  Loss ${loss.toFixed(1)}%  |  Jitter ${jitterMs.toFixed(1)} ms  |  ${codec.replace("video/", "")}  |  ${route}`;
+    const inputLatency = this.#inputLatencyMs === null ? "—" : this.#inputLatencyMs.toFixed(1);
+    this.output.textContent = `FPS ${fps.toFixed(0)}  |  ${bitrate.toFixed(1)} Mbps  |  音频 ${audioKbps.toFixed(0)} kbps  |  RTT ${rttMs.toFixed(0)} ms  |  Input RTT ${inputLatency} ms  |  Loss ${loss.toFixed(1)}%  |  Jitter ${jitterMs.toFixed(1)} ms  |  ${codec.replace("video/", "")}  |  ${route}`;
   }
 }

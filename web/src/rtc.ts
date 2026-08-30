@@ -36,7 +36,9 @@ export class RemoteSession extends EventTarget {
     const fast = peer.createDataChannel("input-fast", { ordered: false, maxRetransmits: 0 });
     const reliable = peer.createDataChannel("input-reliable", { ordered: true });
     fast.binaryType = reliable.binaryType = "arraybuffer";
-    reliable.addEventListener("open", () => { this.#input = new InputController(this.video, fast, reliable); });
+    reliable.addEventListener("open", () => {
+      this.#input = new InputController(this.video, fast, reliable, (latency) => this.#stats?.setInputLatency(latency));
+    });
     this.video.muted = true;
     this.video.playsInline = true;
     for (const name of ["loadedmetadata", "canplay", "playing", "waiting", "stalled", "error"] as const) {

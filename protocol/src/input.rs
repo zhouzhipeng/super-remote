@@ -37,6 +37,7 @@ pub enum InputEvent {
     MouseButton {
         button: u8,
         down: bool,
+        position: Option<(u16, u16)>,
     },
     Keyboard {
         scan_code: u16,
@@ -83,8 +84,19 @@ impl TimedInputEvent {
                 p.extend_from_slice(&y.to_le_bytes());
                 (InputType::MouseMove, p)
             }
-            InputEvent::MouseButton { button, down } => {
-                (InputType::MouseButton, vec![button, u8::from(down)])
+            InputEvent::MouseButton {
+                button,
+                down,
+                position,
+            } => {
+                let mut p = Vec::with_capacity(if position.is_some() { 6 } else { 2 });
+                if let Some((x, y)) = position {
+                    p.extend_from_slice(&x.to_le_bytes());
+                    p.extend_from_slice(&y.to_le_bytes());
+                }
+                p.push(button);
+                p.push(u8::from(down));
+                (InputType::MouseButton, p)
             }
             InputEvent::Keyboard {
                 scan_code,
@@ -147,6 +159,15 @@ impl TimedInputEvent {
             (InputType::MouseButton, [button, down]) => InputEvent::MouseButton {
                 button: *button,
                 down: boolean(*down)?,
+                position: None,
+            },
+            (InputType::MouseButton, [x0, x1, y0, y1, button, down]) => InputEvent::MouseButton {
+                button: *button,
+                down: boolean(*down)?,
+                position: Some((
+                    u16::from_le_bytes([*x0, *x1]),
+                    u16::from_le_bytes([*y0, *y1]),
+                )),
             },
             (InputType::Keyboard, [s0, s1, down, extended]) => InputEvent::Keyboard {
                 scan_code: u16::from_le_bytes([*s0, *s1]),
@@ -182,6 +203,7 @@ mod tests {
             InputEvent::MouseButton {
                 button: 2,
                 down: true,
+                position: Some((4096, 8192)),
             },
             InputEvent::Keyboard {
                 scan_code: 0x1d,
@@ -216,6 +238,28 @@ mod tests {
         assert_eq!(
             TimedInputEvent::decode(&packet),
             Err(DecodeError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn accepts_legacy_button_without_position() {
+        let packet = TimedInputEvent {
+            flags: 0,
+            timestamp_us: 7,
+            event: InputEvent::MouseButton {
+                button: 0,
+                down: true,
+                position: None,
+            },
+        }
+        .encode();
+        assert_eq!(
+            TimedInputEvent::decode(&packet).unwrap().event,
+            InputEvent::MouseButton {
+                button: 0,
+                down: true,
+                position: None,
+            }
         );
     }
 }

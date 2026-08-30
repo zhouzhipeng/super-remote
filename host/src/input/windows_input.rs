@@ -27,7 +27,11 @@ pub fn inject(event: InputEvent) -> anyhow::Result<()> {
             }
             return send(&inputs);
         }
-        InputEvent::MouseButton { button, down } => {
+        InputEvent::MouseButton {
+            button,
+            down,
+            position,
+        } => {
             let flags = match (button, down) {
                 (0, true) => MOUSEEVENTF_LEFTDOWN,
                 (0, false) => MOUSEEVENTF_LEFTUP,
@@ -37,7 +41,21 @@ pub fn inject(event: InputEvent) -> anyhow::Result<()> {
                 (2, false) => MOUSEEVENTF_RIGHTUP,
                 _ => bail!("unsupported mouse button {button}"),
             };
-            mouse(0, 0, 0, flags)
+            let button_input = mouse(0, 0, 0, flags);
+            if let Some((x, y)) = position {
+                // Move and transition are one SendInput batch, so a click can
+                // never wait behind or overtake an unreliable position packet.
+                return send(&[
+                    mouse(
+                        x as i32,
+                        y as i32,
+                        0,
+                        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                    ),
+                    button_input,
+                ]);
+            }
+            button_input
         }
         InputEvent::Keyboard {
             scan_code,

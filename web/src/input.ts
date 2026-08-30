@@ -1,5 +1,8 @@
 const HEADER_LENGTH = 12;
-const FAST_BUFFER_LIMIT = 64 * 1024;
+const ACK_REQUESTED = 0x01;
+// At most one tiny input message may wait in SCTP. Larger limits make the
+// remote pointer replay stale positions after a transient network stall.
+const FAST_BUFFER_LIMIT = 16;
 
 enum InputType {
   MouseMove = 0x01,
@@ -31,10 +34,10 @@ const SCAN_CODES: Record<string, [number, boolean]> = {
   MetaLeft: [0x5b, true], MetaRight: [0x5c, true],
 };
 
-function packet(type: InputType, payloadLength: number): DataView {
+function packet(type: InputType, payloadLength: number, flags = 0): DataView {
   const view = new DataView(new ArrayBuffer(HEADER_LENGTH + payloadLength));
   view.setUint8(0, type);
-  view.setUint8(1, 0);
+  view.setUint8(1, flags);
   view.setUint16(2, payloadLength, true);
   view.setBigUint64(4, BigInt(Math.round(performance.timeOrigin * 1000 + performance.now() * 1000)), true);
   return view;
@@ -49,13 +52,23 @@ export class InputController {
   #fast: RTCDataChannel;
   #reliable: RTCDataChannel;
   #pendingMove: { x: number; y: number } | null = null;
-  #animationFrame = 0;
+  #lastRawUpdate = -Infinity;
+  #moveSequence = 0;
   #pressed = new Set<string>();
 
-  constructor(video: HTMLVideoElement, fast: RTCDataChannel, reliable: RTCDataChannel) {
+  constructor(
+    video: HTMLVideoElement,
+    fast: RTCDataChannel,
+    reliable: RTCDataChannel,
+    private readonly onLatency: (milliseconds: number) => void,
+  ) {
     this.#video = video;
     this.#fast = fast;
     this.#reliable = reliable;
+    video.dataset.inputMode = "pointermove";
+    // Register the raw event unconditionally: browsers that do not implement it
+    // simply never emit it. pointermove remains the Safari/mobile fallback.
+    video.addEventListener("pointerrawupdate", this.#pointerRawUpdate as EventListener);
     video.addEventListener("pointermove", this.#pointerMove);
     video.addEventListener("pointerdown", this.#pointerButton);
     video.addEventListener("pointerup", this.#pointerButton);
@@ -64,9 +77,14 @@ export class InputController {
     window.addEventListener("keydown", this.#keyboard, true);
     window.addEventListener("keyup", this.#keyboard, true);
     window.addEventListener("blur", this.#releaseAll);
+    fast.bufferedAmountLowThreshold = 0;
+    fast.addEventListener("bufferedamountlow", this.#flushPendingMove);
+    fast.addEventListener("message", this.#inputAck);
+    reliable.addEventListener("message", this.#inputAck);
   }
 
   destroy(): void {
+    this.#video.removeEventListener("pointerrawupdate", this.#pointerRawUpdate as EventListener);
     this.#video.removeEventListener("pointermove", this.#pointerMove);
     this.#video.removeEventListener("pointerdown", this.#pointerButton);
     this.#video.removeEventListener("pointerup", this.#pointerButton);
@@ -75,42 +93,64 @@ export class InputController {
     window.removeEventListener("keydown", this.#keyboard, true);
     window.removeEventListener("keyup", this.#keyboard, true);
     window.removeEventListener("blur", this.#releaseAll);
-    cancelAnimationFrame(this.#animationFrame);
+    this.#fast.removeEventListener("bufferedamountlow", this.#flushPendingMove);
+    this.#fast.removeEventListener("message", this.#inputAck);
+    this.#reliable.removeEventListener("message", this.#inputAck);
     this.#releaseAll();
   }
 
   #prevent = (event: Event): void => event.preventDefault();
 
   #pointerMove = (event: PointerEvent): void => {
-    const point = this.#normalizedPoint(event.clientX, event.clientY);
-    if (!point) return;
-    this.#pendingMove = point;
-    if (!this.#animationFrame) this.#animationFrame = requestAnimationFrame(this.#flushMove);
+    if (performance.now() - this.#lastRawUpdate < 32) return;
+    this.#sendPointerEvent(event);
   };
 
-  #flushMove = (): void => {
-    this.#animationFrame = 0;
+  #pointerRawUpdate = (event: PointerEvent): void => {
+    this.#lastRawUpdate = performance.now();
+    this.#video.dataset.inputMode = "pointerrawupdate";
+    this.#sendPointerEvent(event);
+  };
+
+  #sendPointerEvent(event: PointerEvent): void {
+    const coalesced = event.getCoalescedEvents?.();
+    const latest = coalesced?.[coalesced.length - 1] ?? event;
+    const point = this.#normalizedPoint(latest.clientX, latest.clientY);
+    if (!point) return;
+    this.#sendFastMove(point);
+  }
+
+  #flushPendingMove = (): void => {
     const move = this.#pendingMove;
     this.#pendingMove = null;
-    if (!move || this.#fast.readyState !== "open" || this.#fast.bufferedAmount > FAST_BUFFER_LIMIT) return;
-    const view = packet(InputType.MouseMove, 4);
+    if (move) this.#sendFastMove(move);
+  };
+
+  #sendFastMove(move: { x: number; y: number }): void {
+    if (this.#fast.readyState !== "open") return;
+    if (this.#fast.bufferedAmount >= FAST_BUFFER_LIMIT) {
+      this.#pendingMove = move;
+      return;
+    }
+    this.#moveSequence += 1;
+    const flags = this.#moveSequence % 16 === 0 ? ACK_REQUESTED : 0;
+    const view = packet(InputType.MouseMove, 4, flags);
     view.setUint16(12, move.x, true);
     view.setUint16(14, move.y, true);
     this.#fast.send(bytes(view));
-  };
+  }
 
   #pointerButton = (event: PointerEvent): void => {
     event.preventDefault();
     this.#video.focus();
     const point = this.#normalizedPoint(event.clientX, event.clientY);
-    if (point && event.type === "pointerdown") {
-      // A touchscreen has no hover event. Move on the reliable channel before the
-      // button transition so a tap always targets the visible touch position.
-      this.#sendMove(point, this.#reliable);
-    }
-    const view = packet(InputType.MouseButton, 2);
-    view.setUint8(12, event.button);
-    view.setUint8(13, event.type === "pointerdown" ? 1 : 0);
+    if (!point) return;
+    if (event.type === "pointerdown") this.#video.setPointerCapture?.(event.pointerId);
+    const view = packet(InputType.MouseButton, 6, ACK_REQUESTED);
+    view.setUint16(12, point.x, true);
+    view.setUint16(14, point.y, true);
+    view.setUint8(16, event.button);
+    view.setUint8(17, event.type === "pointerdown" ? 1 : 0);
     this.#sendReliable(bytes(view));
   };
 
@@ -128,25 +168,17 @@ export class InputController {
     event.preventDefault();
     event.stopPropagation();
     const down = event.type === "keydown";
-    if (down && (event.repeat || this.#pressed.has(event.code))) return;
+    if (down && this.#pressed.has(event.code) && !event.repeat) return;
     if (down) this.#pressed.add(event.code); else this.#pressed.delete(event.code);
     this.#sendKey(mapping[0], down, mapping[1]);
   };
 
   #sendKey(scanCode: number, down: boolean, extended: boolean): void {
-    const view = packet(InputType.Keyboard, 4);
+    const view = packet(InputType.Keyboard, 4, ACK_REQUESTED);
     view.setUint16(12, scanCode, true);
     view.setUint8(14, down ? 1 : 0);
     view.setUint8(15, extended ? 1 : 0);
     this.#sendReliable(bytes(view));
-  }
-
-  #sendMove(point: { x: number; y: number }, channel: RTCDataChannel): void {
-    if (channel.readyState !== "open") return;
-    const view = packet(InputType.MouseMove, 4);
-    view.setUint16(12, point.x, true);
-    view.setUint16(14, point.y, true);
-    channel.send(bytes(view));
   }
 
   #releaseAll = (): void => {
@@ -160,6 +192,18 @@ export class InputController {
   #sendReliable(data: ArrayBufferView<ArrayBuffer>): void {
     if (this.#reliable.readyState === "open") this.#reliable.send(data);
   }
+
+  #inputAck = (event: MessageEvent<ArrayBuffer>): void => {
+    if (!(event.data instanceof ArrayBuffer) || event.data.byteLength < HEADER_LENGTH) return;
+    const view = new DataView(event.data);
+    if ((view.getUint8(1) & ACK_REQUESTED) === 0) return;
+    const sentUs = Number(view.getBigUint64(4, true));
+    const nowUs = performance.timeOrigin * 1000 + performance.now() * 1000;
+    const latency = Math.max(0, (nowUs - sentUs) / 1000);
+    this.#video.dataset.inputRttMs = latency.toFixed(3);
+    this.#video.dataset.inputAckCount = String(Number(this.#video.dataset.inputAckCount ?? "0") + 1);
+    this.onLatency(latency);
+  };
 
   #normalizedPoint(clientX: number, clientY: number): { x: number; y: number } | null {
     const rect = this.#video.getBoundingClientRect();
