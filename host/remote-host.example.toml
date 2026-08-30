@@ -1,0 +1,22 @@
+server_url = "http://127.0.0.1:8080"
+device_id = "home-pc"
+device_name = "Home PC"
+device_token = "replace-with-the-same-long-device-token-as-server"
+width = 1920
+height = 1080
+fps = 60
+bitrate = 8000000
+monitor_index = 0
+
+# Omit h264_file in normal use: Host captures monitor_index with Windows.Graphics.Capture,
+# converts BGRA to NV12 on the GPU, and requires a Media Foundation hardware H.264 MFT.
+# For transport-only integration tests, uncomment an Annex-B H.264 source:
+# h264_file = "sample.h264"
+# For a live LAN test when the strict Media Foundation hardware probe fails, the launcher
+# can set ffmpeg_path to an NVIDIA-NVENC-capable ffmpeg.exe. Do not use this as proof that
+# the production WGC zero-copy path passed.
+# ffmpeg_path = ".tools/ffmpeg/bin/ffmpeg.exe"
+# ffmpeg_encoder = "h264_nvenc" # or "h264_amf"
+
+[[ice_servers]]
+urls = ["stun:stun.l.google.com:19302"]

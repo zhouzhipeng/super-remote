@@ -1,0 +1,29 @@
+:root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #eef2ff; background: #080b12; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; }
+button, input { font: inherit; }
+button { border: 0; border-radius: 8px; padding: .7rem 1rem; color: white; background: #4f6ef7; cursor: pointer; }
+button:disabled { opacity: .4; cursor: not-allowed; }
+.secondary { background: #252b3a; }
+.center { min-height: 100vh; display: grid; place-items: center; padding: 1rem; }
+.card { background: #131824; border: 1px solid #262d3d; border-radius: 14px; box-shadow: 0 20px 50px #0005; }
+.login { width: min(400px, 100%); padding: 2rem; display: grid; gap: 1rem; }
+.login label { display: grid; gap: .4rem; color: #aeb8cf; }
+.login input { background: #090d16; border: 1px solid #333b4f; border-radius: 8px; color: white; padding: .75rem; }
+.login output { min-height: 1.2rem; color: #ff8a8a; }
+.brand { font-size: 1.1rem; font-weight: 750; letter-spacing: -.02em; }
+.devices header { height: 64px; padding: 0 2rem; border-bottom: 1px solid #252b3a; display: flex; align-items: center; justify-content: space-between; }
+.devices section { padding: 2rem; max-width: 1100px; margin: auto; }
+.device-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; }
+.device-grid article { padding: 1.3rem; position: relative; }
+.device-grid h2 { margin: .2rem 0 .4rem; }
+.device-grid p { color: #98a4bd; min-height: 2.5rem; }
+.status { position: absolute; right: 1.2rem; top: 1.2rem; width: 9px; height: 9px; border-radius: 50%; background: #596174; }
+.status.online { background: #42d392; box-shadow: 0 0 12px #42d392; }
+.remote { position: relative; width: 100vw; height: 100vh; overflow: hidden; background: black; display: grid; grid-template-rows: minmax(0, 1fr) auto; }
+.remote video { width: 100%; height: 100%; object-fit: contain; outline: none; touch-action: none; user-select: none; }
+.toolbar { display: flex; align-items: center; gap: .7rem; min-height: 48px; padding: .45rem .7rem; background: #111722; font: 12px ui-monospace, monospace; white-space: nowrap; overflow-x: auto; }
+#state { color: #95a5c9; }
+#stats { margin-left: auto; }
+.remote:fullscreen { grid-template-rows: minmax(0, 1fr) auto; }
+@media (max-width: 700px) { .devices header, .devices section { padding-left: 1rem; padding-right: 1rem; } #stats { display: none; } }

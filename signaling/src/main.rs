@@ -1,0 +1,245 @@
+mod auth;
+mod state;
+mod websocket;
+
+use std::{net::SocketAddr, sync::Arc};
+
+use anyhow::Context;
+use auth::{AuthConfig, LoginRequest, LoginResponse, Principal, Role, TicketResponse};
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{any, get, post},
+};
+use remote_protocol::{device::DeviceSummary, signaling::CreateSessionRequest};
+use serde::Deserialize;
+use state::AppState;
+use tower_http::{
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
+use tracing::info;
+
+#[derive(Debug, Deserialize)]
+struct WsQuery {
+    ticket: String,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("remote_signaling=info".parse()?),
+        )
+        .init();
+
+    let config = AuthConfig::from_env()?;
+    let bind: SocketAddr = std::env::var("REMOTE_BIND")
+        .unwrap_or_else(|_| "127.0.0.1:8080".into())
+        .parse()
+        .context("REMOTE_BIND must be a socket address")?;
+    let state = Arc::new(AppState::new(config));
+    let web_dist = std::env::var("REMOTE_WEB_DIST").unwrap_or_else(|_| "web/dist".into());
+
+    let api = Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/login", post(login))
+        .route("/ws-ticket", post(browser_ticket))
+        .route("/device-ticket", post(device_ticket))
+        .route("/devices", get(devices))
+        .route("/sessions", post(create_session))
+        .route("/turn-credentials", get(turn_credentials))
+        .route("/client-report", post(client_report))
+        .route("/ws", any(ws_upgrade));
+
+    let app = Router::new()
+        .nest("/api", api)
+        .fallback_service(
+            ServeDir::new(&web_dist)
+                .not_found_service(ServeFile::new(format!("{web_dist}/index.html"))),
+        )
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    info!(%bind, "signaling server listening");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn login(State(state): State<Arc<AppState>>, Json(request): Json<LoginRequest>) -> Response {
+    match state.auth.login(&request) {
+        Ok(token) => Json(LoginResponse {
+            access_token: token,
+            expires_in: 3600,
+        })
+        .into_response(),
+        Err(_) => api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "invalid username or password",
+        ),
+    }
+}
+
+async fn client_report(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(report): Json<serde_json::Value>,
+) -> Response {
+    let principal = match state.auth.authenticate_user(&headers) {
+        Ok(principal) => principal,
+        Err(_) => {
+            return api_error(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "valid user authentication is required",
+            );
+        }
+    };
+    info!(subject = %principal.subject, report = %report, "browser client report");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn browser_ticket(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let principal = match state.auth.authenticate_bearer(&headers) {
+        Ok(p) if p.role == Role::User => p,
+        _ => {
+            return api_error(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "valid user bearer token required",
+            );
+        }
+    };
+    let ticket = state.issue_ticket(principal).await;
+    Json(TicketResponse {
+        ticket,
+        expires_in: 60,
+    })
+    .into_response()
+}
+
+async fn device_ticket(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let token = headers.get("x-device-token").and_then(|v| v.to_str().ok());
+    let device_id = headers.get("x-device-id").and_then(|v| v.to_str().ok());
+    match (token, device_id) {
+        (Some(token), Some(device_id)) if state.auth.verify_device_token(token) => {
+            let principal = Principal {
+                subject: device_id.to_owned(),
+                role: Role::Device,
+            };
+            let ticket = state.issue_ticket(principal).await;
+            Json(TicketResponse {
+                ticket,
+                expires_in: 60,
+            })
+            .into_response()
+        }
+        _ => api_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "valid device credentials required",
+        ),
+    }
+}
+
+async fn devices(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if state.auth.authenticate_user(&headers).is_err() {
+        return api_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "valid bearer token required",
+        );
+    }
+    let devices: Vec<DeviceSummary> = state
+        .devices
+        .read()
+        .await
+        .values()
+        .map(|d| d.summary.clone())
+        .collect();
+    Json(devices).into_response()
+}
+
+async fn create_session(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateSessionRequest>,
+) -> Response {
+    let user = match state.auth.authenticate_user(&headers) {
+        Ok(p) => p,
+        Err(_) => {
+            return api_error(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "valid bearer token required",
+            );
+        }
+    };
+    match state
+        .create_session(&user.subject, &request.device_id)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(state::CreateSessionError::Offline) => api_error(
+            StatusCode::CONFLICT,
+            "device_offline",
+            "device is not online",
+        ),
+        Err(state::CreateSessionError::NotFound) => api_error(
+            StatusCode::NOT_FOUND,
+            "device_not_found",
+            "device does not exist",
+        ),
+    }
+}
+
+async fn turn_credentials(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let user = match state.auth.authenticate_user(&headers) {
+        Ok(p) => p,
+        Err(_) => {
+            return api_error(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "valid bearer token required",
+            );
+        }
+    };
+    match state.auth.turn_credentials(&user.subject) {
+        Some(credentials) => Json(credentials).into_response(),
+        None => api_error(
+            StatusCode::NOT_FOUND,
+            "turn_not_configured",
+            "TURN is not configured",
+        ),
+    }
+}
+
+async fn ws_upgrade(
+    ws: axum::extract::ws::WebSocketUpgrade,
+    Query(query): Query<WsQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    match state.consume_ticket(&query.ticket).await {
+        Some(principal) => ws
+            .max_message_size(1 << 20)
+            .on_upgrade(move |socket| websocket::serve(socket, state, principal)),
+        None => api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_ticket",
+            "websocket ticket is invalid or expired",
+        ),
+    }
+}
+
+fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({ "code": code, "message": message })),
+    )
+        .into_response()
+}
