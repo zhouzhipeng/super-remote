@@ -121,10 +121,10 @@ def select_hardware_pipeline(ffmpeg: Path) -> tuple[str, str]:
         stderr=subprocess.STDOUT,
     )
     if "h264_nvenc" in encoders:
-        # FFmpeg's ddagrab source can remain open without ever producing a frame
-        # after a Windows display/session transition. gdigrab is the reliable
-        # capture source on this host; encoding still stays on NVIDIA NVENC.
-        return "h264_nvenc", "gdigrab"
+        # Desktop Duplication keeps the full-resolution frame on D3D11 from
+        # capture through scaling and NVENC. setpts in the Host assigns exact
+        # 60 Hz timestamps to duplicated frames from otherwise-static desktops.
+        return "h264_nvenc", "ddagrab"
     if "h264_amf" in encoders:
         return "h264_amf", "gdigrab"
     raise RuntimeError("NVENC 和 AMF 硬件 H.264 编码均不可用；按设计禁止 CPU 编码回退")

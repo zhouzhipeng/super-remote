@@ -14,7 +14,10 @@ use rtc::{
     media::{Sample, io::h26x_reader::H26xSampleReader},
     rtp_transceiver::PayloadType,
 };
-use tokio::sync::watch;
+use tokio::{
+    sync::{mpsc, mpsc::error::TrySendError, watch},
+    time::MissedTickBehavior,
+};
 use webrtc::media_stream::{Track, track_local::static_sample::TrackLocalStaticSample};
 
 use crate::{config::HostConfig, stats::HostStats};
@@ -105,6 +108,7 @@ async fn stream_ffmpeg(
     let bitrate = config.bitrate.to_string();
     let buffer_size = (config.bitrate / u32::from(config.fps)).to_string();
     let fps = config.fps.to_string();
+    let desktop_duplication_fps = (u32::from(config.fps) * 5 / 4).to_string();
     let gop = (u32::from(config.fps) * 2).to_string();
     let (level, _) = config.h264_level();
     let scale = if config.ffmpeg_capture_mode == "ddagrab" {
@@ -135,7 +139,7 @@ async fn stream_ffmpeg(
             "-i".to_owned(),
             format!(
                 "ddagrab=output_idx={}:draw_mouse=1:framerate={}:dup_frames=1",
-                config.monitor_index, fps
+                config.monitor_index, desktop_duplication_fps
             ),
         ]);
     } else {
@@ -184,7 +188,7 @@ async fn stream_ffmpeg(
                 "-delay",
                 "0",
                 "-surfaces",
-                "1",
+                "2",
                 "-zerolatency",
                 "1",
                 "-forced-idr",
@@ -229,7 +233,10 @@ async fn stream_ffmpeg(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("FFmpeg stdout was not piped"))?;
-    let (frame_tx, mut frame_rx) = watch::channel::<Option<Bytes>>(None);
+    // Keep a two-frame producer/consumer cushion. Desktop Duplication and NVENC
+    // can deliver adjacent frames in small bursts; pacing this queue at the RTP
+    // clock prevents those bursts from becoming browser-visible jitter.
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Bytes>(2);
     let reader_active = active.clone();
     std::thread::Builder::new()
         .name("desktop-h264-reader".into())
@@ -237,11 +244,14 @@ async fn stream_ffmpeg(
 
     let duration = Duration::from_secs_f64(1.0 / f64::from(config.fps));
     let ssrc = track_ssrc(&track).await?;
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + duration, duration);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let result = async {
-        while active.load(Ordering::Acquire) && frame_rx.changed().await.is_ok() {
-            let Some(data) = frame_rx.borrow_and_update().clone() else {
-                continue;
+        while active.load(Ordering::Acquire) {
+            let Some(data) = frame_rx.recv().await else {
+                break;
             };
+            ticker.tick().await;
             track
                 .sample_writer(ssrc, payload_type)
                 .write_sample(&Sample {
@@ -261,7 +271,7 @@ async fn stream_ffmpeg(
 
 fn read_latest_ffmpeg_frame(
     stdout: std::process::ChildStdout,
-    frame_tx: watch::Sender<Option<Bytes>>,
+    frame_tx: mpsc::Sender<Bytes>,
     active: Arc<AtomicBool>,
 ) {
     let mut reader = H26xSampleReader::new(BufReader::new(stdout), 4 * 1024 * 1024, false);
@@ -280,7 +290,10 @@ fn read_latest_ffmpeg_frame(
             prefix.reserve(4 + sample.data.len());
             prefix.put_slice(&[0, 0, 0, 1]);
             prefix.put_slice(&sample.data);
-            frame_tx.send_replace(Some(prefix.split().freeze()));
+            match frame_tx.try_send(prefix.split().freeze()) {
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Closed(_)) => break,
+            }
         } else {
             prefix.reserve(4 + sample.data.len());
             prefix.put_slice(&[0, 0, 0, 1]);
