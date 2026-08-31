@@ -50,8 +50,8 @@ virtual desktop, including every enabled secondary display, while a client is co
 The overlay is excluded from Windows capture, so the remote picture and input continue
 normally, and it is removed automatically at disconnect. “Web 客户端连接后静音主机声音”
 mutes the Host's default playback endpoint without silencing the WebRTC loopback stream;
-disconnect restores the endpoint's previous mute state. Both preferences are stored in
-`.run/control-settings.json`.
+the endpoint remains muted after disconnect until the user explicitly unmutes it in Windows.
+Both preferences are stored in `.run/control-settings.json`.
 
 ```powershell
 npm --prefix web install

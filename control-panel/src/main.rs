@@ -135,7 +135,6 @@ mod windows_app {
 
     struct AudioMuteLease {
         endpoint: IAudioEndpointVolume,
-        previous_muted: bool,
     }
 
     struct App {
@@ -404,7 +403,7 @@ mod windows_app {
                     self.window,
                     instance,
                     w!("STATIC"),
-                    w!("静音本机默认播放设备；客户端断开后恢复原状态。"),
+                    w!("静音本机默认播放设备；客户端断开后仍保持静音。"),
                     scale(52),
                     scale(412),
                     scale(520),
@@ -663,33 +662,24 @@ mod windows_app {
                     return;
                 }
                 match default_audio_endpoint_volume() {
-                    Ok(endpoint) => {
-                        let previous_muted = unsafe { endpoint.GetMute() }
-                            .map(|value| value.as_bool())
-                            .unwrap_or(false);
-                        match unsafe { endpoint.SetMute(true, std::ptr::null()) } {
-                            Ok(()) => {
-                                self.audio_mute = Some(AudioMuteLease {
-                                    endpoint,
-                                    previous_muted,
-                                });
-                            }
-                            Err(error) => {
-                                set_text(self.action_label, &format!("无法静音主机声音：{error}"))
-                            }
+                    Ok(endpoint) => match unsafe { endpoint.SetMute(true, std::ptr::null()) } {
+                        Ok(()) => {
+                            self.audio_mute = Some(AudioMuteLease { endpoint });
                         }
-                    }
+                        Err(error) => {
+                            set_text(self.action_label, &format!("无法静音主机声音：{error}"))
+                        }
+                    },
                     Err(error) => set_text(
                         self.action_label,
                         &format!("找不到可静音的默认播放设备：{error}"),
                     ),
                 }
-            } else if let Some(lease) = self.audio_mute.take() {
-                let _ = unsafe {
-                    lease
-                        .endpoint
-                        .SetMute(lease.previous_muted, std::ptr::null())
-                };
+            } else {
+                // Releasing the policy lease deliberately does not unmute the
+                // endpoint. Disconnecting a remote client must leave the Host
+                // silent until the user explicitly unmutes it in Windows.
+                self.audio_mute.take();
             }
         }
 
@@ -738,7 +728,7 @@ mod windows_app {
                 privacy_overlay_visible: self.privacy_visible,
                 privacy_overlay_bounds: virtual_screen_bounds(),
                 host_audio_mute_requested: self.settings.mute_host_audio_on_connect,
-                host_audio_muted: self.audio_mute.is_some(),
+                host_audio_muted: default_audio_endpoint_is_muted(),
                 updated_at_unix_ms: now_ms(),
             };
             let _ = write_json(&self.run_dir.join("panel-state.json"), &state);
@@ -1030,6 +1020,13 @@ mod windows_app {
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }?;
         let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }?;
         unsafe { device.Activate(CLSCTX_ALL, None) }
+    }
+
+    fn default_audio_endpoint_is_muted() -> bool {
+        default_audio_endpoint_volume()
+            .and_then(|endpoint| unsafe { endpoint.GetMute() })
+            .map(|muted| muted.as_bool())
+            .unwrap_or(false)
     }
 
     fn process_running(process_id: u32) -> bool {
