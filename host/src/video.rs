@@ -38,6 +38,11 @@ pub async fn stream(
         )
         .await;
     }
+    // Acquiring this guard is intentionally below the prerecorded-file path
+    // and inside stream(): rtc only calls stream() once a client is connected.
+    // Idle hosts therefore hold no display/system power request.
+    #[cfg(windows)]
+    let _display_power = crate::display_power::DisplayPowerGuard::acquire()?;
     if let Some(path) = config.ffmpeg_path.clone() {
         return stream_ffmpeg(path, config, track, payload_type, stats, active).await;
     }
@@ -261,35 +266,69 @@ async fn stream_ffmpeg(
     let ssrc = track_ssrc(&track).await?;
     // The initial IDR carries the SPS/PPS needed to configure a browser decoder.
     // Deliver it reliably before switching to replaceable low-latency frames.
-    let initial_data = initial_frame_rx
-        .await
-        .map_err(|_| anyhow::anyhow!("FFmpeg stopped before its initial keyframe"))?;
-    track
+    let mut initial_frame_rx = initial_frame_rx;
+    let initial_data = loop {
+        tokio::select! {
+            result = &mut initial_frame_rx => {
+                break result.map_err(|_| anyhow::anyhow!(
+                    "FFmpeg stopped before its initial keyframe"
+                ))?;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                if !active.load(Ordering::Acquire) {
+                    let _ = child.kill();
+                    return Ok(());
+                }
+            }
+        }
+    };
+    let initial_write = track
         .sample_writer(ssrc, payload_type)
         .write_sample(&Sample {
             data: initial_data,
             duration,
             ..Default::default()
         })
-        .await?;
+        .await;
+    if let Err(error) = initial_write {
+        if !active.load(Ordering::Acquire) {
+            let _ = child.kill();
+            return Ok(());
+        }
+        return Err(error.into());
+    }
     stats.frames_sent.fetch_add(1, Ordering::Relaxed);
     let mut sent_in_window = 0u64;
     let mut max_write_time = Duration::ZERO;
     let mut report_at = tokio::time::Instant::now() + Duration::from_secs(5);
     let result = async {
         while active.load(Ordering::Acquire) {
-            let Some(data) = frame_rx.recv().await else {
-                break;
+            let data = tokio::select! {
+                data = frame_rx.recv() => {
+                    let Some(data) = data else {
+                        break;
+                    };
+                    data
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    continue;
+                }
             };
             let write_started = tokio::time::Instant::now();
-            track
+            let write_result = track
                 .sample_writer(ssrc, payload_type)
                 .write_sample(&Sample {
                     data,
                     duration,
                     ..Default::default()
                 })
-                .await?;
+                .await;
+            if let Err(error) = write_result {
+                if !active.load(Ordering::Acquire) {
+                    break;
+                }
+                return Err(error.into());
+            }
             max_write_time = max_write_time.max(write_started.elapsed());
             stats.frames_sent.fetch_add(1, Ordering::Relaxed);
             sent_in_window += 1;

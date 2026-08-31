@@ -1,5 +1,7 @@
 mod audio;
 mod config;
+#[cfg(windows)]
+mod display_power;
 mod input;
 mod rtc;
 mod signaling;
@@ -17,6 +19,13 @@ use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    unsafe {
+        windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        )
+    }
+    .context("failed to enable per-monitor V2 DPI awareness")?;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()

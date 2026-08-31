@@ -53,14 +53,20 @@ pub async fn stream(
             }
             return Ok(());
         };
-        track
+        let result = track
             .sample_writer(ssrc, payload_type)
             .write_sample(&Sample {
                 data: Bytes::from(packet),
                 duration,
                 ..Default::default()
             })
-            .await?;
+            .await;
+        if let Err(error) = result {
+            if !active.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
     }
     Ok(())
 }

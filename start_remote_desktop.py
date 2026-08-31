@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 import importlib
 import base64
 import hashlib
@@ -29,6 +30,139 @@ FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 PORT = 8080
 DEVICE_ID = "local-windows-pc"
 PERMANENT_EXPIRY = 253_402_300_799  # 9999-12-31T23:59:59Z
+
+
+def is_process_elevated() -> bool:
+    """Return true only for a fully elevated UAC token, not group membership."""
+    token_query = 0x0008
+    token_elevation = 20
+    token = wintypes.HANDLE()
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        elevated = wintypes.DWORD()
+        returned = wintypes.DWORD()
+        if not advapi32.GetTokenInformation(
+            token,
+            token_elevation,
+            ctypes.byref(elevated),
+            ctypes.sizeof(elevated),
+            ctypes.byref(returned),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return elevated.value != 0
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def relaunch_as_administrator() -> None:
+    """Relaunch this exact command through UAC so Host can control elevated apps."""
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.ShellExecuteW.argtypes = [
+        wintypes.HWND,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        ctypes.c_int,
+    ]
+    shell32.ShellExecuteW.restype = ctypes.c_void_p
+    parameters = subprocess.list2cmdline([str(Path(__file__).resolve()), *sys.argv[1:]])
+    result = shell32.ShellExecuteW(
+        None,
+        "runas",
+        sys.executable,
+        parameters,
+        str(ROOT),
+        1,
+    )
+    if not result or int(result) <= 32:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def process_image_path(process_id: int) -> Path | None:
+    """Read a PID's image path without trusting status.json as an authority."""
+    process_query_limited_information = 0x1000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(process_query_limited_information, False, process_id)
+    if not handle:
+        return None
+    try:
+        buffer = ctypes.create_unicode_buffer(32_768)
+        size = wintypes.DWORD(len(buffer))
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return None
+        return Path(buffer.value).resolve()
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def stop_existing_stack() -> None:
+    """Stop only a previous stack whose executable paths match this project."""
+    status_file = RUN_DIR / "status.json"
+    if not status_file.exists():
+        return
+    try:
+        previous = json.loads(status_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    expected = {
+        "host_pid": (ROOT / "target" / "release" / "remote-host.exe").resolve(),
+        "signaling_pid": (ROOT / "target" / "release" / "remote-signaling.exe").resolve(),
+    }
+    stopped_process_ids: list[int] = []
+    for key, expected_path in expected.items():
+        process_id = previous.get(key)
+        if not isinstance(process_id, int) or process_image_path(process_id) != expected_path:
+            continue
+        print(f"正在停止旧实例：{expected_path.name} (PID {process_id})", flush=True)
+        result = subprocess.run(
+            ["taskkill.exe", "/PID", str(process_id), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.returncode != 0 and process_image_path(process_id) is not None:
+            raise RuntimeError(f"无法停止旧进程 {process_id}")
+        stopped_process_ids.append(process_id)
+    if stopped_process_ids:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if all(process_image_path(process_id) is None for process_id in stopped_process_ids):
+                break
+            time.sleep(0.1)
 
 
 def run(command: list[str], *, env: dict[str, str] | None = None) -> None:
@@ -240,7 +374,12 @@ def wait_for_device(base_url: str, token: str, process: subprocess.Popen[bytes],
 def main() -> int:
     if os.name != "nt":
         raise RuntimeError("这个启动脚本当前只支持 Windows")
+    if not is_process_elevated():
+        print("正在申请管理员权限（用于控制任务管理器等提升权限的窗口）…", flush=True)
+        relaunch_as_administrator()
+        return 0
     RUN_DIR.mkdir(parents=True, exist_ok=True)
+    stop_existing_stack()
     # Establish per-monitor DPI awareness before importing qrcode/Pillow. Pillow
     # may otherwise lock Python to system-DPI awareness, making GetSystemMetrics
     # return the scaled logical desktop (for example 1512x950) instead of the
@@ -346,6 +485,7 @@ def main() -> int:
             "stream": f"{width}x{height}",
             "encoder": encoder,
             "capture_mode": capture_mode,
+            "elevated": True,
         }
         (RUN_DIR / "status.json").write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
         print("\n远程桌面已启动", flush=True)
