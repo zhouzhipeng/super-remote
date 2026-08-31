@@ -26,7 +26,15 @@ mod windows_app {
                 BLACK_BRUSH, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH,
                 FF_DONTCARE, FW_NORMAL, GetStockObject, HBRUSH, HGDIOBJ, PROOF_QUALITY,
             },
+            Media::Audio::{
+                Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole,
+                eRender,
+            },
             System::{
+                Com::{
+                    CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+                    CoUninitialize,
+                },
                 LibraryLoader::GetModuleHandleW,
                 Threading::{
                     CREATE_NEW_PROCESS_GROUP, CreateMutexW, DETACHED_PROCESS, OpenProcess,
@@ -45,14 +53,15 @@ mod windows_app {
                     DispatchMessageW, FindWindowW, GWLP_USERDATA, GetMessageW, GetSystemMetrics,
                     GetWindowLongPtrW, HMENU, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, LoadCursorW,
                     MB_ICONERROR, MB_OK, MSG, MessageBoxW, PostQuitMessage, RegisterClassW,
-                    SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW, SW_SHOWNA, SW_SHOWNORMAL,
-                    SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetForegroundWindow, SetTimer,
-                    SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-                    ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE,
-                    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE,
-                    WM_NCHITTEST, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_NOACTIVATE,
-                    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW,
-                    WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+                    SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+                    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW, SW_SHOWNA,
+                    SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW,
+                    SetForegroundWindow, SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW,
+                    SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
+                    WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
+                    WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_NCHITTEST, WM_SETFONT, WM_TIMER,
+                    WNDCLASSW, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                    WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
                 },
             },
         },
@@ -70,6 +79,7 @@ mod windows_app {
     const ID_OPEN_WEB: usize = 104;
     const ID_OPEN_QR: usize = 105;
     const ID_PRIVACY: usize = 106;
+    const ID_HOST_MUTE: usize = 107;
 
     #[derive(Clone, Default, Deserialize)]
     struct LauncherStatus {
@@ -104,6 +114,8 @@ mod windows_app {
     struct PanelSettings {
         #[serde(default)]
         privacy_screen_on_connect: bool,
+        #[serde(default)]
+        mute_host_audio_on_connect: bool,
     }
 
     #[derive(Serialize)]
@@ -114,7 +126,15 @@ mod windows_app {
         privacy_requested: bool,
         privacy_supported: bool,
         privacy_overlay_visible: bool,
+        privacy_overlay_bounds: [i32; 4],
+        host_audio_mute_requested: bool,
+        host_audio_muted: bool,
         updated_at_unix_ms: u128,
+    }
+
+    struct AudioMuteLease {
+        endpoint: IAudioEndpointVolume,
+        previous_muted: bool,
     }
 
     struct App {
@@ -126,11 +146,14 @@ mod windows_app {
         video_label: HWND,
         address_label: HWND,
         policy_label: HWND,
+        audio_policy_label: HWND,
         action_label: HWND,
         privacy_checkbox: HWND,
+        host_mute_checkbox: HWND,
         overlay: HWND,
         privacy_supported: bool,
         privacy_visible: bool,
+        audio_mute: Option<AudioMuteLease>,
         settings: PanelSettings,
     }
 
@@ -146,11 +169,14 @@ mod windows_app {
                 video_label: HWND::default(),
                 address_label: HWND::default(),
                 policy_label: HWND::default(),
+                audio_policy_label: HWND::default(),
                 action_label: HWND::default(),
                 privacy_checkbox: HWND::default(),
+                host_mute_checkbox: HWND::default(),
                 overlay: HWND::default(),
                 privacy_supported: false,
                 privacy_visible: false,
+                audio_mute: None,
                 settings: PanelSettings::default(),
             }
         }
@@ -349,11 +375,39 @@ mod windows_app {
                     self.window,
                     instance,
                     w!("STATIC"),
-                    w!("本机显示纯黑画面；远端捕获与鼠标键盘操作保持正常。"),
+                    w!("所有显示器变黑；远端画面与鼠标键盘输入不受影响。"),
                     scale(52),
                     scale(334),
                     scale(520),
+                    scale(32),
+                    0,
+                    0,
+                )?
+            };
+            self.host_mute_checkbox = unsafe {
+                child(
+                    self.window,
+                    instance,
+                    w!("BUTTON"),
+                    w!("Web 客户端连接后静音主机声音"),
+                    scale(30),
+                    scale(376),
+                    scale(550),
+                    scale(32),
+                    BS_AUTOCHECKBOX as u32,
+                    ID_HOST_MUTE,
+                )?
+            };
+            self.audio_policy_label = unsafe {
+                child(
+                    self.window,
+                    instance,
+                    w!("STATIC"),
+                    w!("静音本机默认播放设备；客户端断开后恢复原状态。"),
                     scale(52),
+                    scale(412),
+                    scale(520),
+                    scale(32),
                     0,
                     0,
                 )?
@@ -365,7 +419,7 @@ mod windows_app {
                     w!("STATIC"),
                     w!(""),
                     scale(30),
-                    scale(408),
+                    scale(466),
                     scale(550),
                     scale(32),
                     0,
@@ -379,8 +433,10 @@ mod windows_app {
                 self.video_label,
                 self.address_label,
                 self.policy_label,
+                self.audio_policy_label,
                 self.action_label,
                 self.privacy_checkbox,
+                self.host_mute_checkbox,
             ] {
                 unsafe { set_font(control, font.into()) };
             }
@@ -394,21 +450,28 @@ mod windows_app {
                     Some(WPARAM(usize::from(self.settings.privacy_screen_on_connect))),
                     None,
                 );
+                SendMessageW(
+                    self.host_mute_checkbox,
+                    BM_SETCHECK,
+                    Some(WPARAM(usize::from(
+                        self.settings.mute_host_audio_on_connect,
+                    ))),
+                    None,
+                );
             }
             Ok(())
         }
 
         unsafe fn create_overlay(&mut self, instance: HINSTANCE) -> windows::core::Result<()> {
-            let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-            let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+            let [x, y, width, height] = virtual_screen_bounds();
             self.overlay = unsafe {
                 CreateWindowExW(
                     WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
                     OVERLAY_CLASS,
                     w!("Super Remote Privacy Screen"),
                     WS_POPUP,
-                    0,
-                    0,
+                    x,
+                    y,
                     width,
                     height,
                     None,
@@ -516,11 +579,20 @@ mod windows_app {
                         Some(WPARAM(usize::from(self.settings.privacy_screen_on_connect))),
                         None,
                     );
+                    SendMessageW(
+                        self.host_mute_checkbox,
+                        BM_SETCHECK,
+                        Some(WPARAM(usize::from(
+                            self.settings.mute_host_audio_on_connect,
+                        ))),
+                        None,
+                    );
                 }
             }
             let should_show =
                 connected && self.privacy_supported && self.settings.privacy_screen_on_connect;
             self.set_privacy_visible(should_show);
+            self.set_host_audio_muted(connected && self.settings.mute_host_audio_on_connect);
             self.write_runtime_state(services_running, connected);
         }
 
@@ -530,13 +602,12 @@ mod windows_app {
             }
             unsafe {
                 if visible {
-                    let width = GetSystemMetrics(SM_CXSCREEN);
-                    let height = GetSystemMetrics(SM_CYSCREEN);
+                    let [x, y, width, height] = virtual_screen_bounds();
                     let _ = SetWindowPos(
                         self.overlay,
                         Some(HWND_TOPMOST),
-                        0,
-                        0,
+                        x,
+                        y,
                         width,
                         height,
                         SWP_NOACTIVATE | SWP_SHOWWINDOW,
@@ -550,7 +621,7 @@ mod windows_app {
             set_text(
                 self.action_label,
                 if visible {
-                    "隐私黑屏已启用；客户端断开后会自动恢复本机画面。"
+                    "所有显示器隐私黑屏已启用；客户端断开后会自动恢复。"
                 } else {
                     ""
                 },
@@ -569,6 +640,51 @@ mod windows_app {
             self.settings.privacy_screen_on_connect = checked;
             let _ = write_json(&self.run_dir.join("control-settings.json"), &self.settings);
             self.refresh();
+        }
+
+        fn toggle_host_mute_setting(&mut self) {
+            let checked =
+                unsafe { SendMessageW(self.host_mute_checkbox, BM_GETCHECK, None, None).0 == 1 };
+            self.settings.mute_host_audio_on_connect = checked;
+            let _ = write_json(&self.run_dir.join("control-settings.json"), &self.settings);
+            self.refresh();
+        }
+
+        fn set_host_audio_muted(&mut self, muted: bool) {
+            if muted {
+                if let Some(lease) = &self.audio_mute {
+                    let _ = unsafe { lease.endpoint.SetMute(true, std::ptr::null()) };
+                    return;
+                }
+                match default_audio_endpoint_volume() {
+                    Ok(endpoint) => {
+                        let previous_muted = unsafe { endpoint.GetMute() }
+                            .map(|value| value.as_bool())
+                            .unwrap_or(false);
+                        match unsafe { endpoint.SetMute(true, std::ptr::null()) } {
+                            Ok(()) => {
+                                self.audio_mute = Some(AudioMuteLease {
+                                    endpoint,
+                                    previous_muted,
+                                });
+                            }
+                            Err(error) => {
+                                set_text(self.action_label, &format!("无法静音主机声音：{error}"))
+                            }
+                        }
+                    }
+                    Err(error) => set_text(
+                        self.action_label,
+                        &format!("找不到可静音的默认播放设备：{error}"),
+                    ),
+                }
+            } else if let Some(lease) = self.audio_mute.take() {
+                let _ = unsafe {
+                    lease
+                        .endpoint
+                        .SetMute(lease.previous_muted, std::ptr::null())
+                };
+            }
         }
 
         fn action(&self, kind: Action) {
@@ -614,6 +730,9 @@ mod windows_app {
                 privacy_requested: self.settings.privacy_screen_on_connect,
                 privacy_supported: self.privacy_supported,
                 privacy_overlay_visible: self.privacy_visible,
+                privacy_overlay_bounds: virtual_screen_bounds(),
+                host_audio_mute_requested: self.settings.mute_host_audio_on_connect,
+                host_audio_muted: self.audio_mute.is_some(),
                 updated_at_unix_ms: now_ms(),
             };
             let _ = write_json(&self.run_dir.join("panel-state.json"), &state);
@@ -653,13 +772,16 @@ mod windows_app {
         let module = unsafe { GetModuleHandleW(None) }.map_err(|error| error.to_string())?;
         let instance = HINSTANCE(module.0);
         register_classes(instance)?;
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+            .ok()
+            .map_err(|error| format!("failed to initialize COM: {error}"))?;
 
         let mut app = Box::new(App::empty(root));
         let app_ptr = (&mut *app) as *mut App;
         let dpi = unsafe { GetDpiForSystem() } as i32;
         let scale = |value: i32| value * dpi / 96;
         let panel_width = scale(640);
-        let panel_height = scale(500);
+        let panel_height = scale(570);
         let panel_x = (unsafe { GetSystemMetrics(SM_CXSCREEN) } - panel_width) / 2;
         let panel_y = (unsafe { GetSystemMetrics(SM_CYSCREEN) } - panel_height) / 2;
         app.window = unsafe {
@@ -697,26 +819,35 @@ mod windows_app {
             }
         }
         app.set_privacy_visible(false);
+        app.set_host_audio_muted(false);
         unsafe { CloseHandle(mutex).ok() };
+        unsafe { CoUninitialize() };
         Ok(())
     }
 
     fn handle_command(root: &Path) -> Result<bool, String> {
         let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-        let value = match arguments.as_slice() {
-            [flag, value] if flag == "--set-privacy" => Some(match value.as_str() {
-                "true" | "1" | "on" => true,
-                "false" | "0" | "off" => false,
-                _ => return Err("--set-privacy expects true or false".into()),
-            }),
-            _ => None,
+        let (field, value) = match arguments.as_slice() {
+            [flag, value] if flag == "--set-privacy" || flag == "--set-host-mute" => {
+                let parsed = match value.as_str() {
+                    "true" | "1" | "on" => true,
+                    "false" | "0" | "off" => false,
+                    _ => return Err(format!("{flag} expects true or false")),
+                };
+                (Some(flag.as_str()), Some(parsed))
+            }
+            _ => (None, None),
         };
-        let Some(value) = value else {
+        let (Some(field), Some(value)) = (field, value) else {
             return Ok(false);
         };
-        let settings = PanelSettings {
-            privacy_screen_on_connect: value,
-        };
+        let mut settings: PanelSettings =
+            read_json(&root.join(".run/control-settings.json")).unwrap_or_default();
+        if field == "--set-privacy" {
+            settings.privacy_screen_on_connect = value;
+        } else {
+            settings.mute_host_audio_on_connect = value;
+        }
         write_json(&root.join(".run/control-settings.json"), &settings)
             .map_err(|error| error.to_string())?;
         Ok(true)
@@ -789,6 +920,7 @@ mod windows_app {
                         ID_OPEN_WEB => app.action(Action::OpenWeb),
                         ID_OPEN_QR => app.action(Action::OpenQr),
                         ID_PRIVACY => app.toggle_privacy_setting(),
+                        ID_HOST_MUTE => app.toggle_host_mute_setting(),
                         _ => {}
                     }
                 }
@@ -800,7 +932,10 @@ mod windows_app {
             }
             WM_DESTROY => {
                 if !app_ptr.is_null() {
-                    unsafe { (&mut *app_ptr).set_privacy_visible(false) };
+                    unsafe {
+                        (&mut *app_ptr).set_privacy_visible(false);
+                        (&mut *app_ptr).set_host_audio_muted(false);
+                    };
                 }
                 unsafe { PostQuitMessage(0) };
                 LRESULT(0)
@@ -873,6 +1008,22 @@ mod windows_app {
         }
         let text = HSTRING::from(text);
         let _ = unsafe { SetWindowTextW(window, &text) };
+    }
+
+    fn virtual_screen_bounds() -> [i32; 4] {
+        [
+            unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
+            unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
+            unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) },
+            unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) },
+        ]
+    }
+
+    fn default_audio_endpoint_volume() -> windows::core::Result<IAudioEndpointVolume> {
+        let enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }?;
+        let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }?;
+        unsafe { device.Activate(CLSCTX_ALL, None) }
     }
 
     fn process_running(process_id: u32) -> bool {

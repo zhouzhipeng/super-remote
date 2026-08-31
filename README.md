@@ -45,10 +45,13 @@ The control panel is opened automatically with the elevated Host. It shows the H
 Signaling process state, browser connection state, active stream size/FPS/bitrate/encoder,
 primary-display capture details and whether the capture pipeline is idle. Use its buttons
 to start, stop or restart the stack, open the Web client, or view the current QR code.
-The optional “Web 客户端连接后启用本机隐私黑屏” setting covers the physical primary
-display only while a client is connected. The overlay is excluded from Windows capture,
-so the remote picture and input continue normally, and it is removed automatically at
-disconnect. The preference is stored in `.run/control-settings.json`.
+The optional “Web 客户端连接后启用本机隐私黑屏” setting covers the complete Windows
+virtual desktop, including every enabled secondary display, while a client is connected.
+The overlay is excluded from Windows capture, so the remote picture and input continue
+normally, and it is removed automatically at disconnect. “Web 客户端连接后静音主机声音”
+mutes the Host's default playback endpoint without silencing the WebRTC loopback stream;
+disconnect restores the endpoint's previous mute state. Both preferences are stored in
+`.run/control-settings.json`.
 
 ```powershell
 npm --prefix web install
