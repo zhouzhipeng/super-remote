@@ -31,6 +31,7 @@ FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 DEFAULT_PORT = 8080
 DEVICE_ID = "local-windows-pc"
 PERMANENT_EXPIRY = 253_402_300_799  # 9999-12-31T23:59:59Z
+PRODUCTION_MANIFEST = ROOT / "production-manifest.json"
 
 
 def is_process_elevated() -> bool:
@@ -169,6 +170,48 @@ def stop_existing_stack() -> None:
 def run(command: list[str], *, env: dict[str, str] | None = None) -> None:
     print("+", subprocess.list2cmdline(command), flush=True)
     subprocess.run(command, cwd=ROOT, env=env, check=True)
+
+
+def validate_production_package() -> None:
+    required = [
+        ROOT / "web" / "dist" / "index.html",
+        *(ROOT / "target" / "release" / name for name in (
+            "remote-signaling.exe",
+            "remote-host.exe",
+            "remote-control-panel.exe",
+        )),
+    ]
+    missing = [str(path.relative_to(ROOT)) for path in required if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"生产包不完整，缺少：{', '.join(missing)}")
+    try:
+        manifest = json.loads(PRODUCTION_MANIFEST.read_text(encoding="utf-8"))
+        files = manifest["files"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise RuntimeError(f"生产包清单无效：{error}") from error
+    if manifest.get("schema") != 1 or manifest.get("product") != "super-remote":
+        raise RuntimeError("生产包清单的格式或产品名称无效")
+    if not isinstance(files, dict) or not files:
+        raise RuntimeError("生产包清单没有文件记录")
+    root = ROOT.resolve()
+    for relative, metadata in files.items():
+        if not isinstance(relative, str) or not isinstance(metadata, dict):
+            raise RuntimeError("生产包清单包含无效文件记录")
+        path = (root / relative).resolve()
+        if path == root or root not in path.parents:
+            raise RuntimeError(f"生产包清单包含越界路径：{relative}")
+        if not path.is_file():
+            raise RuntimeError(f"生产包缺少清单文件：{relative}")
+        expected_size = metadata.get("size")
+        expected_hash = metadata.get("sha256")
+        if path.stat().st_size != expected_size:
+            raise RuntimeError(f"生产包文件大小校验失败：{relative}")
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != expected_hash:
+            raise RuntimeError(f"生产包文件 SHA-256 校验失败：{relative}")
 
 
 def find_ffmpeg() -> Path:
@@ -380,6 +423,11 @@ def main() -> int:
         relaunch_as_administrator()
         return 0
     RUN_DIR.mkdir(parents=True, exist_ok=True)
+    production_package = PRODUCTION_MANIFEST.is_file()
+    if production_package:
+        # Validate before stopping a healthy existing stack so a truncated or
+        # corrupted package cannot strand the machine without a running Host.
+        validate_production_package()
     stop_existing_stack()
     if "--stop" in sys.argv[1:]:
         print("远程桌面服务已停止。", flush=True)
@@ -431,23 +479,26 @@ def main() -> int:
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise RuntimeError("Web 服务端口必须是 1 到 65535 之间的整数")
 
-    run(["npm.cmd", "--prefix", "web", "install", "--no-audit", "--no-fund"])
-    run(["npm.cmd", "--prefix", "web", "run", "build"])
-    build_command = [
-        "cargo",
-        "build",
-        "--release",
-        "-p",
-        "remote-signaling",
-        "-p",
-        "remote-host",
-    ]
-    # A running control panel keeps its executable locked on Windows. Panel-initiated
-    # service restarts already run the installed panel binary, so rebuilding it here
-    # would fail after the old Host/Signaling processes have been stopped.
-    if "--from-control-panel" not in sys.argv[1:]:
-        build_command.extend(["-p", "remote-control-panel"])
-    run(build_command)
+    if production_package:
+        print("检测到生产二进制包，跳过 npm/Cargo 编译。", flush=True)
+    else:
+        run(["npm.cmd", "--prefix", "web", "install", "--no-audit", "--no-fund"])
+        run(["npm.cmd", "--prefix", "web", "run", "build"])
+        build_command = [
+            "cargo",
+            "build",
+            "--release",
+            "-p",
+            "remote-signaling",
+            "-p",
+            "remote-host",
+        ]
+        # A running control panel keeps its executable locked on Windows. Panel-initiated
+        # service restarts already run the installed panel binary, so rebuilding it here
+        # would fail after the old Host/Signaling processes have been stopped.
+        if "--from-control-panel" not in sys.argv[1:]:
+            build_command.extend(["-p", "remote-control-panel"])
+        run(build_command)
 
     base_url = f"http://{ip}:{port}"
     host_config = RUN_DIR / "remote-host.toml"

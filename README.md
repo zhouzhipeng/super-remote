@@ -66,6 +66,21 @@ npm --prefix web run build
 cargo test --workspace
 ```
 
+To build a distributable Windows production package without replacing binaries used by a
+currently running Host, run:
+
+```powershell
+python build_production.py
+```
+
+The script uses an isolated Cargo target directory, runs Web/Rust tests, performs locked
+release builds, validates the PE binaries and Web assets, and writes a versioned runtime
+directory, ZIP archive, manifest with per-file SHA-256 hashes, and ZIP checksum under
+`artifacts/`. The archive contains no runtime credentials or `.run` data. After extracting
+it, start the packaged application with `python start_remote_desktop.py`; packaged launches
+validate the bundled files and skip npm/Cargo compilation. Use `--skip-tests`, `--no-archive`,
+`--output-dir`, or `--target-dir` when needed.
+
 Set non-development secrets before starting the server. No insecure fallback credentials
 are compiled in.
 
