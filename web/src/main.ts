@@ -26,7 +26,7 @@ async function devicesView(): Promise<void> {
 }
 
 async function sessionView(deviceId: string): Promise<void> {
-  app.innerHTML = `<main class="remote"><video id="remote" autoplay muted playsinline tabindex="0"></video><div class="toolbar"><button id="back" class="secondary">断开</button><button id="sound">开启声音</button><button id="fullscreen" class="secondary" aria-pressed="false">全屏</button><button id="toolbar-pin" class="secondary" aria-pressed="true">取消固定</button><span id="state">正在连接</span><span id="stats"></span></div></main>`;
+  app.innerHTML = `<main class="remote"><video id="remote" autoplay muted playsinline tabindex="0"></video><div class="toolbar-corner-hint" aria-hidden="true"><span>⌄</span><span>控制条</span></div><div class="toolbar"><button id="back" class="secondary">断开</button><button id="sound">开启声音</button><button id="fullscreen" class="secondary" aria-pressed="false">全屏</button><button id="toolbar-pin" class="secondary" aria-pressed="true">取消固定</button><span id="state">正在连接</span><span id="stats"></span></div></main>`;
   const remote = app.querySelector<HTMLElement>(".remote")!;
   const video = app.querySelector<HTMLVideoElement>("#remote")!;
   const toolbar = app.querySelector<HTMLElement>(".toolbar")!;
@@ -93,7 +93,11 @@ async function sessionView(deviceId: string): Promise<void> {
     }
   };
   applyToolbarMode(toolbarPinned, false);
-  pinButton.addEventListener("click", () => { applyToolbarMode(!toolbarPinned, true); });
+  pinButton.addEventListener("click", () => {
+    const pinned = !toolbarPinned;
+    applyToolbarMode(pinned, true);
+    if (!pinned) video.focus({ preventScroll: true });
+  });
   remote.addEventListener("pointermove", (event) => {
     if (!toolbarPinned && event.clientX <= 64 && event.clientY <= 64) {
       setToolbarVisible(true, true);
@@ -101,6 +105,13 @@ async function sessionView(deviceId: string): Promise<void> {
   });
   toolbar.addEventListener("pointerenter", () => { window.clearTimeout(toolbarHideTimer); });
   toolbar.addEventListener("pointerleave", () => { setToolbarVisible(true, true); });
+  toolbar.addEventListener("pointerup", (event) => {
+    if (toolbarPinned || !(event.target instanceof HTMLButtonElement)) return;
+    // A clicked button retaining focus would keep :focus-within active forever.
+    // Return focus to the remote surface and restart the normal hide countdown.
+    video.focus({ preventScroll: true });
+    setToolbarVisible(true, true);
+  });
 
   const updateFullscreenButton = (): void => {
     const fullscreen = document.fullscreenElement === remote;

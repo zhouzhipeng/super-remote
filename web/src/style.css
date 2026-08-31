@@ -27,6 +27,9 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 #stats { margin-left: auto; }
 .remote:fullscreen { grid-template-rows: minmax(0, 1fr) auto; }
 .remote.toolbar-unpinned { display: block; }
-.remote.toolbar-unpinned .toolbar { position: absolute; left: 50%; top: max(.7rem, env(safe-area-inset-top)); width: max-content; max-width: calc(100% - 1rem); border: 1px solid #ffffff20; border-radius: 13px; background: #111722e8; box-shadow: 0 12px 40px #0009; backdrop-filter: blur(16px); opacity: 0; pointer-events: none; transform: translate(-50%, calc(-100% - 1.5rem)); transition: transform 180ms ease, opacity 150ms ease; }
-.remote.toolbar-unpinned.toolbar-visible .toolbar, .remote.toolbar-unpinned .toolbar:focus-within { opacity: 1; pointer-events: auto; transform: translate(-50%, 0); }
+.remote.toolbar-unpinned .toolbar { position: absolute; left: 50%; top: max(.7rem, env(safe-area-inset-top)); width: max-content; max-width: calc(100% - 1rem); border: 1px solid #ffffff20; border-radius: 13px; background: #111722e8; box-shadow: 0 12px 40px #0009; backdrop-filter: blur(16px); visibility: hidden; opacity: 0; pointer-events: none; transform: translate(-50%, calc(-100% - 1.5rem)); transition: transform 180ms ease, opacity 150ms ease, visibility 0s linear 180ms; }
+.remote.toolbar-unpinned.toolbar-visible .toolbar, .remote.toolbar-unpinned .toolbar:focus-within { visibility: visible; opacity: 1; pointer-events: auto; transform: translate(-50%, 0); transition-delay: 0s; }
+.toolbar-corner-hint { display: none; }
+.remote.toolbar-unpinned .toolbar-corner-hint { position: absolute; z-index: 2; left: 0; top: 0; display: flex; align-items: center; gap: .3rem; padding: .35rem .6rem .42rem .42rem; border: 1px solid #ffffff22; border-left: 0; border-top: 0; border-radius: 0 0 12px 0; color: #d9e2fa; background: #111722c7; box-shadow: 0 4px 18px #0007; font: 11px ui-sans-serif, system-ui, sans-serif; pointer-events: none; opacity: .82; transition: opacity 120ms ease; }
+.remote.toolbar-unpinned.toolbar-visible .toolbar-corner-hint { opacity: 0; }
 @media (max-width: 700px) { .devices header, .devices section { padding-left: 1rem; padding-right: 1rem; } #stats { display: none; } }
