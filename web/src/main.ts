@@ -26,7 +26,7 @@ async function devicesView(): Promise<void> {
 }
 
 async function sessionView(deviceId: string): Promise<void> {
-  app.innerHTML = `<main class="remote"><video id="remote" autoplay muted playsinline tabindex="0"></video><button id="toolbar-trigger" class="toolbar-trigger" type="button" aria-label="显示控制条" hidden><span aria-hidden="true">⌃</span><span>控制条</span></button><div class="toolbar"><button id="back" class="secondary">断开</button><button id="sound">开启声音</button><button id="fullscreen" class="secondary" aria-pressed="false">全屏</button><button id="toolbar-pin" class="secondary" aria-pressed="true">取消固定</button><span id="state">正在连接</span><span id="stats"></span></div></main>`;
+  app.innerHTML = `<main class="remote"><video id="remote" autoplay muted playsinline tabindex="0"></video><button id="toolbar-trigger" class="toolbar-trigger" type="button" aria-label="显示控制条" hidden><span aria-hidden="true">⌄</span><span>控制条</span></button><div class="toolbar"><button id="back" class="secondary">断开</button><button id="sound">开启声音</button><button id="fullscreen" class="secondary" aria-pressed="false">全屏</button><button id="toolbar-pin" class="secondary" aria-pressed="true">取消固定</button><span id="state">正在连接</span><span id="stats"></span></div></main>`;
   const remote = app.querySelector<HTMLElement>(".remote")!;
   const video = app.querySelector<HTMLVideoElement>("#remote")!;
   const toolbar = app.querySelector<HTMLElement>(".toolbar")!;
@@ -104,7 +104,7 @@ async function sessionView(deviceId: string): Promise<void> {
     setToolbarVisible(!remote.classList.contains("toolbar-visible"), true);
   });
   remote.addEventListener("pointermove", (event) => {
-    if (!toolbarPinned && event.clientY >= window.innerHeight - 84) setToolbarVisible(true, true);
+    if (!toolbarPinned && event.clientY <= 84) setToolbarVisible(true, true);
   });
   toolbar.addEventListener("pointerenter", () => { window.clearTimeout(toolbarHideTimer); });
   toolbar.addEventListener("pointerleave", () => { setToolbarVisible(true, true); });
