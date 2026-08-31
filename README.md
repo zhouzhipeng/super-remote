@@ -44,7 +44,10 @@ from the local subnet, and the phone must be on the same LAN.
 The control panel is opened automatically with the elevated Host. It shows the Host and
 Signaling process state, browser connection state, active stream size/FPS/bitrate/encoder,
 primary-display capture details and whether the capture pipeline is idle. Use its buttons
-to start, stop or restart the stack, open the Web client, or view the current QR code.
+to start, stop or restart the stack, open the Web client, or view the current QR code. The
+8080 login account and password can be changed in the panel; saving preserves the JWT/device
+secrets and restarts the services so the new login takes effect. Passwords must contain at
+least 12 UTF-8 bytes and remain masked in the panel.
 The optional “Web 客户端连接后启用本机隐私黑屏” setting covers the complete Windows
 virtual desktop, including every enabled secondary display, while a client is connected.
 The overlay is excluded from Windows capture, so the remote picture and input continue

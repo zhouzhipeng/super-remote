@@ -324,7 +324,7 @@ def json_request(url: str, *, body: dict[str, str] | None = None, token: str | N
         return json.loads(response.read())
 
 
-def permanent_access_token(jwt_secret: str) -> str:
+def permanent_access_token(jwt_secret: str, subject: str) -> str:
     def encoded(value: object) -> str:
         raw = json.dumps(value, separators=(",", ":")).encode()
         return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
@@ -332,7 +332,7 @@ def permanent_access_token(jwt_secret: str) -> str:
     header = encoded({"typ": "JWT", "alg": "HS256"})
     claims = encoded(
         {
-            "sub": "admin",
+            "sub": subject,
             "role": "user",
             "exp": PERMANENT_EXPIRY,
             "iat": int(time.time()),
@@ -407,25 +407,39 @@ def main() -> int:
         credentials = {
             "jwt_secret": secrets.token_urlsafe(48),
             "device_token": secrets.token_urlsafe(36),
+            "username": "admin",
             "password": secrets.token_urlsafe(12),
         }
         secrets_file.write_text(json.dumps(credentials, indent=2), encoding="utf-8")
+    if "username" not in credentials:
+        credentials["username"] = "admin"
+        secrets_file.write_text(
+            json.dumps(credentials, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    username = credentials.get("username")
+    password = credentials.get("password")
+    if not isinstance(username, str) or not username.strip():
+        raise RuntimeError("登录账号不能为空")
+    if not isinstance(password, str) or len(password.encode("utf-8")) < 12:
+        raise RuntimeError("登录密码必须至少包含 12 个 UTF-8 字节")
 
     run(["npm.cmd", "--prefix", "web", "install", "--no-audit", "--no-fund"])
     run(["npm.cmd", "--prefix", "web", "run", "build"])
-    run(
-        [
-            "cargo",
-            "build",
-            "--release",
-            "-p",
-            "remote-signaling",
-            "-p",
-            "remote-host",
-            "-p",
-            "remote-control-panel",
-        ]
-    )
+    build_command = [
+        "cargo",
+        "build",
+        "--release",
+        "-p",
+        "remote-signaling",
+        "-p",
+        "remote-host",
+    ]
+    # A running control panel keeps its executable locked on Windows. Panel-initiated
+    # service restarts already run the installed panel binary, so rebuilding it here
+    # would fail after the old Host/Signaling processes have been stopped.
+    if "--from-control-panel" not in sys.argv[1:]:
+        build_command.extend(["-p", "remote-control-panel"])
+    run(build_command)
 
     base_url = f"http://{ip}:{PORT}"
     host_config = RUN_DIR / "remote-host.toml"
@@ -455,8 +469,8 @@ def main() -> int:
             "REMOTE_BIND": f"0.0.0.0:{PORT}",
             "REMOTE_WEB_DIST": str((ROOT / "web" / "dist").resolve()),
             "REMOTE_JWT_SECRET": credentials["jwt_secret"],
-            "REMOTE_ADMIN_USER": "admin",
-            "REMOTE_ADMIN_PASSWORD": credentials["password"],
+            "REMOTE_ADMIN_USER": username,
+            "REMOTE_ADMIN_PASSWORD": password,
             "REMOTE_DEVICE_TOKEN": credentials["device_token"],
             "RUST_LOG": "remote_signaling=info,remote_host=info",
         }
@@ -475,7 +489,7 @@ def main() -> int:
     host: subprocess.Popen[bytes] | None = None
     try:
         wait_for_health(base_url, signaling)
-        access_token = permanent_access_token(credentials["jwt_secret"])
+        access_token = permanent_access_token(credentials["jwt_secret"], username)
         host = subprocess.Popen(
             [str(ROOT / "target" / "release" / "remote-host.exe"), str(host_config)],
             cwd=ROOT,
@@ -495,8 +509,8 @@ def main() -> int:
             "url": base_url,
             "direct_url": direct_url,
             "qr": str(qr_path),
-            "username": "admin",
-            "password": credentials["password"],
+            "username": username,
+            "password": password,
             "signaling_pid": signaling.pid,
             "host_pid": host.pid,
             "launcher_pid": os.getpid(),

@@ -44,29 +44,30 @@ mod windows_app {
             },
             UI::{
                 HiDpi::{
-                    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
+                    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
                     SetProcessDpiAwarenessContext,
                 },
                 Shell::ShellExecuteW,
                 WindowsAndMessaging::{
                     BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_PUSHBUTTON,
                     CREATESTRUCTW, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
-                    DispatchMessageW, FindWindowW, GWLP_USERDATA, GetMessageW, GetSystemMetrics,
-                    GetWindowLongPtrW, HHOOK, HMENU, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW,
+                    DispatchMessageW, ES_AUTOHSCROLL, ES_PASSWORD, FindWindowW, GWLP_USERDATA,
+                    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowTextLengthW,
+                    GetWindowTextW, HHOOK, HMENU, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW,
                     KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, LLMHF_INJECTED,
                     LLMHF_LOWER_IL_INJECTED, LWA_ALPHA, LoadCursorW, MB_ICONERROR, MB_OK, MSG,
                     MSLLHOOKSTRUCT, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
                     SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
                     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW, SW_SHOWNA,
-                    SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW,
+                    SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW,
                     SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
                     SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
                     SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
                     WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE,
                     WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE,
-                    WM_NCHITTEST, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_LAYERED,
-                    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-                    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+                    WM_NCHITTEST, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD,
+                    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                    WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
                 },
             },
         },
@@ -85,6 +86,9 @@ mod windows_app {
     const ID_OPEN_QR: usize = 105;
     const ID_PRIVACY: usize = 106;
     const ID_HOST_MUTE: usize = 107;
+    const ID_SAVE_LOGIN: usize = 108;
+    const ID_LOGIN_USERNAME: usize = 109;
+    const ID_LOGIN_PASSWORD: usize = 110;
     const WM_LOCAL_PHYSICAL_INPUT: u32 = WM_APP + 1;
 
     static LOCAL_INPUT_WINDOW: AtomicIsize = AtomicIsize::new(0);
@@ -125,6 +129,15 @@ mod windows_app {
         privacy_screen_on_connect: bool,
         #[serde(default)]
         mute_host_audio_on_connect: bool,
+    }
+
+    #[derive(Clone, Deserialize, Serialize)]
+    struct StoredCredentials {
+        jwt_secret: String,
+        device_token: String,
+        #[serde(default = "default_login_username")]
+        username: String,
+        password: String,
     }
 
     #[derive(Serialize)]
@@ -194,6 +207,8 @@ mod windows_app {
         policy_label: HWND,
         audio_policy_label: HWND,
         action_label: HWND,
+        username_edit: HWND,
+        password_edit: HWND,
         privacy_checkbox: HWND,
         host_mute_checkbox: HWND,
         overlay: HWND,
@@ -219,6 +234,8 @@ mod windows_app {
                 policy_label: HWND::default(),
                 audio_policy_label: HWND::default(),
                 action_label: HWND::default(),
+                username_edit: HWND::default(),
+                password_edit: HWND::default(),
                 privacy_checkbox: HWND::default(),
                 host_mute_checkbox: HWND::default(),
                 overlay: HWND::default(),
@@ -406,6 +423,91 @@ mod windows_app {
                 )?;
             }
 
+            let username_label = unsafe {
+                child(
+                    self.window,
+                    instance,
+                    w!("STATIC"),
+                    w!("8080 登录账号"),
+                    scale(30),
+                    scale(296),
+                    scale(120),
+                    scale(32),
+                    0,
+                    0,
+                )?
+            };
+            self.username_edit = unsafe {
+                child(
+                    self.window,
+                    instance,
+                    w!("EDIT"),
+                    w!("admin"),
+                    scale(150),
+                    scale(288),
+                    scale(160),
+                    scale(38),
+                    WS_BORDER.0 | ES_AUTOHSCROLL as u32,
+                    ID_LOGIN_USERNAME,
+                )?
+            };
+            let password_label = unsafe {
+                child(
+                    self.window,
+                    instance,
+                    w!("STATIC"),
+                    w!("密码"),
+                    scale(330),
+                    scale(296),
+                    scale(50),
+                    scale(32),
+                    0,
+                    0,
+                )?
+            };
+            self.password_edit = unsafe {
+                child(
+                    self.window,
+                    instance,
+                    w!("EDIT"),
+                    w!(""),
+                    scale(384),
+                    scale(288),
+                    scale(206),
+                    scale(38),
+                    WS_BORDER.0 | ES_AUTOHSCROLL as u32 | ES_PASSWORD as u32,
+                    ID_LOGIN_PASSWORD,
+                )?
+            };
+            let credential_help = unsafe {
+                child(
+                    self.window,
+                    instance,
+                    w!("STATIC"),
+                    w!("密码至少 12 个字节；留空表示保留当前密码。"),
+                    scale(30),
+                    scale(342),
+                    scale(400),
+                    scale(32),
+                    0,
+                    0,
+                )?
+            };
+            let save_login = unsafe {
+                child(
+                    self.window,
+                    instance,
+                    w!("BUTTON"),
+                    w!("保存并重启服务"),
+                    scale(438),
+                    scale(334),
+                    scale(152),
+                    scale(38),
+                    BS_PUSHBUTTON as u32,
+                    ID_SAVE_LOGIN,
+                )?
+            };
+
             self.privacy_checkbox = unsafe {
                 child(
                     self.window,
@@ -413,7 +515,7 @@ mod windows_app {
                     w!("BUTTON"),
                     w!("Web 客户端连接后启用本机隐私黑屏"),
                     scale(30),
-                    scale(298),
+                    scale(398),
                     scale(550),
                     scale(32),
                     BS_AUTOCHECKBOX as u32,
@@ -427,7 +529,7 @@ mod windows_app {
                     w!("STATIC"),
                     w!("所有显示器变黑；断线后须使用本机键盘或鼠标解除。"),
                     scale(52),
-                    scale(334),
+                    scale(434),
                     scale(520),
                     scale(32),
                     0,
@@ -441,7 +543,7 @@ mod windows_app {
                     w!("BUTTON"),
                     w!("Web 客户端连接后静音主机声音"),
                     scale(30),
-                    scale(376),
+                    scale(476),
                     scale(550),
                     scale(32),
                     BS_AUTOCHECKBOX as u32,
@@ -455,7 +557,7 @@ mod windows_app {
                     w!("STATIC"),
                     w!("静音本机默认播放设备；客户端断开后仍保持静音。"),
                     scale(52),
-                    scale(412),
+                    scale(512),
                     scale(520),
                     scale(32),
                     0,
@@ -469,9 +571,9 @@ mod windows_app {
                     w!("STATIC"),
                     w!(""),
                     scale(30),
-                    scale(466),
+                    scale(568),
                     scale(550),
-                    scale(32),
+                    scale(58),
                     0,
                     0,
                 )?
@@ -482,6 +584,12 @@ mod windows_app {
                 self.client_label,
                 self.video_label,
                 self.address_label,
+                username_label,
+                self.username_edit,
+                password_label,
+                self.password_edit,
+                credential_help,
+                save_login,
                 self.policy_label,
                 self.audio_policy_label,
                 self.action_label,
@@ -493,7 +601,11 @@ mod windows_app {
 
             self.settings =
                 read_json(&self.run_dir.join("control-settings.json")).unwrap_or_default();
+            let username = read_json::<StoredCredentials>(&self.run_dir.join("secrets.json"))
+                .map(|credentials| credentials.username)
+                .unwrap_or_else(default_login_username);
             unsafe {
+                set_text(self.username_edit, &username);
                 SendMessageW(
                     self.privacy_checkbox,
                     BM_SETCHECK,
@@ -664,7 +776,8 @@ mod windows_app {
             if self.overlay.0.is_null() {
                 return;
             }
-            if self.privacy_visible != visible {
+            let visibility_changed = self.privacy_visible != visible;
+            if visibility_changed {
                 unsafe {
                     if visible {
                         let [x, y, width, height] = virtual_screen_bounds();
@@ -684,18 +797,18 @@ mod windows_app {
                 }
                 self.privacy_visible = visible;
             }
-            set_text(
-                self.action_label,
-                if visible {
+            if visible {
+                set_text(
+                    self.action_label,
                     if self.client_connected {
                         "所有显示器隐私黑屏已启用；断线后需使用本机键盘或鼠标解除。"
                     } else {
                         "客户端已断开；正在等待本机键盘或鼠标操作解除隐私黑屏。"
-                    }
-                } else {
-                    ""
-                },
-            );
+                    },
+                );
+            } else if visibility_changed {
+                set_text(self.action_label, "");
+            }
         }
 
         fn release_privacy_from_local_input(&mut self) {
@@ -733,6 +846,40 @@ mod windows_app {
             self.settings.mute_host_audio_on_connect = checked;
             let _ = write_json(&self.run_dir.join("control-settings.json"), &self.settings);
             self.refresh();
+        }
+
+        fn save_login_credentials(&mut self) {
+            let username = window_text(self.username_edit).trim().to_owned();
+            let new_password = window_text(self.password_edit);
+            if let Err(error) = validate_login_update(
+                &username,
+                (!new_password.is_empty()).then_some(new_password.as_str()),
+            ) {
+                set_text(self.action_label, &error);
+                return;
+            }
+            let path = self.run_dir.join("secrets.json");
+            let Some(mut credentials) = read_json::<StoredCredentials>(&path) else {
+                set_text(
+                    self.action_label,
+                    "无法读取 .run/secrets.json；凭据未修改。",
+                );
+                return;
+            };
+            credentials.username = username;
+            if !new_password.is_empty() {
+                credentials.password = new_password;
+            }
+            if let Err(error) = write_json(&path, &credentials) {
+                set_text(self.action_label, &format!("无法保存登录凭据：{error}"));
+                return;
+            }
+            set_text(self.password_edit, "");
+            self.action(Action::Restart);
+            set_text(
+                self.action_label,
+                "登录凭据已保存；正在重启 8080 服务使其生效…",
+            );
         }
 
         fn set_host_audio_muted(&mut self, muted: bool) {
@@ -779,7 +926,7 @@ mod windows_app {
                     } else {
                         launcher.python_executable
                     };
-                    let mut arguments = Vec::new();
+                    let mut arguments = vec!["--from-control-panel"];
                     if matches!(kind, Action::Stop) {
                         arguments.push("--stop");
                     }
@@ -855,10 +1002,8 @@ mod windows_app {
 
         let mut app = Box::new(App::empty(root));
         let app_ptr = (&mut *app) as *mut App;
-        let dpi = unsafe { GetDpiForSystem() } as i32;
-        let scale = |value: i32| value * dpi / 96;
-        let panel_width = scale(640);
-        let panel_height = scale(570);
+        let panel_width = 640;
+        let panel_height = 680;
         let panel_x = (unsafe { GetSystemMetrics(SM_CXSCREEN) } - panel_width) / 2;
         let panel_y = (unsafe { GetSystemMetrics(SM_CYSCREEN) } - panel_height) / 2;
         app.window = unsafe {
@@ -879,6 +1024,22 @@ mod windows_app {
         }
         .map_err(|error| error.to_string())?;
         unsafe {
+            let dpi = GetDpiForWindow(app.window) as i32;
+            let scale = |value: i32| value * dpi / 96;
+            let scaled_width = scale(640);
+            let scaled_height = scale(680);
+            let scaled_x = (GetSystemMetrics(SM_CXSCREEN) - scaled_width) / 2;
+            let scaled_y = (GetSystemMetrics(SM_CYSCREEN) - scaled_height) / 2;
+            SetWindowPos(
+                app.window,
+                None,
+                scaled_x,
+                scaled_y,
+                scaled_width,
+                scaled_height,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+            .map_err(|error| error.to_string())?;
             app.create_controls(instance)
                 .map_err(|error| error.to_string())?;
             app.create_overlay(instance)
@@ -939,6 +1100,28 @@ mod windows_app {
             .ok()
             .and_then(|path| path.parent()?.parent()?.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    fn default_login_username() -> String {
+        "admin".into()
+    }
+
+    fn validate_login_update(username: &str, password: Option<&str>) -> Result<(), String> {
+        if username.is_empty() {
+            return Err("登录账号不能为空。".into());
+        }
+        if username.len() > 128 || username.chars().any(char::is_control) {
+            return Err("登录账号不能包含控制字符，且最多为 128 个 UTF-8 字节。".into());
+        }
+        if let Some(password) = password {
+            if password.len() < 12 {
+                return Err("登录密码至少需要 12 个 UTF-8 字节。".into());
+            }
+            if password.len() > 256 || password.chars().any(char::is_control) {
+                return Err("登录密码不能包含控制字符，且最多为 256 个 UTF-8 字节。".into());
+            }
+        }
+        Ok(())
     }
 
     fn next_privacy_latch(
@@ -1073,6 +1256,7 @@ mod windows_app {
                         ID_OPEN_QR => app.action(Action::OpenQr),
                         ID_PRIVACY => app.toggle_privacy_setting(),
                         ID_HOST_MUTE => app.toggle_host_mute_setting(),
+                        ID_SAVE_LOGIN => app.save_login_credentials(),
                         _ => {}
                     }
                 }
@@ -1248,6 +1432,16 @@ mod windows_app {
         serde_json::from_slice(&fs::read(path).ok()?).ok()
     }
 
+    fn window_text(window: HWND) -> String {
+        let length = unsafe { GetWindowTextLengthW(window) };
+        if length <= 0 {
+            return String::new();
+        }
+        let mut buffer = vec![0_u16; length as usize + 1];
+        let copied = unsafe { GetWindowTextW(window, &mut buffer) };
+        String::from_utf16_lossy(&buffer[..copied.max(0) as usize])
+    }
+
     fn write_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -1303,6 +1497,23 @@ mod windows_app {
         fn hardware_input_is_considered_physical() {
             assert!(keyboard_input_is_physical(&KBDLLHOOKSTRUCT::default()));
             assert!(mouse_input_is_physical(&MSLLHOOKSTRUCT::default()));
+        }
+
+        #[test]
+        fn legacy_credentials_default_to_admin() {
+            let credentials: StoredCredentials = serde_json::from_str(
+                r#"{"jwt_secret":"secret","device_token":"device","password":"long-password"}"#,
+            )
+            .unwrap();
+            assert_eq!(credentials.username, "admin");
+        }
+
+        #[test]
+        fn login_update_requires_a_nonempty_user_and_long_password() {
+            assert!(validate_login_update("operator", None).is_ok());
+            assert!(validate_login_update("", None).is_err());
+            assert!(validate_login_update("operator", Some("too-short")).is_err());
+            assert!(validate_login_update("operator", Some("long-password")).is_ok());
         }
     }
 }
