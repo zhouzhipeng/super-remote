@@ -19,7 +19,7 @@ allowed to build an unbounded queue.
   and Win32 `SendInput` injection.
 - `control-panel`: native Rust/Win32 Windows control panel for live service, client,
   capture and encoder status; start/stop/restart actions; Web/QR shortcuts; and an
-  optional capture-excluded privacy screen while a browser client is connected.
+  optional capture-excluded, local-input-released privacy screen.
 - `deploy`: production-oriented Nginx, signaling and authenticated coturn deployment.
 
 ## Local build
@@ -48,7 +48,9 @@ to start, stop or restart the stack, open the Web client, or view the current QR
 The optional “Web 客户端连接后启用本机隐私黑屏” setting covers the complete Windows
 virtual desktop, including every enabled secondary display, while a client is connected.
 The overlay is excluded from Windows capture, so the remote picture and input continue
-normally, and it is removed automatically at disconnect. “Web 客户端连接后静音主机声音”
+normally. After the Web client disconnects, the overlay remains latched until a physical
+keyboard or mouse attached to the Host generates input; injected `SendInput` events cannot
+release it. “Web 客户端连接后静音主机声音”
 mutes the Host's default playback endpoint without silencing the WebRTC loopback stream;
 the endpoint remains muted after disconnect until the user explicitly unmutes it in Windows.
 Both preferences are stored in `.run/control-settings.json`.

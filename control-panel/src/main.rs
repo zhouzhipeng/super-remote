@@ -12,6 +12,7 @@ mod windows_app {
         fs::{self, File, OpenOptions},
         path::{Path, PathBuf},
         process::{Command, Stdio},
+        sync::atomic::{AtomicBool, AtomicIsize, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -49,17 +50,20 @@ mod windows_app {
                 Shell::ShellExecuteW,
                 WindowsAndMessaging::{
                     BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_PUSHBUTTON,
-                    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow,
+                    CREATESTRUCTW, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
                     DispatchMessageW, FindWindowW, GWLP_USERDATA, GetMessageW, GetSystemMetrics,
-                    GetWindowLongPtrW, HMENU, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, LWA_ALPHA,
-                    LoadCursorW, MB_ICONERROR, MB_OK, MSG, MessageBoxW, PostQuitMessage,
-                    RegisterClassW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
-                    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW,
-                    SW_SHOWNA, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW,
+                    GetWindowLongPtrW, HHOOK, HMENU, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW,
+                    KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, LLMHF_INJECTED,
+                    LLMHF_LOWER_IL_INJECTED, LWA_ALPHA, LoadCursorW, MB_ICONERROR, MB_OK, MSG,
+                    MSLLHOOKSTRUCT, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
+                    SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+                    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW, SW_SHOWNA,
+                    SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW,
                     SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
                     SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-                    ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE,
-                    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE,
+                    SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
+                    WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE,
+                    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE,
                     WM_NCHITTEST, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_LAYERED,
                     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
                     WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
@@ -81,6 +85,10 @@ mod windows_app {
     const ID_OPEN_QR: usize = 105;
     const ID_PRIVACY: usize = 106;
     const ID_HOST_MUTE: usize = 107;
+    const WM_LOCAL_PHYSICAL_INPUT: u32 = WM_APP + 1;
+
+    static LOCAL_INPUT_WINDOW: AtomicIsize = AtomicIsize::new(0);
+    static LOCAL_INPUT_ARMED: AtomicBool = AtomicBool::new(false);
 
     #[derive(Clone, Default, Deserialize)]
     struct LauncherStatus {
@@ -127,6 +135,7 @@ mod windows_app {
         privacy_requested: bool,
         privacy_supported: bool,
         privacy_overlay_visible: bool,
+        privacy_waiting_for_local_input: bool,
         privacy_overlay_bounds: [i32; 4],
         host_audio_mute_requested: bool,
         host_audio_muted: bool,
@@ -135,6 +144,43 @@ mod windows_app {
 
     struct AudioMuteLease {
         endpoint: IAudioEndpointVolume,
+    }
+
+    struct LocalInputHooks {
+        keyboard: HHOOK,
+        mouse: HHOOK,
+    }
+
+    impl LocalInputHooks {
+        fn install(window: HWND, instance: HINSTANCE) -> Result<Self, String> {
+            LOCAL_INPUT_WINDOW.store(window.0 as isize, Ordering::Release);
+            let keyboard = unsafe {
+                SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), Some(instance), 0)
+            }
+            .map_err(|error| format!("failed to install local keyboard hook: {error}"))?;
+            let mouse = match unsafe {
+                SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), Some(instance), 0)
+            } {
+                Ok(mouse) => mouse,
+                Err(error) => {
+                    unsafe { UnhookWindowsHookEx(keyboard).ok() };
+                    LOCAL_INPUT_WINDOW.store(0, Ordering::Release);
+                    return Err(format!("failed to install local mouse hook: {error}"));
+                }
+            };
+            Ok(Self { keyboard, mouse })
+        }
+    }
+
+    impl Drop for LocalInputHooks {
+        fn drop(&mut self) {
+            LOCAL_INPUT_ARMED.store(false, Ordering::Release);
+            LOCAL_INPUT_WINDOW.store(0, Ordering::Release);
+            unsafe {
+                UnhookWindowsHookEx(self.keyboard).ok();
+                UnhookWindowsHookEx(self.mouse).ok();
+            }
+        }
     }
 
     struct App {
@@ -153,6 +199,8 @@ mod windows_app {
         overlay: HWND,
         privacy_supported: bool,
         privacy_visible: bool,
+        privacy_latched: bool,
+        client_connected: bool,
         audio_mute: Option<AudioMuteLease>,
         settings: PanelSettings,
     }
@@ -176,6 +224,8 @@ mod windows_app {
                 overlay: HWND::default(),
                 privacy_supported: false,
                 privacy_visible: false,
+                privacy_latched: false,
+                client_connected: false,
                 audio_mute: None,
                 settings: PanelSettings::default(),
             }
@@ -375,7 +425,7 @@ mod windows_app {
                     self.window,
                     instance,
                     w!("STATIC"),
-                    w!("所有显示器变黑；远端画面与鼠标键盘输入不受影响。"),
+                    w!("所有显示器变黑；断线后须使用本机键盘或鼠标解除。"),
                     scale(52),
                     scale(334),
                     scale(520),
@@ -509,6 +559,7 @@ mod windows_app {
                 && host_fresh
                 && host.connection_state == "connected"
                 && host.capture_active;
+            self.client_connected = connected;
 
             set_text(
                 self.service_label,
@@ -594,42 +645,71 @@ mod windows_app {
                     );
                 }
             }
-            let should_show =
-                connected && self.privacy_supported && self.settings.privacy_screen_on_connect;
+            self.privacy_latched = next_privacy_latch(
+                self.privacy_latched,
+                connected,
+                self.privacy_supported,
+                self.settings.privacy_screen_on_connect,
+            );
+            let should_show = self.privacy_latched
+                && self.privacy_supported
+                && self.settings.privacy_screen_on_connect;
             self.set_privacy_visible(should_show);
+            LOCAL_INPUT_ARMED.store(should_show && !connected, Ordering::Release);
             self.set_host_audio_muted(connected && self.settings.mute_host_audio_on_connect);
             self.write_runtime_state(services_running, connected);
         }
 
         fn set_privacy_visible(&mut self, visible: bool) {
-            if self.privacy_visible == visible || self.overlay.0.is_null() {
+            if self.overlay.0.is_null() {
                 return;
             }
-            unsafe {
-                if visible {
-                    let [x, y, width, height] = virtual_screen_bounds();
-                    let _ = SetWindowPos(
-                        self.overlay,
-                        Some(HWND_TOPMOST),
-                        x,
-                        y,
-                        width,
-                        height,
-                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                    );
-                    let _ = ShowWindow(self.overlay, SW_SHOWNA);
-                } else {
-                    let _ = ShowWindow(self.overlay, SW_HIDE);
+            if self.privacy_visible != visible {
+                unsafe {
+                    if visible {
+                        let [x, y, width, height] = virtual_screen_bounds();
+                        let _ = SetWindowPos(
+                            self.overlay,
+                            Some(HWND_TOPMOST),
+                            x,
+                            y,
+                            width,
+                            height,
+                            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                        );
+                        let _ = ShowWindow(self.overlay, SW_SHOWNA);
+                    } else {
+                        let _ = ShowWindow(self.overlay, SW_HIDE);
+                    }
                 }
+                self.privacy_visible = visible;
             }
-            self.privacy_visible = visible;
             set_text(
                 self.action_label,
                 if visible {
-                    "所有显示器隐私黑屏已启用；客户端断开后会自动恢复。"
+                    if self.client_connected {
+                        "所有显示器隐私黑屏已启用；断线后需使用本机键盘或鼠标解除。"
+                    } else {
+                        "客户端已断开；正在等待本机键盘或鼠标操作解除隐私黑屏。"
+                    }
                 } else {
                     ""
                 },
+            );
+        }
+
+        fn release_privacy_from_local_input(&mut self) {
+            LOCAL_INPUT_ARMED.store(false, Ordering::Release);
+            if !self.privacy_latched || self.client_connected {
+                return;
+            }
+            self.privacy_latched = false;
+            self.set_privacy_visible(false);
+            let launcher: LauncherStatus =
+                read_json(&self.run_dir.join("status.json")).unwrap_or_default();
+            self.write_runtime_state(
+                process_running(launcher.host_pid) && process_running(launcher.signaling_pid),
+                false,
             );
         }
 
@@ -726,6 +806,7 @@ mod windows_app {
                 privacy_requested: self.settings.privacy_screen_on_connect,
                 privacy_supported: self.privacy_supported,
                 privacy_overlay_visible: self.privacy_visible,
+                privacy_waiting_for_local_input: self.privacy_visible && !client_connected,
                 privacy_overlay_bounds: virtual_screen_bounds(),
                 host_audio_mute_requested: self.settings.mute_host_audio_on_connect,
                 host_audio_muted: default_audio_endpoint_is_muted(),
@@ -802,14 +883,13 @@ mod windows_app {
                 .map_err(|error| error.to_string())?;
             app.create_overlay(instance)
                 .map_err(|error| error.to_string())?;
+            let _local_input_hooks = LocalInputHooks::install(app.window, instance)?;
             let _ = ShowWindow(app.window, SW_SHOWNORMAL);
             SetTimer(Some(app.window), 1, 500, None);
-        }
-        app.refresh();
+            app.refresh();
 
-        let mut message = MSG::default();
-        while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
-            unsafe {
+            let mut message = MSG::default();
+            while GetMessageW(&mut message, None, 0, 0).as_bool() {
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
@@ -861,6 +941,78 @@ mod windows_app {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
+    fn next_privacy_latch(
+        currently_latched: bool,
+        client_connected: bool,
+        privacy_supported: bool,
+        privacy_enabled: bool,
+    ) -> bool {
+        if !privacy_supported || !privacy_enabled {
+            false
+        } else if client_connected {
+            true
+        } else {
+            currently_latched
+        }
+    }
+
+    fn keyboard_input_is_physical(event: &KBDLLHOOKSTRUCT) -> bool {
+        !event.flags.contains(LLKHF_INJECTED) && !event.flags.contains(LLKHF_LOWER_IL_INJECTED)
+    }
+
+    fn mouse_input_is_physical(event: &MSLLHOOKSTRUCT) -> bool {
+        event.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) == 0
+    }
+
+    fn notify_local_physical_input() {
+        if !LOCAL_INPUT_ARMED.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let window = LOCAL_INPUT_WINDOW.load(Ordering::Acquire);
+        if window == 0 {
+            return;
+        }
+        let result = unsafe {
+            PostMessageW(
+                Some(HWND(window as *mut c_void)),
+                WM_LOCAL_PHYSICAL_INPUT,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+        if result.is_err() {
+            LOCAL_INPUT_ARMED.store(true, Ordering::Release);
+        }
+    }
+
+    unsafe extern "system" fn keyboard_hook_proc(
+        code: i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if code >= 0 {
+            let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+            if keyboard_input_is_physical(event) {
+                notify_local_physical_input();
+            }
+        }
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
+
+    unsafe extern "system" fn mouse_hook_proc(
+        code: i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if code >= 0 {
+            let event = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+            if mouse_input_is_physical(event) {
+                notify_local_physical_input();
+            }
+        }
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
+
     fn register_classes(instance: HINSTANCE) -> Result<(), String> {
         let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }.map_err(|error| error.to_string())?;
         let panel_brush = unsafe { CreateSolidBrush(COLORREF(0x00f7f7f7)) };
@@ -902,6 +1054,10 @@ mod windows_app {
             WM_CREATE => LRESULT(0),
             WM_TIMER if !app_ptr.is_null() => {
                 unsafe { (&mut *app_ptr).refresh() };
+                LRESULT(0)
+            }
+            WM_LOCAL_PHYSICAL_INPUT if !app_ptr.is_null() => {
+                unsafe { (&mut *app_ptr).release_privacy_from_local_input() };
                 LRESULT(0)
             }
             WM_COMMAND if !app_ptr.is_null() => {
@@ -1110,6 +1266,43 @@ mod windows_app {
         let message = HSTRING::from(message);
         unsafe {
             MessageBoxW(None, &message, PANEL_TITLE, MB_OK | MB_ICONERROR);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn privacy_stays_latched_after_disconnect_until_local_release() {
+            let connected = next_privacy_latch(false, true, true, true);
+            assert!(connected);
+            assert!(next_privacy_latch(connected, false, true, true));
+        }
+
+        #[test]
+        fn disabling_privacy_clears_a_disconnected_latch() {
+            assert!(!next_privacy_latch(true, false, true, false));
+        }
+
+        #[test]
+        fn injected_input_is_not_considered_physical() {
+            let keyboard = KBDLLHOOKSTRUCT {
+                flags: LLKHF_INJECTED,
+                ..Default::default()
+            };
+            let mouse = MSLLHOOKSTRUCT {
+                flags: LLMHF_INJECTED,
+                ..Default::default()
+            };
+            assert!(!keyboard_input_is_physical(&keyboard));
+            assert!(!mouse_input_is_physical(&mouse));
+        }
+
+        #[test]
+        fn hardware_input_is_considered_physical() {
+            assert!(keyboard_input_is_physical(&KBDLLHOOKSTRUCT::default()));
+            assert!(mouse_input_is_physical(&MSLLHOOKSTRUCT::default()));
         }
     }
 }
