@@ -26,8 +26,13 @@ async function devicesView(): Promise<void> {
 }
 
 async function sessionView(deviceId: string): Promise<void> {
-  app.innerHTML = `<main class="remote"><video id="remote" autoplay muted playsinline tabindex="0"></video><div class="toolbar"><button id="back" class="secondary">断开</button><button id="sound">开启声音</button><button id="fullscreen" class="secondary">全屏</button><span id="state">正在连接</span><span id="stats"></span></div></main>`;
+  app.innerHTML = `<main class="remote"><video id="remote" autoplay muted playsinline tabindex="0"></video><button id="toolbar-trigger" class="toolbar-trigger" type="button" aria-label="显示控制条" hidden><span aria-hidden="true">⌃</span><span>控制条</span></button><div class="toolbar"><button id="back" class="secondary">断开</button><button id="sound">开启声音</button><button id="fullscreen" class="secondary" aria-pressed="false">全屏</button><button id="toolbar-pin" class="secondary" aria-pressed="true">取消固定</button><span id="state">正在连接</span><span id="stats"></span></div></main>`;
+  const remote = app.querySelector<HTMLElement>(".remote")!;
   const video = app.querySelector<HTMLVideoElement>("#remote")!;
+  const toolbar = app.querySelector<HTMLElement>(".toolbar")!;
+  const toolbarTrigger = app.querySelector<HTMLButtonElement>("#toolbar-trigger")!;
+  const pinButton = app.querySelector<HTMLButtonElement>("#toolbar-pin")!;
+  const fullscreenButton = app.querySelector<HTMLButtonElement>("#fullscreen")!;
   const state = app.querySelector<HTMLSpanElement>("#state")!;
   const stats = app.querySelector<HTMLElement>("#stats")!;
   let disposed = false;
@@ -43,23 +48,91 @@ async function sessionView(deviceId: string): Promise<void> {
   // pixels available to the video. Debounce a reconnect so the Host restarts the
   // encoder at the new fitted resolution instead of stretching an old stream.
   let resizeTimer = 0;
-  const resizeObserver = new ResizeObserver(() => {
+  let forceResize = false;
+  const scheduleResizeReconnect = (force = false): void => {
+    forceResize ||= force;
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(() => {
       if (disposed || session.state !== "connected") return;
       const area = physicalVideoArea(video);
-      if (Math.abs(area.width - connectedArea.width) < 64 && Math.abs(area.height - connectedArea.height) < 64) return;
+      const forced = forceResize;
+      forceResize = false;
+      if (!forced && Math.abs(area.width - connectedArea.width) < 64 && Math.abs(area.height - connectedArea.height) < 64) return;
       connectedArea = area;
       session.close();
       session = createRemoteSession();
       void session.connect(deviceId).catch((error) => { state.textContent = error instanceof Error ? error.message : String(error); });
-    }, 700);
-  });
+    }, force ? 250 : 700);
+  };
+  const resizeObserver = new ResizeObserver(() => { scheduleResizeReconnect(); });
   resizeObserver.observe(video);
+
+  let toolbarPinned = localStorage.getItem("remote-toolbar-pinned") !== "false";
+  let toolbarHideTimer = 0;
+  const setToolbarVisible = (visible: boolean, autoHide = false): void => {
+    window.clearTimeout(toolbarHideTimer);
+    if (toolbarPinned) return;
+    remote.classList.toggle("toolbar-visible", visible);
+    toolbarTrigger.setAttribute("aria-expanded", String(visible));
+    if (visible && autoHide) {
+      toolbarHideTimer = window.setTimeout(() => {
+        if (!toolbar.matches(":hover") && !toolbar.contains(document.activeElement)) {
+          remote.classList.remove("toolbar-visible");
+          toolbarTrigger.setAttribute("aria-expanded", "false");
+        }
+      }, 2600);
+    }
+  };
+  const applyToolbarMode = (pinned: boolean, reconnect: boolean): void => {
+    toolbarPinned = pinned;
+    localStorage.setItem("remote-toolbar-pinned", String(pinned));
+    remote.classList.toggle("toolbar-unpinned", !pinned);
+    remote.classList.toggle("toolbar-visible", !pinned);
+    toolbarTrigger.hidden = pinned;
+    toolbarTrigger.setAttribute("aria-expanded", String(!pinned));
+    pinButton.textContent = pinned ? "取消固定" : "固定控制条";
+    pinButton.title = pinned ? "取消固定，让画面占满整个窗口" : "将控制条固定在窗口底部";
+    pinButton.setAttribute("aria-pressed", String(pinned));
+    if (!pinned) setToolbarVisible(true, true);
+    if (reconnect) {
+      requestAnimationFrame(() => requestAnimationFrame(() => scheduleResizeReconnect(true)));
+    }
+  };
+  applyToolbarMode(toolbarPinned, false);
+  pinButton.addEventListener("click", () => { applyToolbarMode(!toolbarPinned, true); });
+  toolbarTrigger.addEventListener("click", () => {
+    setToolbarVisible(!remote.classList.contains("toolbar-visible"), true);
+  });
+  remote.addEventListener("pointermove", (event) => {
+    if (!toolbarPinned && event.clientY >= window.innerHeight - 84) setToolbarVisible(true, true);
+  });
+  toolbar.addEventListener("pointerenter", () => { window.clearTimeout(toolbarHideTimer); });
+  toolbar.addEventListener("pointerleave", () => { setToolbarVisible(true, true); });
+
+  const updateFullscreenButton = (): void => {
+    const fullscreen = document.fullscreenElement === remote;
+    fullscreenButton.textContent = fullscreen ? "退出全屏" : "全屏";
+    fullscreenButton.title = fullscreen ? "退出浏览器全屏" : "进入浏览器全屏";
+    fullscreenButton.setAttribute("aria-pressed", String(fullscreen));
+  };
+  const onFullscreenChange = (): void => {
+    updateFullscreenButton();
+    requestAnimationFrame(() => scheduleResizeReconnect(true));
+  };
+  document.addEventListener("fullscreenchange", onFullscreenChange);
+  fullscreenButton.addEventListener("click", () => {
+    void (document.fullscreenElement ? document.exitFullscreen() : remote.requestFullscreen())
+      .catch((error) => { state.textContent = `无法切换全屏：${error instanceof Error ? error.message : String(error)}`; });
+  });
+  updateFullscreenButton();
+
   app.querySelector("#back")!.addEventListener("click", () => {
     disposed = true;
     resizeObserver.disconnect();
     window.clearTimeout(resizeTimer);
+    window.clearTimeout(toolbarHideTimer);
+    document.removeEventListener("fullscreenchange", onFullscreenChange);
+    if (document.fullscreenElement === remote) void document.exitFullscreen();
     session.close();
     void devicesView();
   });
@@ -70,7 +143,6 @@ async function sessionView(deviceId: string): Promise<void> {
       soundButton.textContent = muted ? "开启声音" : "静音";
     }).catch(() => { state.textContent = "浏览器阻止了声音播放，请再点一次"; });
   });
-  app.querySelector("#fullscreen")!.addEventListener("click", () => app.querySelector(".remote")?.requestFullscreen());
   try { await session.connect(deviceId); } catch (error) { state.textContent = error instanceof Error ? error.message : String(error); }
 }
 

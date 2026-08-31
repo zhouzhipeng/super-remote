@@ -21,9 +21,16 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .status { position: absolute; right: 1.2rem; top: 1.2rem; width: 9px; height: 9px; border-radius: 50%; background: #596174; }
 .status.online { background: #42d392; box-shadow: 0 0 12px #42d392; }
 .remote { position: relative; width: 100vw; height: 100vh; overflow: hidden; background: black; display: grid; grid-template-rows: minmax(0, 1fr) auto; }
-.remote video { width: 100%; height: 100%; object-fit: contain; outline: none; touch-action: none; user-select: none; }
-.toolbar { display: flex; align-items: center; gap: .7rem; min-height: 48px; padding: .45rem .7rem; background: #111722; font: 12px ui-monospace, monospace; white-space: nowrap; overflow-x: auto; }
+.remote video { display: block; width: 100%; height: 100%; object-fit: contain; outline: none; touch-action: none; user-select: none; }
+.toolbar { z-index: 3; display: flex; align-items: center; gap: .7rem; min-height: 48px; padding: .45rem .7rem; background: #111722; font: 12px ui-monospace, monospace; white-space: nowrap; overflow-x: auto; }
 #state { color: #95a5c9; }
 #stats { margin-left: auto; }
 .remote:fullscreen { grid-template-rows: minmax(0, 1fr) auto; }
+.remote.toolbar-unpinned { display: block; }
+.remote.toolbar-unpinned .toolbar { position: absolute; left: 50%; bottom: max(.7rem, env(safe-area-inset-bottom)); width: max-content; max-width: calc(100% - 1rem); border: 1px solid #ffffff20; border-radius: 13px; background: #111722e8; box-shadow: 0 12px 40px #0009; backdrop-filter: blur(16px); opacity: 0; pointer-events: none; transform: translate(-50%, calc(100% + 1.5rem)); transition: transform 180ms ease, opacity 150ms ease; }
+.remote.toolbar-unpinned.toolbar-visible .toolbar, .remote.toolbar-unpinned .toolbar:focus-within { opacity: 1; pointer-events: auto; transform: translate(-50%, 0); }
+.toolbar-trigger { position: absolute; z-index: 4; left: 50%; bottom: max(.25rem, env(safe-area-inset-bottom)); display: flex; align-items: center; gap: .35rem; padding: .28rem .65rem; border: 1px solid #ffffff1f; border-radius: 999px; color: #cbd5ee; background: #111722c9; box-shadow: 0 5px 20px #0008; font-size: 11px; opacity: .72; transform: translateX(-50%); transition: opacity 150ms ease, transform 180ms ease; }
+.toolbar-trigger:hover, .toolbar-trigger:focus-visible { opacity: 1; }
+.remote.toolbar-visible .toolbar-trigger { opacity: 0; pointer-events: none; transform: translate(-50%, 10px); }
+.toolbar-trigger[hidden] { display: none; }
 @media (max-width: 700px) { .devices header, .devices section { padding-left: 1rem; padding-right: 1rem; } #stats { display: none; } }
