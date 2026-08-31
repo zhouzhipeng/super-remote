@@ -105,6 +105,9 @@ Pointer movement bypasses animation-frame batching and uses raw pointer updates 
 browser supports them. Click coordinates and button transitions are injected as one Win32
 batch, while keyboard transitions remain reliable and ordered. The toolbar reports sampled
 post-injection input RTT so input latency can be verified independently from video latency.
+The browser keyboard mapper automatically remaps the left and right Command keys on Mac and
+iPad clients to the matching remote Windows Control keys, so familiar Command shortcuts act
+as their Ctrl equivalents on the Host.
 Software encoder fallback is intentionally disabled; the application will not claim or
 simulate hardware acceleration.
 System playback audio uses event-driven WASAPI loopback capture and 48 kHz stereo Opus
