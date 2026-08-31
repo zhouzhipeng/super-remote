@@ -17,6 +17,9 @@ allowed to build an unbounded queue.
 - `host`: Windows agent with webrtc-rs 0.20.x, trickle ICE, GDI/D3D11/NVENC
   hardware H.264, WASAPI loopback/Opus system audio, strict DataChannel validation
   and Win32 `SendInput` injection.
+- `control-panel`: native Rust/Win32 Windows control panel for live service, client,
+  capture and encoder status; start/stop/restart actions; Web/QR shortcuts; and an
+  optional capture-excluded privacy screen while a browser client is connected.
 - `deploy`: production-oriented Nginx, signaling and authenticated coturn deployment.
 
 ## Local build
@@ -31,11 +34,21 @@ python start_remote_desktop.py
 
 The script detects the LAN address and physical primary display, downloads a project-local
 FFmpeg build when needed, requires an available NVENC or AMF H.264 hardware encoder,
-builds and starts Signaling/Web/Host, and writes a long-lived direct-access QR code to
+builds and starts Signaling/Web/Host plus the native Windows control panel, and writes a
+long-lived direct-access QR code to
 `.run/remote-desktop-qr.png`. Keep the terminal open; Ctrl+C stops the managed processes.
 The QR remains valid while `.run/secrets.json` is unchanged and contains a bearer token,
 so treat it as a permanent password and do not share it. Windows Firewall must allow TCP 8080
 from the local subnet, and the phone must be on the same LAN.
+
+The control panel is opened automatically with the elevated Host. It shows the Host and
+Signaling process state, browser connection state, active stream size/FPS/bitrate/encoder,
+primary-display capture details and whether the capture pipeline is idle. Use its buttons
+to start, stop or restart the stack, open the Web client, or view the current QR code.
+The optional “Web 客户端连接后启用本机隐私黑屏” setting covers the physical primary
+display only while a client is connected. The overlay is excluded from Windows capture,
+so the remote picture and input continue normally, and it is removed automatically at
+disconnect. The preference is stored in `.run/control-settings.json`.
 
 ```powershell
 npm --prefix web install

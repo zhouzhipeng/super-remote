@@ -35,7 +35,7 @@ use webrtc::{
     runtime::{Runtime, default_runtime},
 };
 
-use crate::{audio, config::HostConfig, input, stats::HostStats, video};
+use crate::{audio, config::HostConfig, control::ControlStatus, input, stats::HostStats, video};
 
 #[derive(Clone)]
 struct Handler {
@@ -45,6 +45,7 @@ struct Handler {
     stats: Arc<HostStats>,
     media_active: Arc<AtomicBool>,
     media_state: watch::Sender<MediaState>,
+    control: Arc<ControlStatus>,
 }
 
 pub struct AcceptedSession {
@@ -105,16 +106,19 @@ impl PeerConnectionEventHandler for Handler {
             RTCPeerConnectionState::Connected => {
                 self.media_active.store(true, Ordering::Release);
                 self.media_state.send_replace(MediaState::RUNNING);
+                self.control.connected(self.session_id);
             }
             RTCPeerConnectionState::Disconnected => {
                 // Stop capture, encoding and loopback immediately while the peer is
                 // disconnected. A later Connected event restarts the sources on demand.
                 self.media_active.store(false, Ordering::Release);
                 self.media_state.send_replace(MediaState::WAITING);
+                self.control.disconnected(self.session_id);
             }
             RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
                 self.media_active.store(false, Ordering::Release);
                 self.media_state.send_replace(MediaState::STOPPED);
+                self.control.disconnected(self.session_id);
             }
             _ => {}
         }
@@ -175,6 +179,7 @@ pub async fn accept_offer(
     session_id: Uuid,
     sdp: String,
     outbound: mpsc::Sender<ClientSignal>,
+    control: Arc<ControlStatus>,
 ) -> anyhow::Result<AcceptedSession> {
     info!(
         %session_id,
@@ -215,6 +220,7 @@ pub async fn accept_offer(
         stats: stats.clone(),
         media_active: media_active.clone(),
         media_state: media_state.clone(),
+        control,
     });
     let peer = Arc::new(
         PeerConnectionBuilder::new()

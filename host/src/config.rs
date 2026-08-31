@@ -43,6 +43,8 @@ pub struct HostConfig {
     pub ffmpeg_capture_height: u32,
     #[serde(default)]
     pub ice_servers: Vec<IceServerConfig>,
+    /// Optional local JSON status file consumed by the Windows control panel.
+    pub control_status_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -213,6 +215,7 @@ mod tests {
             ffmpeg_capture_width: 2560,
             ffmpeg_capture_height: 1600,
             ice_servers: Vec::new(),
+            control_status_path: None,
         })
     }
 

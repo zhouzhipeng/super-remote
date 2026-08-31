@@ -1,5 +1,5 @@
 [workspace]
-members = ["protocol", "signaling", "host"]
+members = ["protocol", "signaling", "host", "control-panel"]
 resolver = "2"
 
 [workspace.package]

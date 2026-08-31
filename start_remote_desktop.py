@@ -18,6 +18,7 @@ import socket
 import subprocess
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
 import zipfile
@@ -380,6 +381,9 @@ def main() -> int:
         return 0
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     stop_existing_stack()
+    if "--stop" in sys.argv[1:]:
+        print("远程桌面服务已停止。", flush=True)
+        return 0
     # Establish per-monitor DPI awareness before importing qrcode/Pillow. Pillow
     # may otherwise lock Python to system-DPI awareness, making GetSystemMetrics
     # return the scaled logical desktop (for example 1512x950) instead of the
@@ -409,12 +413,24 @@ def main() -> int:
 
     run(["npm.cmd", "--prefix", "web", "install", "--no-audit", "--no-fund"])
     run(["npm.cmd", "--prefix", "web", "run", "build"])
-    run(["cargo", "build", "--release", "-p", "remote-signaling", "-p", "remote-host"])
+    run(
+        [
+            "cargo",
+            "build",
+            "--release",
+            "-p",
+            "remote-signaling",
+            "-p",
+            "remote-host",
+            "-p",
+            "remote-control-panel",
+        ]
+    )
 
     base_url = f"http://{ip}:{PORT}"
     host_config = RUN_DIR / "remote-host.toml"
     escaped_ffmpeg = str(ffmpeg).replace("\\", "\\\\")
-    host_config.write_text(
+    host_config_text = (
         f'server_url = "{base_url}"\n'
         f'device_id = "{DEVICE_ID}"\n'
         'device_name = "这台 Windows 电脑"\n'
@@ -425,9 +441,13 @@ def main() -> int:
         f'ffmpeg_capture_mode = "{capture_mode}"\n'
         f'ffmpeg_capture_x = 0\nffmpeg_capture_y = 0\n'
         f'ffmpeg_capture_width = {primary_width}\n'
-        f'ffmpeg_capture_height = {primary_height}\n',
-        encoding="utf-8",
+        f'ffmpeg_capture_height = {primary_height}\n'
+        f'control_status_path = "{str(RUN_DIR / "host-state.json").replace("\\", "\\\\")}"\n'
     )
+    # Parse before replacing the live configuration so launcher changes cannot
+    # silently strand an already stopped stack with an invalid TOML file.
+    tomllib.loads(host_config_text)
+    host_config.write_text(host_config_text, encoding="utf-8")
 
     env = os.environ.copy()
     env.update(
@@ -486,8 +506,19 @@ def main() -> int:
             "encoder": encoder,
             "capture_mode": capture_mode,
             "elevated": True,
+            "python_executable": str(Path(sys.executable).resolve()),
         }
         (RUN_DIR / "status.json").write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+        panel_executable = ROOT / "target" / "release" / "remote-control-panel.exe"
+        subprocess.Popen(
+            [str(panel_executable), str(ROOT)],
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
+            close_fds=True,
+        )
         print("\n远程桌面已启动", flush=True)
         print(f"手机访问：{base_url}", flush=True)
         print(f"二维码：{qr_path}", flush=True)

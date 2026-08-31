@@ -1,5 +1,6 @@
 mod audio;
 mod config;
+mod control;
 #[cfg(windows)]
 mod display_power;
 mod input;
@@ -12,6 +13,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Context;
 use config::HostConfig;
+use control::ControlStatus;
 use remote_protocol::signaling::{ClientSignal, ServerSignal};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
@@ -37,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "remote-host.toml".into());
     let config =
         Arc::new(HostConfig::load(&path).with_context(|| format!("failed to load {path}"))?);
+    let control = Arc::new(ControlStatus::new(&config));
     let (outbound_tx, outbound_rx) = mpsc::channel::<ClientSignal>(128);
     let sessions: Arc<Mutex<HashMap<Uuid, rtc::AcceptedSession>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -50,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
     info!(device_id = %config.device_id, "host is online");
+    control.online();
 
     while let Some(signal) = inbound.recv().await {
         match signal {
@@ -74,11 +78,14 @@ async fn main() -> anyhow::Result<()> {
                     item.stop_media();
                     let _ = item.peer.close().await;
                 }
+                let session_config = config.for_viewport(viewport_width, viewport_height);
+                control.preparing(session_id, &session_config);
                 match rtc::accept_offer(
-                    config.for_viewport(viewport_width, viewport_height),
+                    session_config,
                     session_id,
                     sdp,
                     outbound_tx.clone(),
+                    control.clone(),
                 )
                 .await
                 {
@@ -119,10 +126,12 @@ async fn main() -> anyhow::Result<()> {
                     session.stop_media();
                     let _ = session.peer.close().await;
                 }
+                control.disconnected(session_id);
             }
             ServerSignal::Error { code, message } => warn!(%code, %message, "signaling error"),
             _ => {}
         }
     }
+    control.offline();
     anyhow::bail!("signaling connection closed")
 }
