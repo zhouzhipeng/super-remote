@@ -51,17 +51,18 @@ mod windows_app {
                     BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_PUSHBUTTON,
                     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow,
                     DispatchMessageW, FindWindowW, GWLP_USERDATA, GetMessageW, GetSystemMetrics,
-                    GetWindowLongPtrW, HMENU, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, LoadCursorW,
-                    MB_ICONERROR, MB_OK, MSG, MessageBoxW, PostQuitMessage, RegisterClassW,
-                    SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
-                    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW, SW_SHOWNA,
-                    SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW,
-                    SetForegroundWindow, SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW,
-                    SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
-                    WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
-                    WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_NCHITTEST, WM_SETFONT, WM_TIMER,
-                    WNDCLASSW, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-                    WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+                    GetWindowLongPtrW, HMENU, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, LWA_ALPHA,
+                    LoadCursorW, MB_ICONERROR, MB_OK, MSG, MessageBoxW, PostQuitMessage,
+                    RegisterClassW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
+                    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW,
+                    SW_SHOWNA, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW,
+                    SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
+                    SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+                    ShowWindow, TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE,
+                    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE,
+                    WM_NCHITTEST, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_LAYERED,
+                    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+                    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
                 },
             },
         },
@@ -466,7 +467,11 @@ mod windows_app {
             let [x, y, width, height] = virtual_screen_bounds();
             self.overlay = unsafe {
                 CreateWindowExW(
-                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                    WS_EX_TOPMOST
+                        | WS_EX_TOOLWINDOW
+                        | WS_EX_NOACTIVATE
+                        | WS_EX_LAYERED
+                        | WS_EX_TRANSPARENT,
                     OVERLAY_CLASS,
                     w!("Super Remote Privacy Screen"),
                     WS_POPUP,
@@ -480,6 +485,7 @@ mod windows_app {
                     None,
                 )?
             };
+            unsafe { SetLayeredWindowAttributes(self.overlay, COLORREF(0), 255, LWA_ALPHA) }?;
             self.privacy_supported =
                 unsafe { SetWindowDisplayAffinity(self.overlay, WDA_EXCLUDEFROMCAPTURE) }.is_ok();
             if !self.privacy_supported {
