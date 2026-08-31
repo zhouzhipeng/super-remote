@@ -10,6 +10,7 @@ mod windows_app {
     use std::{
         ffi::c_void,
         fs::{self, File, OpenOptions},
+        net::{Ipv4Addr, SocketAddrV4, TcpListener},
         path::{Path, PathBuf},
         process::{Command, Stdio},
         sync::atomic::{AtomicBool, AtomicIsize, Ordering},
@@ -58,7 +59,7 @@ mod windows_app {
                     LLMHF_LOWER_IL_INJECTED, LWA_ALPHA, LoadCursorW, MB_ICONERROR, MB_OK, MSG,
                     MSLLHOOKSTRUCT, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
                     SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
-                    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW, SW_SHOWNA,
+                    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_RESTORE, SW_SHOWNA,
                     SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW,
                     SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
                     SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
@@ -89,6 +90,7 @@ mod windows_app {
     const ID_SAVE_LOGIN: usize = 108;
     const ID_LOGIN_USERNAME: usize = 109;
     const ID_LOGIN_PASSWORD: usize = 110;
+    const ID_WEB_PORT: usize = 111;
     const WM_LOCAL_PHYSICAL_INPUT: u32 = WM_APP + 1;
 
     static LOCAL_INPUT_WINDOW: AtomicIsize = AtomicIsize::new(0);
@@ -98,6 +100,8 @@ mod windows_app {
     struct LauncherStatus {
         url: String,
         qr: String,
+        #[serde(default = "default_web_port")]
+        port: u16,
         host_pid: u32,
         signaling_pid: u32,
         primary_display: String,
@@ -138,6 +142,8 @@ mod windows_app {
         #[serde(default = "default_login_username")]
         username: String,
         password: String,
+        #[serde(default = "default_web_port")]
+        port: u16,
     }
 
     #[derive(Serialize)]
@@ -207,6 +213,7 @@ mod windows_app {
         policy_label: HWND,
         audio_policy_label: HWND,
         action_label: HWND,
+        port_edit: HWND,
         username_edit: HWND,
         password_edit: HWND,
         privacy_checkbox: HWND,
@@ -234,6 +241,7 @@ mod windows_app {
                 policy_label: HWND::default(),
                 audio_policy_label: HWND::default(),
                 action_label: HWND::default(),
+                port_edit: HWND::default(),
                 username_edit: HWND::default(),
                 password_edit: HWND::default(),
                 privacy_checkbox: HWND::default(),
@@ -423,15 +431,43 @@ mod windows_app {
                 )?;
             }
 
+            let port_label = unsafe {
+                child(
+                    self.window,
+                    instance,
+                    w!("STATIC"),
+                    w!("Web 端口"),
+                    scale(30),
+                    scale(296),
+                    scale(110),
+                    scale(32),
+                    0,
+                    0,
+                )?
+            };
+            self.port_edit = unsafe {
+                child(
+                    self.window,
+                    instance,
+                    w!("EDIT"),
+                    w!("8080"),
+                    scale(140),
+                    scale(288),
+                    scale(90),
+                    scale(38),
+                    WS_BORDER.0 | ES_AUTOHSCROLL as u32,
+                    ID_WEB_PORT,
+                )?
+            };
             let username_label = unsafe {
                 child(
                     self.window,
                     instance,
                     w!("STATIC"),
-                    w!("8080 登录账号"),
-                    scale(30),
+                    w!("登录账号"),
+                    scale(250),
                     scale(296),
-                    scale(120),
+                    scale(90),
                     scale(32),
                     0,
                     0,
@@ -443,9 +479,9 @@ mod windows_app {
                     instance,
                     w!("EDIT"),
                     w!("admin"),
-                    scale(150),
+                    scale(340),
                     scale(288),
-                    scale(160),
+                    scale(250),
                     scale(38),
                     WS_BORDER.0 | ES_AUTOHSCROLL as u32,
                     ID_LOGIN_USERNAME,
@@ -456,10 +492,10 @@ mod windows_app {
                     self.window,
                     instance,
                     w!("STATIC"),
-                    w!("密码"),
-                    scale(330),
-                    scale(296),
-                    scale(50),
+                    w!("登录密码"),
+                    scale(30),
+                    scale(342),
+                    scale(90),
                     scale(32),
                     0,
                     0,
@@ -471,26 +507,12 @@ mod windows_app {
                     instance,
                     w!("EDIT"),
                     w!(""),
-                    scale(384),
-                    scale(288),
-                    scale(206),
+                    scale(120),
+                    scale(334),
+                    scale(270),
                     scale(38),
                     WS_BORDER.0 | ES_AUTOHSCROLL as u32 | ES_PASSWORD as u32,
                     ID_LOGIN_PASSWORD,
-                )?
-            };
-            let credential_help = unsafe {
-                child(
-                    self.window,
-                    instance,
-                    w!("STATIC"),
-                    w!("密码至少 12 个字节；留空表示保留当前密码。"),
-                    scale(30),
-                    scale(342),
-                    scale(400),
-                    scale(32),
-                    0,
-                    0,
                 )?
             };
             let save_login = unsafe {
@@ -507,6 +529,20 @@ mod windows_app {
                     ID_SAVE_LOGIN,
                 )?
             };
+            let credential_help = unsafe {
+                child(
+                    self.window,
+                    instance,
+                    w!("STATIC"),
+                    w!("端口范围 1–65535；密码至少 12 字节，留空则保留。"),
+                    scale(30),
+                    scale(386),
+                    scale(560),
+                    scale(32),
+                    0,
+                    0,
+                )?
+            };
 
             self.privacy_checkbox = unsafe {
                 child(
@@ -515,7 +551,7 @@ mod windows_app {
                     w!("BUTTON"),
                     w!("Web 客户端连接后启用本机隐私黑屏"),
                     scale(30),
-                    scale(398),
+                    scale(430),
                     scale(550),
                     scale(32),
                     BS_AUTOCHECKBOX as u32,
@@ -529,7 +565,7 @@ mod windows_app {
                     w!("STATIC"),
                     w!("所有显示器变黑；断线后须使用本机键盘或鼠标解除。"),
                     scale(52),
-                    scale(434),
+                    scale(466),
                     scale(520),
                     scale(32),
                     0,
@@ -543,7 +579,7 @@ mod windows_app {
                     w!("BUTTON"),
                     w!("Web 客户端连接后静音主机声音"),
                     scale(30),
-                    scale(476),
+                    scale(508),
                     scale(550),
                     scale(32),
                     BS_AUTOCHECKBOX as u32,
@@ -557,7 +593,7 @@ mod windows_app {
                     w!("STATIC"),
                     w!("静音本机默认播放设备；客户端断开后仍保持静音。"),
                     scale(52),
-                    scale(512),
+                    scale(544),
                     scale(520),
                     scale(32),
                     0,
@@ -571,7 +607,7 @@ mod windows_app {
                     w!("STATIC"),
                     w!(""),
                     scale(30),
-                    scale(568),
+                    scale(600),
                     scale(550),
                     scale(58),
                     0,
@@ -584,6 +620,8 @@ mod windows_app {
                 self.client_label,
                 self.video_label,
                 self.address_label,
+                port_label,
+                self.port_edit,
                 username_label,
                 self.username_edit,
                 password_label,
@@ -601,11 +639,13 @@ mod windows_app {
 
             self.settings =
                 read_json(&self.run_dir.join("control-settings.json")).unwrap_or_default();
-            let username = read_json::<StoredCredentials>(&self.run_dir.join("secrets.json"))
-                .map(|credentials| credentials.username)
-                .unwrap_or_else(default_login_username);
+            let (username, port) =
+                read_json::<StoredCredentials>(&self.run_dir.join("secrets.json"))
+                    .map(|credentials| (credentials.username, credentials.port))
+                    .unwrap_or_else(|| (default_login_username(), default_web_port()));
             unsafe {
                 set_text(self.username_edit, &username);
+                set_text(self.port_edit, &port.to_string());
                 SendMessageW(
                     self.privacy_checkbox,
                     BM_SETCHECK,
@@ -849,6 +889,13 @@ mod windows_app {
         }
 
         fn save_login_credentials(&mut self) {
+            let port = match parse_web_port(&window_text(self.port_edit)) {
+                Ok(port) => port,
+                Err(error) => {
+                    set_text(self.action_label, &error);
+                    return;
+                }
+            };
             let username = window_text(self.username_edit).trim().to_owned();
             let new_password = window_text(self.password_edit);
             if let Err(error) = validate_login_update(
@@ -856,6 +903,16 @@ mod windows_app {
                 (!new_password.is_empty()).then_some(new_password.as_str()),
             ) {
                 set_text(self.action_label, &error);
+                return;
+            }
+            let current_port = read_json::<LauncherStatus>(&self.run_dir.join("status.json"))
+                .map(|status| status.port)
+                .unwrap_or_else(default_web_port);
+            if port != current_port && !web_port_is_available(port) {
+                set_text(
+                    self.action_label,
+                    &format!("端口 {port} 已被其他程序占用；设置未保存。"),
+                );
                 return;
             }
             let path = self.run_dir.join("secrets.json");
@@ -867,6 +924,7 @@ mod windows_app {
                 return;
             };
             credentials.username = username;
+            credentials.port = port;
             if !new_password.is_empty() {
                 credentials.password = new_password;
             }
@@ -878,7 +936,7 @@ mod windows_app {
             self.action(Action::Restart);
             set_text(
                 self.action_label,
-                "登录凭据已保存；正在重启 8080 服务使其生效…",
+                &format!("Web 设置已保存；正在重启端口 {port} 的服务…"),
             );
         }
 
@@ -985,7 +1043,7 @@ mod windows_app {
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
             if let Ok(existing) = unsafe { FindWindowW(PANEL_CLASS, PANEL_TITLE) } {
                 unsafe {
-                    let _ = ShowWindow(existing, SW_SHOW);
+                    let _ = ShowWindow(existing, SW_RESTORE);
                     let _ = SetForegroundWindow(existing);
                 }
             }
@@ -1003,7 +1061,7 @@ mod windows_app {
         let mut app = Box::new(App::empty(root));
         let app_ptr = (&mut *app) as *mut App;
         let panel_width = 640;
-        let panel_height = 680;
+        let panel_height = 720;
         let panel_x = (unsafe { GetSystemMetrics(SM_CXSCREEN) } - panel_width) / 2;
         let panel_y = (unsafe { GetSystemMetrics(SM_CYSCREEN) } - panel_height) / 2;
         app.window = unsafe {
@@ -1027,7 +1085,7 @@ mod windows_app {
             let dpi = GetDpiForWindow(app.window) as i32;
             let scale = |value: i32| value * dpi / 96;
             let scaled_width = scale(640);
-            let scaled_height = scale(680);
+            let scaled_height = scale(720);
             let scaled_x = (GetSystemMetrics(SM_CXSCREEN) - scaled_width) / 2;
             let scaled_y = (GetSystemMetrics(SM_CYSCREEN) - scaled_height) / 2;
             SetWindowPos(
@@ -1104,6 +1162,21 @@ mod windows_app {
 
     fn default_login_username() -> String {
         "admin".into()
+    }
+
+    fn default_web_port() -> u16 {
+        8080
+    }
+
+    fn parse_web_port(value: &str) -> Result<u16, String> {
+        match value.trim().parse::<u16>() {
+            Ok(port) if port != 0 => Ok(port),
+            _ => Err("Web 端口必须是 1 到 65535 之间的整数。".into()),
+        }
+    }
+
+    fn web_port_is_available(port: u16) -> bool {
+        TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).is_ok()
     }
 
     fn validate_login_update(username: &str, password: Option<&str>) -> Result<(), String> {
@@ -1506,6 +1579,7 @@ mod windows_app {
             )
             .unwrap();
             assert_eq!(credentials.username, "admin");
+            assert_eq!(credentials.port, 8080);
         }
 
         #[test]
@@ -1514,6 +1588,14 @@ mod windows_app {
             assert!(validate_login_update("", None).is_err());
             assert!(validate_login_update("operator", Some("too-short")).is_err());
             assert!(validate_login_update("operator", Some("long-password")).is_ok());
+        }
+
+        #[test]
+        fn web_port_must_fit_the_tcp_port_range() {
+            assert_eq!(parse_web_port(" 8080 ").unwrap(), 8080);
+            assert!(parse_web_port("0").is_err());
+            assert!(parse_web_port("65536").is_err());
+            assert!(parse_web_port("not-a-port").is_err());
         }
     }
 }

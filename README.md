@@ -38,16 +38,18 @@ builds and starts Signaling/Web/Host plus the native Windows control panel, and 
 long-lived direct-access QR code to
 `.run/remote-desktop-qr.png`. Keep the terminal open; Ctrl+C stops the managed processes.
 The QR remains valid while `.run/secrets.json` is unchanged and contains a bearer token,
-so treat it as a permanent password and do not share it. Windows Firewall must allow TCP 8080
-from the local subnet, and the phone must be on the same LAN.
+so treat it as a permanent password and do not share it. Windows Firewall must allow the
+configured TCP Web port (8080 by default) from the local subnet, and the phone must be on
+the same LAN.
 
 The control panel is opened automatically with the elevated Host. It shows the Host and
 Signaling process state, browser connection state, active stream size/FPS/bitrate/encoder,
 primary-display capture details and whether the capture pipeline is idle. Use its buttons
 to start, stop or restart the stack, open the Web client, or view the current QR code. The
-8080 login account and password can be changed in the panel; saving preserves the JWT/device
-secrets and restarts the services so the new login takes effect. Passwords must contain at
-least 12 UTF-8 bytes and remain masked in the panel.
+Web port, login account and password can be changed in the panel; saving preserves the
+JWT/device secrets and restarts the services so the new address and login take effect. The
+port must be between 1 and 65535. Passwords must contain at least 12 UTF-8 bytes and remain
+masked in the panel.
 The optional “Web 客户端连接后启用本机隐私黑屏” setting covers the complete Windows
 virtual desktop, including every enabled secondary display, while a client is connected.
 The overlay is excluded from Windows capture, so the remote picture and input continue

@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent
 RUN_DIR = ROOT / ".run"
 TOOLS_DIR = ROOT / ".tools"
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-PORT = 8080
+DEFAULT_PORT = 8080
 DEVICE_ID = "local-windows-pc"
 PERMANENT_EXPIRY = 253_402_300_799  # 9999-12-31T23:59:59Z
 
@@ -409,19 +409,27 @@ def main() -> int:
             "device_token": secrets.token_urlsafe(36),
             "username": "admin",
             "password": secrets.token_urlsafe(12),
+            "port": DEFAULT_PORT,
         }
         secrets_file.write_text(json.dumps(credentials, indent=2), encoding="utf-8")
-    if "username" not in credentials:
-        credentials["username"] = "admin"
+    credentials_changed = False
+    for key, default in (("username", "admin"), ("port", DEFAULT_PORT)):
+        if key not in credentials:
+            credentials[key] = default
+            credentials_changed = True
+    if credentials_changed:
         secrets_file.write_text(
             json.dumps(credentials, ensure_ascii=False, indent=2), encoding="utf-8"
         )
     username = credentials.get("username")
     password = credentials.get("password")
+    port = credentials.get("port")
     if not isinstance(username, str) or not username.strip():
         raise RuntimeError("登录账号不能为空")
     if not isinstance(password, str) or len(password.encode("utf-8")) < 12:
         raise RuntimeError("登录密码必须至少包含 12 个 UTF-8 字节")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise RuntimeError("Web 服务端口必须是 1 到 65535 之间的整数")
 
     run(["npm.cmd", "--prefix", "web", "install", "--no-audit", "--no-fund"])
     run(["npm.cmd", "--prefix", "web", "run", "build"])
@@ -441,7 +449,7 @@ def main() -> int:
         build_command.extend(["-p", "remote-control-panel"])
     run(build_command)
 
-    base_url = f"http://{ip}:{PORT}"
+    base_url = f"http://{ip}:{port}"
     host_config = RUN_DIR / "remote-host.toml"
     escaped_ffmpeg = str(ffmpeg).replace("\\", "\\\\")
     host_config_text = (
@@ -466,7 +474,7 @@ def main() -> int:
     env = os.environ.copy()
     env.update(
         {
-            "REMOTE_BIND": f"0.0.0.0:{PORT}",
+            "REMOTE_BIND": f"0.0.0.0:{port}",
             "REMOTE_WEB_DIST": str((ROOT / "web" / "dist").resolve()),
             "REMOTE_JWT_SECRET": credentials["jwt_secret"],
             "REMOTE_ADMIN_USER": username,
@@ -511,6 +519,7 @@ def main() -> int:
             "qr": str(qr_path),
             "username": username,
             "password": password,
+            "port": port,
             "signaling_pid": signaling.pid,
             "host_pid": host.pid,
             "launcher_pid": os.getpid(),
