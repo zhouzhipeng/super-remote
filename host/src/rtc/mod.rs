@@ -20,7 +20,10 @@ use ::rtc::{
         },
     },
 };
-use remote_protocol::signaling::ClientSignal;
+use remote_protocol::{
+    clipboard::{ClipboardRequest, ClipboardResponse, MAX_CLIPBOARD_TEXT_BYTES},
+    signaling::ClientSignal,
+};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -35,7 +38,9 @@ use webrtc::{
     runtime::{Runtime, default_runtime},
 };
 
-use crate::{audio, config::HostConfig, control::ControlStatus, input, stats::HostStats, video};
+use crate::{
+    audio, clipboard, config::HostConfig, control::ControlStatus, input, stats::HostStats, video,
+};
 
 #[derive(Clone)]
 struct Handler {
@@ -140,6 +145,11 @@ impl PeerConnectionEventHandler for Handler {
         let stats = self.stats.clone();
         runtime.spawn(Box::pin(async move {
             let label = channel.label().await.unwrap_or_default();
+            if label == "clipboard" {
+                debug!(%label, "clipboard data channel created");
+                serve_clipboard(channel).await;
+                return;
+            }
             if label != "input-fast" && label != "input-reliable" {
                 warn!(%label, "closing unknown data channel");
                 let _ = channel.close().await;
@@ -171,6 +181,81 @@ impl PeerConnectionEventHandler for Handler {
                 }
             }
         }));
+    }
+}
+
+async fn serve_clipboard(channel: Arc<dyn DataChannel>) {
+    while let Some(event) = channel.poll().await {
+        match event {
+            DataChannelEvent::OnMessage(message) if message.is_string => {
+                let response = match String::from_utf8(message.data.to_vec())
+                    .map_err(anyhow::Error::from)
+                    .and_then(|json| {
+                        serde_json::from_str::<ClipboardRequest>(&json).map_err(Into::into)
+                    }) {
+                    Ok(request) => {
+                        let id = request.id();
+                        match tokio::task::spawn_blocking(move || {
+                            process_clipboard_request(request)
+                        })
+                        .await
+                        {
+                            Ok(Ok(response)) => response,
+                            Ok(Err(error)) => ClipboardResponse::Error {
+                                id,
+                                message: error.to_string(),
+                            },
+                            Err(error) => ClipboardResponse::Error {
+                                id,
+                                message: format!("clipboard worker failed: {error}"),
+                            },
+                        }
+                    }
+                    Err(error) => ClipboardResponse::Error {
+                        id: 0,
+                        message: format!("invalid clipboard request: {error}"),
+                    },
+                };
+                match serde_json::to_string(&response) {
+                    Ok(json) => {
+                        if let Err(error) = channel.send_text(&json).await {
+                            warn!(%error, "failed to send clipboard response");
+                            break;
+                        }
+                    }
+                    Err(error) => warn!(%error, "failed to encode clipboard response"),
+                }
+            }
+            DataChannelEvent::OnMessage(_) => warn!("binary clipboard message rejected"),
+            DataChannelEvent::OnClose => break,
+            _ => {}
+        }
+    }
+}
+
+fn process_clipboard_request(request: ClipboardRequest) -> anyhow::Result<ClipboardResponse> {
+    match request {
+        ClipboardRequest::Read { id } => {
+            let text = clipboard::read_text()?;
+            anyhow::ensure!(
+                text.len() <= MAX_CLIPBOARD_TEXT_BYTES,
+                "主机剪贴板文本超过 {} KiB 限制",
+                MAX_CLIPBOARD_TEXT_BYTES / 1024
+            );
+            Ok(ClipboardResponse::Content { id, text })
+        }
+        ClipboardRequest::Write { id, text, paste } => {
+            anyhow::ensure!(
+                text.len() <= MAX_CLIPBOARD_TEXT_BYTES,
+                "剪贴板文本超过 {} KiB 限制",
+                MAX_CLIPBOARD_TEXT_BYTES / 1024
+            );
+            clipboard::write_text(&text)?;
+            if paste {
+                input::paste_shortcut()?;
+            }
+            Ok(ClipboardResponse::Ack { id })
+        }
     }
 }
 

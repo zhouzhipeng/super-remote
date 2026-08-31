@@ -13,3 +13,12 @@ pub fn inject_packet(packet: &[u8]) -> anyhow::Result<TimedInputEvent> {
     #[cfg(not(windows))]
     anyhow::bail!("input injection is only supported on Windows")
 }
+
+pub fn paste_shortcut() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        windows_input::paste_shortcut()
+    }
+    #[cfg(not(windows))]
+    anyhow::bail!("input injection is only supported on Windows")
+}

@@ -26,7 +26,7 @@ async function devicesView(): Promise<void> {
 }
 
 async function sessionView(deviceId: string): Promise<void> {
-  app.innerHTML = `<main class="remote"><video id="remote" autoplay muted playsinline tabindex="0"></video><div class="toolbar-corner-hint" aria-hidden="true"><span>⌄</span><span>控制条</span></div><div class="toolbar"><button id="back" class="secondary">断开</button><button id="sound">开启声音</button><button id="fullscreen" class="secondary" aria-pressed="false">全屏</button><button id="toolbar-pin" class="secondary" aria-pressed="true">取消固定</button><span id="state">正在连接</span><span id="stats"></span></div></main>`;
+  app.innerHTML = `<main class="remote"><video id="remote" autoplay muted playsinline tabindex="0"></video><div class="toolbar-corner-hint" aria-hidden="true"><span>⌄</span><span>控制条</span></div><div class="toolbar"><button id="back" class="secondary">断开</button><button id="sound">开启声音</button><button id="clipboard" class="secondary">剪贴板</button><button id="fullscreen" class="secondary" aria-pressed="false">全屏</button><button id="toolbar-pin" class="secondary" aria-pressed="true">取消固定</button><span id="state">正在连接</span><span id="stats"></span></div><section class="clipboard-panel card" hidden aria-label="双向剪贴板"><header><strong>双向文本剪贴板</strong><button id="clipboard-close" class="secondary" aria-label="关闭剪贴板">关闭</button></header><textarea id="clipboard-text" placeholder="在这里粘贴手机/浏览器中的文本，或从主机读取文本" spellcheck="false"></textarea><div class="clipboard-actions"><button id="clipboard-read">从主机读取</button><button id="clipboard-send" class="secondary">发送到主机</button><button id="clipboard-paste">发送并粘贴</button><button id="clipboard-copy" class="secondary">复制到本机</button></div><output id="clipboard-status">Ctrl+C / Ctrl+V 也会自动同步文本</output></section></main>`;
   const remote = app.querySelector<HTMLElement>(".remote")!;
   const video = app.querySelector<HTMLVideoElement>("#remote")!;
   const toolbar = app.querySelector<HTMLElement>(".toolbar")!;
@@ -34,11 +34,24 @@ async function sessionView(deviceId: string): Promise<void> {
   const fullscreenButton = app.querySelector<HTMLButtonElement>("#fullscreen")!;
   const state = app.querySelector<HTMLSpanElement>("#state")!;
   const stats = app.querySelector<HTMLElement>("#stats")!;
+  const clipboardButton = app.querySelector<HTMLButtonElement>("#clipboard")!;
+  const clipboardPanel = app.querySelector<HTMLElement>(".clipboard-panel")!;
+  const clipboardText = app.querySelector<HTMLTextAreaElement>("#clipboard-text")!;
+  const clipboardStatus = app.querySelector<HTMLOutputElement>("#clipboard-status")!;
   let disposed = false;
   const createRemoteSession = (): RemoteSession => {
     const next = new RemoteSession(video, stats);
     next.addEventListener("state", (event) => { state.textContent = stateLabel((event as CustomEvent<string>).detail); });
     next.addEventListener("error", (event) => { state.textContent = String((event as CustomEvent).detail); });
+    next.addEventListener("clipboardready", () => { clipboardButton.disabled = false; });
+    next.addEventListener("clipboard", (event) => {
+      const detail = (event as CustomEvent<{ text: string; copied: boolean; automatic: boolean }>).detail;
+      clipboardText.value = detail.text;
+      clipboardStatus.textContent = detail.copied
+        ? "主机文本已复制到当前设备"
+        : "已读取主机文本；浏览器未授权自动写入，请点“复制到本机”";
+      clipboardButton.classList.toggle("attention", !detail.copied);
+    });
     return next;
   };
   let session = createRemoteSession();
@@ -58,6 +71,7 @@ async function sessionView(deviceId: string): Promise<void> {
       forceResize = false;
       if (!forced && Math.abs(area.width - connectedArea.width) < 64 && Math.abs(area.height - connectedArea.height) < 64) return;
       connectedArea = area;
+      clipboardButton.disabled = true;
       session.close();
       session = createRemoteSession();
       void session.connect(deviceId).catch((error) => { state.textContent = error instanceof Error ? error.message : String(error); });
@@ -93,6 +107,72 @@ async function sessionView(deviceId: string): Promise<void> {
     }
   };
   applyToolbarMode(toolbarPinned, false);
+  clipboardButton.disabled = true;
+
+  const showClipboardPanel = (visible: boolean): void => {
+    clipboardPanel.hidden = !visible;
+    remote.classList.toggle("clipboard-open", visible);
+    if (visible) {
+      setToolbarVisible(true);
+      clipboardText.focus({ preventScroll: true });
+    } else {
+      video.focus({ preventScroll: true });
+      setToolbarVisible(true, true);
+    }
+  };
+  const clipboardAction = async (action: () => Promise<void>): Promise<void> => {
+    clipboardStatus.textContent = "正在同步…";
+    try { await action(); } catch (error) {
+      clipboardStatus.textContent = error instanceof Error ? error.message : String(error);
+    }
+  };
+  clipboardButton.addEventListener("click", () => {
+    const opening = clipboardPanel.hasAttribute("hidden");
+    showClipboardPanel(opening);
+    if (opening) {
+      void clipboardAction(async () => {
+        clipboardText.value = await session.readClipboard();
+        clipboardStatus.textContent = "已从主机读取";
+      });
+    }
+  });
+  app.querySelector("#clipboard-close")!.addEventListener("click", () => showClipboardPanel(false));
+  app.querySelector("#clipboard-read")!.addEventListener("click", () => {
+    void clipboardAction(async () => {
+      clipboardText.value = await session.readClipboard();
+      clipboardStatus.textContent = "已从主机读取";
+    });
+  });
+  app.querySelector("#clipboard-send")!.addEventListener("click", () => {
+    void clipboardAction(async () => {
+      await session.writeClipboard(clipboardText.value);
+      clipboardStatus.textContent = "已发送到主机剪贴板";
+    });
+  });
+  app.querySelector("#clipboard-paste")!.addEventListener("click", () => {
+    void clipboardAction(async () => {
+      await session.writeClipboard(clipboardText.value, true);
+      clipboardStatus.textContent = "已发送并粘贴到主机";
+      showClipboardPanel(false);
+    });
+  });
+  app.querySelector("#clipboard-copy")!.addEventListener("click", () => {
+    void clipboardAction(async () => {
+      let copied = false;
+      try {
+        await navigator.clipboard.writeText(clipboardText.value);
+        copied = true;
+      } catch { /* fall through to the user-gesture copy command */ }
+      if (!copied) {
+        clipboardText.focus();
+        clipboardText.select();
+        copied = document.execCommand("copy");
+      }
+      if (!copied) throw new Error("浏览器拒绝复制，请长按或选中文本后复制");
+      clipboardButton.classList.remove("attention");
+      clipboardStatus.textContent = "已复制到当前设备";
+    });
+  });
   pinButton.addEventListener("click", () => {
     const pinned = !toolbarPinned;
     applyToolbarMode(pinned, true);

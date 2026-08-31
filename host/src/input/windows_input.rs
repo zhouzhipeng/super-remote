@@ -61,27 +61,40 @@ pub fn inject(event: InputEvent) -> anyhow::Result<()> {
             scan_code,
             down,
             extended,
-        } => {
-            let mut flags = KEYEVENTF_SCANCODE;
-            if !down {
-                flags |= KEYEVENTF_KEYUP;
-            }
-            if extended {
-                flags |= KEYEVENTF_EXTENDEDKEY;
-            }
-            INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wScan: scan_code,
-                        dwFlags: flags,
-                        ..Default::default()
-                    },
-                },
-            }
-        }
+        } => keyboard(scan_code, down, extended),
     };
     send(&[input])
+}
+
+pub fn paste_shortcut() -> anyhow::Result<()> {
+    // One native batch makes clipboard replacement + paste deterministic from
+    // the caller's perspective and avoids a stale Ctrl+V racing the data channel.
+    send(&[
+        keyboard(0x1d, true, false),
+        keyboard(0x2f, true, false),
+        keyboard(0x2f, false, false),
+        keyboard(0x1d, false, false),
+    ])
+}
+
+fn keyboard(scan_code: u16, down: bool, extended: bool) -> INPUT {
+    let mut flags = KEYEVENTF_SCANCODE;
+    if !down {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    if extended {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wScan: scan_code,
+                dwFlags: flags,
+                ..Default::default()
+            },
+        },
+    }
 }
 
 fn mouse(

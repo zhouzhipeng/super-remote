@@ -55,12 +55,15 @@ export class InputController {
   #lastRawUpdate = -Infinity;
   #moveSequence = 0;
   #pressed = new Set<string>();
+  #clipboardPasteKeys = new Set<string>();
 
   constructor(
     video: HTMLVideoElement,
     fast: RTCDataChannel,
     reliable: RTCDataChannel,
     private readonly onLatency: (milliseconds: number) => void,
+    private readonly onPasteText: (text: string) => void,
+    private readonly onCopyShortcut: () => void,
   ) {
     this.#video = video;
     this.#fast = fast;
@@ -76,6 +79,7 @@ export class InputController {
     video.addEventListener("wheel", this.#wheel, { passive: false });
     window.addEventListener("keydown", this.#keyboard, true);
     window.addEventListener("keyup", this.#keyboard, true);
+    window.addEventListener("paste", this.#paste, true);
     window.addEventListener("blur", this.#releaseAll);
     fast.bufferedAmountLowThreshold = 0;
     fast.addEventListener("bufferedamountlow", this.#flushPendingMove);
@@ -92,6 +96,7 @@ export class InputController {
     this.#video.removeEventListener("wheel", this.#wheel);
     window.removeEventListener("keydown", this.#keyboard, true);
     window.removeEventListener("keyup", this.#keyboard, true);
+    window.removeEventListener("paste", this.#paste, true);
     window.removeEventListener("blur", this.#releaseAll);
     this.#fast.removeEventListener("bufferedamountlow", this.#flushPendingMove);
     this.#fast.removeEventListener("message", this.#inputAck);
@@ -163,14 +168,37 @@ export class InputController {
   };
 
   #keyboard = (event: KeyboardEvent): void => {
+    if (isLocalUiTarget(event.target)) return;
     const mapping = SCAN_CODES[event.code];
     if (!mapping) return;
+    const clipboardModifier = event.ctrlKey || event.metaKey;
+    if (event.code === "KeyV" && (clipboardModifier || this.#clipboardPasteKeys.has(event.code))) {
+      // Let the browser emit its trusted paste event so clipboardData remains
+      // available even on a plain-HTTP LAN address, but never forward the V key.
+      // The Host performs clipboard replacement and Ctrl+V as one operation.
+      if (event.type === "keydown") this.#clipboardPasteKeys.add(event.code);
+      else this.#clipboardPasteKeys.delete(event.code);
+      event.stopPropagation();
+      return;
+    }
     event.preventDefault();
     event.stopPropagation();
     const down = event.type === "keydown";
     if (down && this.#pressed.has(event.code) && !event.repeat) return;
     if (down) this.#pressed.add(event.code); else this.#pressed.delete(event.code);
     this.#sendKey(mapping[0], down, mapping[1]);
+    if (!down && clipboardModifier && (event.code === "KeyC" || event.code === "KeyX")) {
+      this.onCopyShortcut();
+    }
+  };
+
+  #paste = (event: ClipboardEvent): void => {
+    if (isLocalUiTarget(event.target)) return;
+    const text = event.clipboardData?.getData("text/plain");
+    if (text === undefined) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.onPasteText(text);
   };
 
   #sendKey(scanCode: number, down: boolean, extended: boolean): void {
@@ -187,6 +215,7 @@ export class InputController {
       if (mapping) this.#sendKey(mapping[0], false, mapping[1]);
     }
     this.#pressed.clear();
+    this.#clipboardPasteKeys.clear();
   };
 
   #sendReliable(data: ArrayBufferView<ArrayBuffer>): void {
@@ -217,6 +246,10 @@ export class InputController {
     if (clientX < left || clientX > left + displayWidth || clientY < top || clientY > top + displayHeight) return null;
     return { x: clamp16(((clientX - left) / displayWidth) * 65535), y: clamp16(((clientY - top) / displayHeight) * 65535) };
   }
+}
+
+function isLocalUiTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && target.closest(".toolbar, .clipboard-panel") !== null;
 }
 
 function bytes(view: DataView): Uint8Array<ArrayBuffer> {

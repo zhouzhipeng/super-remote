@@ -1,7 +1,7 @@
 :root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #eef2ff; background: #080b12; font-synthesis: none; }
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; }
-button, input { font: inherit; }
+button, input, textarea { font: inherit; }
 button { border: 0; border-radius: 8px; padding: .7rem 1rem; color: white; background: #4f6ef7; cursor: pointer; }
 button:disabled { opacity: .4; cursor: not-allowed; }
 .secondary { background: #252b3a; }
@@ -23,13 +23,20 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .remote { position: relative; width: 100vw; height: 100vh; overflow: hidden; background: black; display: grid; grid-template-rows: minmax(0, 1fr) auto; }
 .remote video { display: block; width: 100%; height: 100%; object-fit: contain; outline: none; touch-action: none; user-select: none; }
 .toolbar { z-index: 3; display: flex; align-items: center; gap: .7rem; min-height: 48px; padding: .45rem .7rem; background: #111722; font: 12px ui-monospace, monospace; white-space: nowrap; overflow-x: auto; }
+.toolbar button.attention { box-shadow: 0 0 0 2px #ffc857; color: #fff3c4; }
 #state { color: #95a5c9; }
 #stats { margin-left: auto; }
 .remote:fullscreen { grid-template-rows: minmax(0, 1fr) auto; }
 .remote.toolbar-unpinned { display: block; }
 .remote.toolbar-unpinned .toolbar { position: absolute; left: 50%; top: max(.7rem, env(safe-area-inset-top)); width: max-content; max-width: calc(100% - 1rem); border: 1px solid #ffffff20; border-radius: 13px; background: #111722e8; box-shadow: 0 12px 40px #0009; backdrop-filter: blur(16px); visibility: hidden; opacity: 0; pointer-events: none; transform: translate(-50%, calc(-100% - 1.5rem)); transition: transform 180ms ease, opacity 150ms ease, visibility 0s linear 180ms; }
-.remote.toolbar-unpinned.toolbar-visible .toolbar, .remote.toolbar-unpinned .toolbar:focus-within { visibility: visible; opacity: 1; pointer-events: auto; transform: translate(-50%, 0); transition-delay: 0s; }
+.remote.toolbar-unpinned.toolbar-visible .toolbar, .remote.toolbar-unpinned.clipboard-open .toolbar, .remote.toolbar-unpinned .toolbar:focus-within { visibility: visible; opacity: 1; pointer-events: auto; transform: translate(-50%, 0); transition-delay: 0s; }
 .toolbar-corner-hint { display: none; }
 .remote.toolbar-unpinned .toolbar-corner-hint { position: absolute; z-index: 2; left: 0; top: 0; display: flex; align-items: center; gap: .3rem; padding: .35rem .6rem .42rem .42rem; border: 1px solid #ffffff22; border-left: 0; border-top: 0; border-radius: 0 0 12px 0; color: #d9e2fa; background: #111722c7; box-shadow: 0 4px 18px #0007; font: 11px ui-sans-serif, system-ui, sans-serif; pointer-events: none; opacity: .82; transition: opacity 120ms ease; }
 .remote.toolbar-unpinned.toolbar-visible .toolbar-corner-hint { opacity: 0; }
+.clipboard-panel { position: absolute; z-index: 4; left: 50%; top: 50%; width: min(640px, calc(100% - 2rem)); max-height: calc(100% - 5rem); padding: 1rem; transform: translate(-50%, -50%); display: grid; gap: .8rem; background: #111722f2; backdrop-filter: blur(18px); }
+.clipboard-panel[hidden] { display: none; }
+.clipboard-panel header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.clipboard-panel textarea { width: 100%; min-height: 180px; max-height: 50vh; resize: vertical; border: 1px solid #3b455d; border-radius: 9px; padding: .8rem; color: #eef2ff; background: #080c14; line-height: 1.45; }
+.clipboard-actions { display: flex; flex-wrap: wrap; gap: .6rem; }
+.clipboard-panel output { min-height: 1.2rem; color: #aeb8cf; font-size: .85rem; }
 @media (max-width: 700px) { .devices header, .devices section { padding-left: 1rem; padding-right: 1rem; } #stats { display: none; } }

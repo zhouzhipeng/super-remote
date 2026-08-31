@@ -1,4 +1,5 @@
 mod audio;
+mod clipboard;
 mod config;
 mod control;
 #[cfg(windows)]

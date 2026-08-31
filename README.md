@@ -111,8 +111,12 @@ System playback audio uses event-driven WASAPI loopback capture and 48 kHz stere
 in 20 ms WebRTC audio samples. Browsers require one user gesture before unmuting autoplay;
 tap the `开启声音` button after connecting.
 `h264_file` is optional and exists only to isolate WebRTC transport during integration tests.
-Clipboard, multi-monitor, secure desktop and ICE restart remain the V2 items identified by
-the design.
+Bidirectional text clipboard uses its own reliable WebRTC data channel. `Ctrl+V` replaces the
+Host clipboard and injects the paste shortcut as one Host-side operation, while `Ctrl+C` reads
+the result back to the browser. The toolbar clipboard panel provides explicit read, send,
+send-and-paste and local-copy actions for mobile browsers and plain-HTTP LAN origins that deny
+background clipboard writes. Multi-monitor, secure desktop and ICE restart remain the V2 items
+identified by the design.
 
 Run `cargo run -p remote-host --example hardware_probe` on the Host before deployment. It
 requires a hardware Media Foundation encoder that can share the WGC D3D11 device; failure

@@ -5,6 +5,14 @@ import { StatsMonitor } from "./stats.ts";
 import type { ServerSignal } from "./types.ts";
 
 export type SessionState = "idle" | "creating_session" | "negotiating" | "connected" | "reconnecting" | "closed";
+export type ClipboardSyncDetail = { text: string; copied: boolean; automatic: boolean };
+
+type ClipboardResponse =
+  | { type: "content"; id: number; text: string }
+  | { type: "ack"; id: number }
+  | { type: "error"; id: number; message: string };
+
+const MAX_CLIPBOARD_TEXT_BYTES = 12 * 1024;
 
 export class RemoteSession extends EventTarget {
   state: SessionState = "idle";
@@ -17,6 +25,10 @@ export class RemoteSession extends EventTarget {
   #stats: StatsMonitor | null = null;
   #reportTimers: number[] = [];
   #remoteStream = new MediaStream();
+  #clipboard: RTCDataChannel | null = null;
+  #clipboardRequestId = 0;
+  #clipboardRequests = new Map<number, { resolve: (text: string) => void; reject: (error: Error) => void; timer: number }>();
+  #clipboardPullTimer = 0;
 
   constructor(private readonly video: HTMLVideoElement, private readonly statsOutput: HTMLElement) { super(); }
 
@@ -35,9 +47,27 @@ export class RemoteSession extends EventTarget {
     peer.addTransceiver("audio", { direction: "recvonly" });
     const fast = peer.createDataChannel("input-fast", { ordered: false, maxRetransmits: 0 });
     const reliable = peer.createDataChannel("input-reliable", { ordered: true });
+    const clipboard = peer.createDataChannel("clipboard", { ordered: true });
+    this.#clipboard = clipboard;
     fast.binaryType = reliable.binaryType = "arraybuffer";
+    clipboard.addEventListener("message", this.#onClipboardMessage);
+    clipboard.addEventListener("open", () => this.dispatchEvent(new Event("clipboardready")));
     reliable.addEventListener("open", () => {
-      this.#input = new InputController(this.video, fast, reliable, (latency) => this.#stats?.setInputLatency(latency));
+      this.#input = new InputController(
+        this.video,
+        fast,
+        reliable,
+        (latency) => this.#stats?.setInputLatency(latency),
+        (text) => {
+          void this.writeClipboard(text, true).catch((error) => this.#clipboardError(error));
+        },
+        () => {
+          window.clearTimeout(this.#clipboardPullTimer);
+          this.#clipboardPullTimer = window.setTimeout(() => {
+            void this.syncHostClipboardToBrowser(true).catch((error) => this.#clipboardError(error));
+          }, 120);
+        },
+      );
     });
     this.video.muted = true;
     this.video.playsInline = true;
@@ -87,12 +117,43 @@ export class RemoteSession extends EventTarget {
     return this.video.play();
   }
 
+  readClipboard(): Promise<string> {
+    return this.#clipboardRequest({ type: "read" });
+  }
+
+  writeClipboard(text: string, paste = false): Promise<string> {
+    if (new TextEncoder().encode(text).byteLength > MAX_CLIPBOARD_TEXT_BYTES) {
+      return Promise.reject(new Error(`剪贴板文本不能超过 ${MAX_CLIPBOARD_TEXT_BYTES / 1024} KiB`));
+    }
+    return this.#clipboardRequest({ type: "write", text, paste });
+  }
+
+  async syncHostClipboardToBrowser(automatic = false): Promise<ClipboardSyncDetail> {
+    const text = await this.readClipboard();
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    } catch { /* HTTP and mobile permission fallback is exposed by the clipboard panel. */ }
+    const detail = { text, copied, automatic };
+    this.dispatchEvent(new CustomEvent<ClipboardSyncDetail>("clipboard", { detail }));
+    return detail;
+  }
+
   close(): void {
     if (this.state === "closed") return;
     if (this.#sessionId) {
       try { this.#signaling.send({ type: "session_close", session_id: this.#sessionId }); } catch { /* already disconnected */ }
     }
     this.#input?.destroy();
+    window.clearTimeout(this.#clipboardPullTimer);
+    this.#clipboard?.removeEventListener("message", this.#onClipboardMessage);
+    this.#clipboard = null;
+    for (const request of this.#clipboardRequests.values()) {
+      window.clearTimeout(request.timer);
+      request.reject(new Error("远程会话已关闭"));
+    }
+    this.#clipboardRequests.clear();
     this.#stats?.stop();
     for (const timer of this.#reportTimers.splice(0)) window.clearTimeout(timer);
     this.#peer?.close();
@@ -104,6 +165,45 @@ export class RemoteSession extends EventTarget {
   #onSignal = (event: Event): void => {
     void this.#handleSignal((event as CustomEvent<ServerSignal>).detail);
   };
+
+  #clipboardRequest(message: { type: "read" } | { type: "write"; text: string; paste: boolean }): Promise<string> {
+    const channel = this.#clipboard;
+    if (!channel || channel.readyState !== "open") return Promise.reject(new Error("剪贴板通道尚未连接"));
+    const id = ++this.#clipboardRequestId;
+    const payload = JSON.stringify({ ...message, id });
+    return new Promise<string>((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        this.#clipboardRequests.delete(id);
+        reject(new Error("剪贴板操作超时"));
+      }, 5000);
+      this.#clipboardRequests.set(id, { resolve, reject, timer });
+      try {
+        channel.send(payload);
+      } catch (error) {
+        window.clearTimeout(timer);
+        this.#clipboardRequests.delete(id);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  #onClipboardMessage = (event: MessageEvent<string>): void => {
+    if (typeof event.data !== "string") return;
+    let response: ClipboardResponse;
+    try { response = JSON.parse(event.data) as ClipboardResponse; } catch { return; }
+    const request = this.#clipboardRequests.get(response.id);
+    if (!request) return;
+    window.clearTimeout(request.timer);
+    this.#clipboardRequests.delete(response.id);
+    if (response.type === "error") request.reject(new Error(response.message));
+    else request.resolve(response.type === "content" ? response.text : "");
+  };
+
+  #clipboardError(error: unknown): void {
+    this.dispatchEvent(new CustomEvent("error", {
+      detail: error instanceof Error ? error.message : String(error),
+    }));
+  }
 
   async #handleSignal(signal: ServerSignal): Promise<void> {
     if ("session_id" in signal && signal.session_id !== this.#sessionId) return;
