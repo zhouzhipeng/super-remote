@@ -26,11 +26,10 @@ async function devicesView(): Promise<void> {
 }
 
 async function sessionView(deviceId: string): Promise<void> {
-  app.innerHTML = `<main class="remote"><video id="remote" autoplay muted playsinline tabindex="0"></video><button id="toolbar-trigger" class="toolbar-trigger" type="button" aria-label="显示控制条" hidden><span aria-hidden="true">⌄</span><span>控制条</span></button><div class="toolbar"><button id="back" class="secondary">断开</button><button id="sound">开启声音</button><button id="fullscreen" class="secondary" aria-pressed="false">全屏</button><button id="toolbar-pin" class="secondary" aria-pressed="true">取消固定</button><span id="state">正在连接</span><span id="stats"></span></div></main>`;
+  app.innerHTML = `<main class="remote"><video id="remote" autoplay muted playsinline tabindex="0"></video><div class="toolbar"><button id="back" class="secondary">断开</button><button id="sound">开启声音</button><button id="fullscreen" class="secondary" aria-pressed="false">全屏</button><button id="toolbar-pin" class="secondary" aria-pressed="true">取消固定</button><span id="state">正在连接</span><span id="stats"></span></div></main>`;
   const remote = app.querySelector<HTMLElement>(".remote")!;
   const video = app.querySelector<HTMLVideoElement>("#remote")!;
   const toolbar = app.querySelector<HTMLElement>(".toolbar")!;
-  const toolbarTrigger = app.querySelector<HTMLButtonElement>("#toolbar-trigger")!;
   const pinButton = app.querySelector<HTMLButtonElement>("#toolbar-pin")!;
   const fullscreenButton = app.querySelector<HTMLButtonElement>("#fullscreen")!;
   const state = app.querySelector<HTMLSpanElement>("#state")!;
@@ -73,12 +72,10 @@ async function sessionView(deviceId: string): Promise<void> {
     window.clearTimeout(toolbarHideTimer);
     if (toolbarPinned) return;
     remote.classList.toggle("toolbar-visible", visible);
-    toolbarTrigger.setAttribute("aria-expanded", String(visible));
     if (visible && autoHide) {
       toolbarHideTimer = window.setTimeout(() => {
         if (!toolbar.matches(":hover") && !toolbar.contains(document.activeElement)) {
           remote.classList.remove("toolbar-visible");
-          toolbarTrigger.setAttribute("aria-expanded", "false");
         }
       }, 2600);
     }
@@ -87,24 +84,20 @@ async function sessionView(deviceId: string): Promise<void> {
     toolbarPinned = pinned;
     localStorage.setItem("remote-toolbar-pinned", String(pinned));
     remote.classList.toggle("toolbar-unpinned", !pinned);
-    remote.classList.toggle("toolbar-visible", !pinned);
-    toolbarTrigger.hidden = pinned;
-    toolbarTrigger.setAttribute("aria-expanded", String(!pinned));
+    remote.classList.remove("toolbar-visible");
     pinButton.textContent = pinned ? "取消固定" : "固定控制条";
     pinButton.title = pinned ? "取消固定，让画面占满整个窗口" : "将控制条固定在窗口底部";
     pinButton.setAttribute("aria-pressed", String(pinned));
-    if (!pinned) setToolbarVisible(true, true);
     if (reconnect) {
       requestAnimationFrame(() => requestAnimationFrame(() => scheduleResizeReconnect(true)));
     }
   };
   applyToolbarMode(toolbarPinned, false);
   pinButton.addEventListener("click", () => { applyToolbarMode(!toolbarPinned, true); });
-  toolbarTrigger.addEventListener("click", () => {
-    setToolbarVisible(!remote.classList.contains("toolbar-visible"), true);
-  });
   remote.addEventListener("pointermove", (event) => {
-    if (!toolbarPinned && event.clientY <= 84) setToolbarVisible(true, true);
+    if (!toolbarPinned && event.clientX <= 64 && event.clientY <= 64) {
+      setToolbarVisible(true, true);
+    }
   });
   toolbar.addEventListener("pointerenter", () => { window.clearTimeout(toolbarHideTimer); });
   toolbar.addEventListener("pointerleave", () => { setToolbarVisible(true, true); });
