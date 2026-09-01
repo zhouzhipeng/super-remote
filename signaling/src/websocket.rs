@@ -18,13 +18,6 @@ pub async fn serve(socket: WebSocket, state: Arc<AppState>, principal: Principal
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (tx, mut rx) = mpsc::channel::<ServerSignal>(64);
 
-    if principal.role == Role::User {
-        state
-            .browsers
-            .write()
-            .await
-            .insert(principal.subject.clone(), tx.clone());
-    }
     let writer = tokio::spawn(async move {
         while let Some(signal) = rx.recv().await {
             let Ok(json) = serde_json::to_string(&signal) else {
@@ -63,9 +56,7 @@ pub async fn serve(socket: WebSocket, state: Arc<AppState>, principal: Principal
         }
     }
 
-    if principal.role == Role::User {
-        state.browsers.write().await.remove(&principal.subject);
-    } else {
+    if principal.role == Role::Device {
         let mut devices = state.devices.write().await;
         if let Some(device) = devices.get_mut(&principal.subject) {
             device.summary.online = false;
@@ -110,7 +101,7 @@ async fn handle_signal(
             viewport_height,
         } if principal.role == Role::User => {
             if !state
-                .authorize_offer(session_id, &principal.subject, &session_token)
+                .authorize_offer(session_id, &principal.subject, &session_token, tx.clone())
                 .await
             {
                 return false;

@@ -24,12 +24,12 @@ pub struct SessionRecord {
     pub owner: String,
     pub device_id: String,
     pub session_token: Option<String>,
+    pub browser_sender: Option<SignalTx>,
 }
 
 pub struct AppState {
     pub auth: AuthConfig,
     pub devices: RwLock<HashMap<String, DeviceConnection>>,
-    pub browsers: RwLock<HashMap<String, SignalTx>>,
     pub sessions: RwLock<HashMap<Uuid, SessionRecord>>,
     tickets: RwLock<HashMap<String, (Principal, Instant)>>,
 }
@@ -45,7 +45,6 @@ impl AppState {
         Self {
             auth,
             devices: RwLock::new(HashMap::new()),
-            browsers: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             tickets: RwLock::new(HashMap::new()),
         }
@@ -85,6 +84,7 @@ impl AppState {
                 owner: owner.to_owned(),
                 device_id: device_id.to_owned(),
                 session_token: Some(session_token.clone()),
+                browser_sender: None,
             },
         );
         sender
@@ -133,6 +133,7 @@ impl AppState {
         session_id: Uuid,
         owner: &str,
         session_token: &str,
+        browser_sender: SignalTx,
     ) -> bool {
         let mut sessions = self.sessions.write().await;
         let Some(session) = sessions.get_mut(&session_id) else {
@@ -142,6 +143,10 @@ impl AppState {
             return false;
         }
         session.session_token = None;
+        // Bind Host replies to the exact WebSocket that submitted this offer.
+        // A user may have Safari and Chrome open simultaneously, and one
+        // browser may briefly own multiple sockets while reconnecting.
+        session.browser_sender = Some(browser_sender);
         true
     }
 
@@ -151,7 +156,7 @@ impl AppState {
         device_id: &str,
         message: ServerSignal,
     ) -> bool {
-        let owner = {
+        let tx = {
             let sessions = self.sessions.read().await;
             let Some(session) = sessions.get(&session_id) else {
                 return false;
@@ -159,9 +164,8 @@ impl AppState {
             if session.device_id != device_id {
                 return false;
             }
-            session.owner.clone()
+            session.browser_sender.clone()
         };
-        let tx = self.browsers.read().await.get(&owner).cloned();
         match tx {
             Some(tx) => tx.send(message).await.is_ok(),
             None => false,
