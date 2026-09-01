@@ -9,6 +9,8 @@ mod rtc;
 mod signaling;
 mod stats;
 mod video;
+#[cfg(windows)]
+mod window_layout;
 
 use std::{collections::HashMap, sync::Arc};
 

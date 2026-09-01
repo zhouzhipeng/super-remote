@@ -30,6 +30,8 @@ media_pipeline = { package = "win-native-media", version = "0.1.1" }
 wasapi = "0.24"
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
   "Win32_System_DataExchange",
   "Win32_System_Memory",
   "Win32_System_Power",

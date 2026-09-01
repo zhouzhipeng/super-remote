@@ -123,6 +123,11 @@ post-injection input RTT so input latency can be verified independently from vid
 The browser keyboard mapper automatically remaps the left and right Command keys on Mac and
 iPad clients to the matching remote Windows Control keys, so familiar Command shortcuts act
 as their Ctrl equivalents on the Host.
+When a WebRTC client connects on a multi-monitor Host, visible application windows whose
+current monitor is not the primary display are consolidated onto the primary work area.
+Normal windows keep their size unless they exceed the primary work area, relative placement
+is preserved, and minimized or maximized windows retain their state. Desktop, taskbar,
+transient shell and privacy-overlay windows are excluded.
 Software encoder fallback is intentionally disabled; the application will not claim or
 simulate hardware acceleration.
 System playback audio uses event-driven WASAPI loopback capture and 48 kHz stereo Opus

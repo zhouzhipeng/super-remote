@@ -112,6 +112,27 @@ impl PeerConnectionEventHandler for Handler {
                 self.media_active.store(true, Ordering::Release);
                 self.media_state.send_replace(MediaState::RUNNING);
                 self.control.connected(self.session_id);
+                #[cfg(windows)]
+                {
+                    let session_id = self.session_id;
+                    drop(tokio::task::spawn_blocking(move || {
+                        match crate::window_layout::move_secondary_windows_to_primary() {
+                            Ok(summary) => info!(
+                                %session_id,
+                                monitors = summary.monitor_count,
+                                candidates = summary.candidates,
+                                moved = summary.moved,
+                                failed = summary.failed,
+                                "moved secondary-monitor application windows to the primary monitor"
+                            ),
+                            Err(error) => warn!(
+                                %session_id,
+                                %error,
+                                "failed to consolidate application windows on the primary monitor"
+                            ),
+                        }
+                    }));
+                }
             }
             RTCPeerConnectionState::Disconnected => {
                 // Stop capture, encoding and loopback immediately while the peer is
