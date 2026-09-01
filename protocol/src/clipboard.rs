@@ -8,12 +8,13 @@ pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 12 * 1024;
 pub enum ClipboardRequest {
     Read { id: u32 },
     Write { id: u32, text: String, paste: bool },
+    Paste { id: u32 },
 }
 
 impl ClipboardRequest {
     pub fn id(&self) -> u32 {
         match self {
-            Self::Read { id } | Self::Write { id, .. } => *id,
+            Self::Read { id } | Self::Write { id, .. } | Self::Paste { id } => *id,
         }
     }
 }
@@ -42,5 +43,6 @@ mod tests {
             .id(),
             9
         );
+        assert_eq!(ClipboardRequest::Paste { id: 11 }.id(), 11);
     }
 }

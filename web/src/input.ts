@@ -49,7 +49,8 @@ export class InputController {
     reliable: RTCDataChannel,
     private readonly onLatency: (milliseconds: number) => void,
     private readonly onPasteText: (text: string) => void,
-    private readonly onCopyShortcut: () => void,
+    private readonly onPasteHostClipboard: () => void,
+    private readonly onCopyShortcut: () => string,
   ) {
     this.#video = video;
     this.#fast = fast;
@@ -184,9 +185,13 @@ export class InputController {
         if (event.type === "keydown" && !event.repeat) this.#captureBrowserPaste();
         return;
       }
-      // A copy/cut performed in this still-focused remote session already put
-      // the right text on the Host clipboard. Forward V normally instead of
-      // overwriting that text with a stale browser clipboard.
+      // A copy/cut performed in this remote session already put the right text
+      // on the Host. Ask it to inject that text directly; forwarding a
+      // synthetic Ctrl+V is unreliable in Chromium and elevated applications.
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.type === "keydown" && !event.repeat) this.onPasteHostClipboard();
+      return;
     }
     event.preventDefault();
     event.stopPropagation();
@@ -194,9 +199,14 @@ export class InputController {
     if (down && this.#pressed.has(event.code) && !event.repeat) return;
     if (down) this.#pressed.add(event.code); else this.#pressed.delete(event.code);
     this.#sendKey(mapping[0], down, mapping[1]);
-    if (!down && clipboardModifier && (event.code === "KeyC" || event.code === "KeyX")) {
+    if (down && !event.repeat && clipboardModifier && (event.code === "KeyC" || event.code === "KeyX")) {
       this.#clipboardShortcuts.markRemoteCopy();
-      this.onCopyShortcut();
+      try {
+        this.#copyHostTextToBrowser(this.onCopyShortcut());
+      } catch (error) {
+        this.#video.dataset.clipboardCopy = "failed";
+        this.#video.dataset.clipboardCopyError = error instanceof Error ? error.message : String(error);
+      }
     }
   };
 
@@ -246,6 +256,25 @@ export class InputController {
     this.#pasteSink.value = "";
     this.#video.dataset.clipboardPasteSource = source;
     this.onPasteText(text);
+    this.#video.focus({ preventScroll: true });
+  }
+
+  #copyHostTextToBrowser(text: string): void {
+    this.#pasteSink.value = text;
+    this.#pasteSink.focus({ preventScroll: true });
+    this.#pasteSink.select();
+    let copied = false;
+    try { copied = document.execCommand("copy"); } catch { /* try the modern API below */ }
+    if (!copied && navigator.clipboard?.writeText) {
+      void navigator.clipboard.writeText(text).then(() => {
+        this.#video.dataset.clipboardCopy = "api";
+      }).catch((error) => {
+        this.#video.dataset.clipboardCopy = "failed";
+        this.#video.dataset.clipboardCopyError = String(error);
+      });
+    }
+    this.#pasteSink.value = "";
+    this.#video.dataset.clipboardCopy = copied ? "event" : "api-pending";
     this.#video.focus({ preventScroll: true });
   }
 

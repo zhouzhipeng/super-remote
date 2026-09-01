@@ -2,10 +2,10 @@ use anyhow::{Context, bail};
 use remote_protocol::input::InputEvent;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
-    SendInput,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE,
+    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
 };
 
 pub fn inject(event: InputEvent) -> anyhow::Result<()> {
@@ -66,7 +66,7 @@ pub fn inject(event: InputEvent) -> anyhow::Result<()> {
     send(&[input])
 }
 
-pub fn paste_shortcut() -> anyhow::Result<()> {
+pub fn paste_text(text: &str) -> anyhow::Result<()> {
     // A browser shortcut can leave Cmd-as-Ctrl or another modifier logically
     // held until its later keyup arrives over the data channel. Clear every
     // modifier first so the target always receives exactly Ctrl+V.
@@ -79,11 +79,36 @@ pub fn paste_shortcut() -> anyhow::Result<()> {
         keyboard(0x38, false, true),  // right Alt
         keyboard(0x5b, false, true),  // left Windows
         keyboard(0x5c, false, true),  // right Windows
-        keyboard(0x1d, true, false),
-        keyboard(0x2f, true, false),
-        keyboard(0x2f, false, false),
-        keyboard(0x1d, false, false),
-    ])
+    ])?;
+    // Inject the captured browser text itself. This is keyboard-layout
+    // independent and does not depend on the foreground application accepting
+    // a synthetic Ctrl+V shortcut. UTF-16 code units preserve all Unicode,
+    // including surrogate pairs.
+    let inputs = text
+        .encode_utf16()
+        .flat_map(|unit| [unicode(unit, true), unicode(unit, false)])
+        .collect::<Vec<_>>();
+    for chunk in inputs.chunks(512) {
+        send(chunk)?;
+    }
+    Ok(())
+}
+
+fn unicode(unit: u16, down: bool) -> INPUT {
+    let mut flags = KEYEVENTF_UNICODE;
+    if !down {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wScan: unit,
+                dwFlags: flags,
+                ..Default::default()
+            },
+        },
+    }
 }
 
 fn keyboard(scan_code: u16, down: bool, extended: bool) -> INPUT {
@@ -135,5 +160,71 @@ fn send(inputs: &[INPUT]) -> anyhow::Result<()> {
         Err(std::io::Error::last_os_error()).context("SendInput rejected an input event")
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paste_text;
+    use windows::{
+        Win32::UI::{
+            Input::KeyboardAndMouse::SetFocus,
+            WindowsAndMessaging::{
+                CreateWindowExW, DestroyWindow, DispatchMessageW, GetWindowTextW, MSG, PM_REMOVE,
+                PeekMessageW, SW_SHOW, SetForegroundWindow, ShowWindow, TranslateMessage,
+                WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+            },
+        },
+        core::w,
+    };
+
+    #[test]
+    #[ignore = "opens a short-lived native edit window to verify real SendInput delivery"]
+    fn unicode_paste_reaches_the_focused_windows_control() {
+        let window = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("EDIT"),
+                w!(""),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                100,
+                100,
+                500,
+                180,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("create native edit control");
+        unsafe {
+            let _ = ShowWindow(window, SW_SHOW);
+            let _ = SetForegroundWindow(window);
+            let _ = SetFocus(Some(window));
+        }
+
+        let expected = "Super Remote 双向粘贴 ✅";
+        paste_text(expected).expect("inject Unicode text");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut actual = String::new();
+        while std::time::Instant::now() < deadline {
+            let mut message = MSG::default();
+            while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                unsafe {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+            let mut buffer = vec![0_u16; 256];
+            let copied = unsafe { GetWindowTextW(window, &mut buffer) };
+            actual = String::from_utf16_lossy(&buffer[..copied.max(0) as usize]);
+            if actual == expected {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        unsafe { DestroyWindow(window).expect("destroy native edit control") };
+        assert_eq!(actual, expected);
     }
 }

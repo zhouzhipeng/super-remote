@@ -39,5 +39,11 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .clipboard-panel textarea { width: 100%; min-height: 180px; max-height: 50vh; resize: vertical; border: 1px solid #3b455d; border-radius: 9px; padding: .8rem; color: #eef2ff; background: #080c14; line-height: 1.45; }
 .clipboard-actions { display: flex; flex-wrap: wrap; gap: .6rem; }
 .clipboard-panel output { min-height: 1.2rem; color: #aeb8cf; font-size: .85rem; }
+.disconnect-dialog { width: min(400px, calc(100% - 2rem)); margin: auto; padding: 1.6rem; border: 1px solid #374158; color: #eef2ff; background: #131824; text-align: center; }
+.disconnect-dialog::backdrop { background: #02040bc7; backdrop-filter: blur(4px); }
+.disconnect-dialog h2 { margin: .8rem 0 .45rem; font-size: 1.35rem; }
+.disconnect-dialog p { margin: 0 0 1.4rem; color: #aeb8cf; line-height: 1.55; }
+.disconnect-dialog button { width: 100%; }
+.disconnect-icon { display: grid; place-items: center; width: 44px; height: 44px; margin: 0 auto; border-radius: 50%; color: #ffd3d3; background: #a9364652; border: 1px solid #ff718466; font-size: 1.35rem; font-weight: 800; }
 .remote-clipboard-sink { position: fixed; left: -10000px; top: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; font-size: 16px; }
 @media (max-width: 700px) { .devices header, .devices section { padding-left: 1rem; padding-right: 1rem; } #stats { display: none; } }

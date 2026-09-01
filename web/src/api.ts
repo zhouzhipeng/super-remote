@@ -61,3 +61,23 @@ export async function iceServers(): Promise<RTCIceServer[]> {
 export async function reportClient(report: Record<string, unknown>): Promise<void> {
   await request<never>("/client-report", { method: "POST", body: JSON.stringify(report) });
 }
+
+/**
+ * Read while the Cmd+C/Control+C key event is still on the JavaScript stack.
+ * Async clipboard writes lose their trusted user gesture on plain HTTP LAN
+ * origins, so this intentionally uses the browser's synchronous XHR primitive.
+ */
+export function localClipboardTextDuringGesture(): string {
+  const token = accessToken();
+  if (!token) throw new Error("登录已失效");
+  const request = new XMLHttpRequest();
+  request.open("GET", "/api/local-clipboard", false);
+  request.setRequestHeader("authorization", `Bearer ${token}`);
+  request.send();
+  if (request.status < 200 || request.status >= 300) {
+    throw new Error(`读取主机剪贴板失败（HTTP ${request.status}）`);
+  }
+  const response = JSON.parse(request.responseText) as { text?: unknown };
+  if (typeof response.text !== "string") throw new Error("主机剪贴板响应无效");
+  return response.text;
+}

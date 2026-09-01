@@ -1,4 +1,5 @@
 mod auth;
+mod local_clipboard;
 mod state;
 mod websocket;
 
@@ -14,7 +15,7 @@ use axum::{
     routing::{any, get, post},
 };
 use remote_protocol::{device::DeviceSummary, signaling::CreateSessionRequest};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use state::AppState;
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -25,6 +26,11 @@ use tracing::info;
 #[derive(Debug, Deserialize)]
 struct WsQuery {
     ticket: String,
+}
+
+#[derive(Serialize)]
+struct LocalClipboardResponse {
+    text: String,
 }
 
 #[tokio::main]
@@ -53,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/sessions", post(create_session))
         .route("/turn-credentials", get(turn_credentials))
         .route("/client-report", post(client_report))
+        .route("/local-clipboard", get(local_clipboard_text))
         .route("/ws", any(ws_upgrade));
 
     let app = Router::new()
@@ -102,6 +109,44 @@ async fn client_report(
     };
     info!(subject = %principal.subject, report = %report, "browser client report");
     StatusCode::NO_CONTENT.into_response()
+}
+
+async fn local_clipboard_text(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let principal = match state.auth.authenticate_user(&headers) {
+        Ok(principal) => principal,
+        Err(_) => {
+            return api_error(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "valid user authentication is required",
+            );
+        }
+    };
+    // This endpoint is deliberately synchronous from the browser's point of
+    // view. Cmd+C must finish while the browser still considers the keyboard
+    // event a trusted user gesture, otherwise an HTTP LAN page cannot update
+    // the client clipboard. Wait briefly for the Host's Ctrl+C to advance the
+    // shared Windows clipboard sequence before returning its text.
+    match tokio::task::spawn_blocking(|| {
+        local_clipboard::read_text_after_copy(std::time::Duration::from_millis(140))
+    })
+    .await
+    {
+        Ok(Ok(text)) => {
+            info!(subject = %principal.subject, bytes = text.len(), "served Host clipboard to browser copy gesture");
+            Json(LocalClipboardResponse { text }).into_response()
+        }
+        Ok(Err(error)) => api_error(
+            StatusCode::CONFLICT,
+            "clipboard_unavailable",
+            &error.to_string(),
+        ),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "clipboard_worker_failed",
+            &error.to_string(),
+        ),
+    }
 }
 
 async fn browser_ticket(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {

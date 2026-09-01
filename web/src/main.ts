@@ -1,6 +1,6 @@
 import "./style.css";
 import { accessToken, listDevices, login, logout, setAccessToken } from "./api.ts";
-import { RemoteSession } from "./rtc.ts";
+import { RemoteSession, type SessionDisconnectDetail } from "./rtc.ts";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
@@ -26,7 +26,7 @@ async function devicesView(): Promise<void> {
 }
 
 async function sessionView(deviceId: string): Promise<void> {
-  app.innerHTML = `<main class="remote"><video id="remote" autoplay muted playsinline tabindex="0"></video><div class="toolbar-corner-hint" aria-hidden="true"><span>⌄</span><span>控制条</span></div><div class="toolbar"><button id="back" class="secondary">断开</button><button id="sound">开启声音</button><button id="clipboard" class="secondary">剪贴板</button><button id="fullscreen" class="secondary" aria-pressed="false">全屏</button><button id="toolbar-pin" class="secondary" aria-pressed="true">取消固定</button><span id="state">正在连接</span><span id="stats"></span></div><section class="clipboard-panel card" hidden aria-label="双向剪贴板"><header><strong>双向文本剪贴板</strong><button id="clipboard-close" class="secondary" aria-label="关闭剪贴板">关闭</button></header><textarea id="clipboard-text" placeholder="在这里粘贴手机/浏览器中的文本，或从主机读取文本" spellcheck="false"></textarea><div class="clipboard-actions"><button id="clipboard-read">从主机读取</button><button id="clipboard-send" class="secondary">发送到主机</button><button id="clipboard-paste">发送并粘贴</button><button id="clipboard-copy" class="secondary">复制到本机</button></div><output id="clipboard-status">Ctrl+C / Ctrl+V 也会自动同步文本</output></section></main>`;
+  app.innerHTML = `<main class="remote"><video id="remote" autoplay muted playsinline tabindex="0"></video><div class="toolbar-corner-hint" aria-hidden="true"><span>⌄</span><span>控制条</span></div><div class="toolbar"><button id="back" class="secondary">断开</button><button id="sound">开启声音</button><button id="clipboard" class="secondary">剪贴板</button><button id="fullscreen" class="secondary" aria-pressed="false">全屏</button><button id="toolbar-pin" class="secondary" aria-pressed="true">取消固定</button><span id="state">正在连接</span><span id="stats"></span></div><section class="clipboard-panel card" hidden aria-label="双向剪贴板"><header><strong>双向文本剪贴板</strong><button id="clipboard-close" class="secondary" aria-label="关闭剪贴板">关闭</button></header><textarea id="clipboard-text" placeholder="在这里粘贴手机/浏览器中的文本，或从主机读取文本" spellcheck="false"></textarea><div class="clipboard-actions"><button id="clipboard-read">从主机读取</button><button id="clipboard-send" class="secondary">发送到主机</button><button id="clipboard-paste">发送并粘贴</button><button id="clipboard-copy" class="secondary">复制到本机</button></div><output id="clipboard-status">Ctrl+C / Ctrl+V 也会自动同步文本</output></section><dialog class="disconnect-dialog card" aria-labelledby="disconnect-title" aria-describedby="disconnect-message"><div class="disconnect-icon" aria-hidden="true">!</div><h2 id="disconnect-title">连接已断开</h2><p id="disconnect-message">Web 连接已断开，请检查网络后重新连接。</p><button id="disconnect-confirm">返回设备列表</button></dialog></main>`;
   const remote = app.querySelector<HTMLElement>(".remote")!;
   const video = app.querySelector<HTMLVideoElement>("#remote")!;
   const toolbar = app.querySelector<HTMLElement>(".toolbar")!;
@@ -38,11 +38,19 @@ async function sessionView(deviceId: string): Promise<void> {
   const clipboardPanel = app.querySelector<HTMLElement>(".clipboard-panel")!;
   const clipboardText = app.querySelector<HTMLTextAreaElement>("#clipboard-text")!;
   const clipboardStatus = app.querySelector<HTMLOutputElement>("#clipboard-status")!;
+  const disconnectDialog = app.querySelector<HTMLDialogElement>(".disconnect-dialog")!;
+  const disconnectMessage = app.querySelector<HTMLParagraphElement>("#disconnect-message")!;
   let disposed = false;
   const createRemoteSession = (): RemoteSession => {
     const next = new RemoteSession(video, stats);
     next.addEventListener("state", (event) => { state.textContent = stateLabel((event as CustomEvent<string>).detail); });
     next.addEventListener("error", (event) => { state.textContent = String((event as CustomEvent).detail); });
+    next.addEventListener("disconnect", (event) => {
+      if (disposed || next !== session) return;
+      const { message } = (event as CustomEvent<SessionDisconnectDetail>).detail;
+      disconnectMessage.textContent = message;
+      if (!disconnectDialog.open) disconnectDialog.showModal();
+    });
     next.addEventListener("clipboardready", () => { clipboardButton.disabled = false; });
     next.addEventListener("clipboard", (event) => {
       const detail = (event as CustomEvent<{ text: string; copied: boolean; automatic: boolean }>).detail;
@@ -210,8 +218,10 @@ async function sessionView(deviceId: string): Promise<void> {
   });
   updateFullscreenButton();
 
-  app.querySelector("#back")!.addEventListener("click", () => {
+  const leaveSession = (): void => {
+    if (disposed) return;
     disposed = true;
+    if (disconnectDialog.open) disconnectDialog.close();
     resizeObserver.disconnect();
     window.clearTimeout(resizeTimer);
     window.clearTimeout(toolbarHideTimer);
@@ -219,7 +229,10 @@ async function sessionView(deviceId: string): Promise<void> {
     if (document.fullscreenElement === remote) void document.exitFullscreen();
     session.close();
     void devicesView();
-  });
+  };
+  disconnectDialog.addEventListener("cancel", (event) => { event.preventDefault(); });
+  app.querySelector("#disconnect-confirm")!.addEventListener("click", leaveSession);
+  app.querySelector("#back")!.addEventListener("click", leaveSession);
   const soundButton = app.querySelector<HTMLButtonElement>("#sound")!;
   soundButton.addEventListener("click", () => {
     const muted = !video.muted;

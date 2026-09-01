@@ -1,4 +1,4 @@
-import { createSession, iceServers, reportClient } from "./api.ts";
+import { createSession, iceServers, localClipboardTextDuringGesture, reportClient } from "./api.ts";
 import { InputController } from "./input.ts";
 import { SignalingSocket } from "./signaling.ts";
 import { StatsMonitor } from "./stats.ts";
@@ -6,6 +6,7 @@ import type { ServerSignal } from "./types.ts";
 
 export type SessionState = "idle" | "creating_session" | "negotiating" | "connected" | "reconnecting" | "closed";
 export type ClipboardSyncDetail = { text: string; copied: boolean; automatic: boolean };
+export type SessionDisconnectDetail = { message: string };
 
 type ClipboardResponse =
   | { type: "content"; id: number; text: string }
@@ -40,11 +41,14 @@ export class RemoteSession extends EventTarget {
   #clipboardRequestId = 0;
   #clipboardRequests = new Map<number, { resolve: (text: string) => void; reject: (error: Error) => void; timer: number }>();
   #clipboardPullTimer = 0;
+  #closing = false;
+  #disconnectReported = false;
 
   constructor(private readonly video: HTMLVideoElement, private readonly statsOutput: HTMLElement) { super(); }
 
   async connect(deviceId: string): Promise<void> {
     this.#setState("creating_session");
+    this.#signaling.addEventListener("close", this.#onSignalingClose);
     await this.#signaling.connect();
     this.#signaling.addEventListener("signal", this.#onSignal);
     const { session_id, session_token } = await createSession(deviceId);
@@ -73,11 +77,9 @@ export class RemoteSession extends EventTarget {
           void this.writeClipboard(text, true).catch((error) => this.#clipboardError(error));
         },
         () => {
-          window.clearTimeout(this.#clipboardPullTimer);
-          this.#clipboardPullTimer = window.setTimeout(() => {
-            void this.syncHostClipboardToBrowser(true).catch((error) => this.#clipboardError(error));
-          }, 120);
+          void this.pasteHostClipboard().catch((error) => this.#clipboardError(error));
         },
+        () => localClipboardTextDuringGesture(),
       );
     });
     this.video.muted = true;
@@ -119,7 +121,9 @@ export class RemoteSession extends EventTarget {
           this.#reportTimers.push(window.setTimeout(() => { void this.#report(`connected:${delay}`); }, delay));
         }
       } else if (peer.connectionState === "disconnected") this.#setState("reconnecting");
-      else if (peer.connectionState === "failed" || peer.connectionState === "closed") this.close();
+      else if (!this.#closing && (peer.connectionState === "failed" || peer.connectionState === "closed")) {
+        this.#disconnect("远程桌面连接已中断，请检查网络或主机状态。");
+      }
     };
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
@@ -148,6 +152,10 @@ export class RemoteSession extends EventTarget {
     return this.#clipboardRequest({ type: "write", text, paste });
   }
 
+  pasteHostClipboard(): Promise<string> {
+    return this.#clipboardRequest({ type: "paste" });
+  }
+
   async syncHostClipboardToBrowser(automatic = false): Promise<ClipboardSyncDetail> {
     const text = await this.readClipboard();
     let copied = false;
@@ -162,7 +170,8 @@ export class RemoteSession extends EventTarget {
   }
 
   close(): void {
-    if (this.state === "closed") return;
+    if (this.state === "closed" || this.#closing) return;
+    this.#closing = true;
     if (this.#sessionId) {
       try { this.#signaling.send({ type: "session_close", session_id: this.#sessionId }); } catch { /* already disconnected */ }
     }
@@ -179,6 +188,7 @@ export class RemoteSession extends EventTarget {
     this.#stats?.stop();
     for (const timer of this.#reportTimers.splice(0)) window.clearTimeout(timer);
     this.#peer?.close();
+    this.#signaling.removeEventListener("close", this.#onSignalingClose);
     this.#signaling.close();
     this.video.srcObject = null;
     this.#setState("closed");
@@ -188,7 +198,18 @@ export class RemoteSession extends EventTarget {
     void this.#handleSignal((event as CustomEvent<ServerSignal>).detail);
   };
 
-  #clipboardRequest(message: { type: "read" } | { type: "write"; text: string; paste: boolean }): Promise<string> {
+  #onSignalingClose = (): void => {
+    this.#disconnect("Web 连接已断开，请检查网络后重新连接。");
+  };
+
+  #disconnect(message: string): void {
+    if (this.#closing || this.state === "closed" || this.#disconnectReported) return;
+    this.#disconnectReported = true;
+    this.dispatchEvent(new CustomEvent<SessionDisconnectDetail>("disconnect", { detail: { message } }));
+    this.close();
+  }
+
+  #clipboardRequest(message: { type: "read" } | { type: "write"; text: string; paste: boolean } | { type: "paste" }): Promise<string> {
     const channel = this.#clipboard;
     if (!channel || channel.readyState !== "open") return Promise.reject(new Error("剪贴板通道尚未连接"));
     const id = ++this.#clipboardRequestId;
@@ -239,7 +260,9 @@ export class RemoteSession extends EventTarget {
       if (this.#peer?.remoteDescription) await this.#peer.addIceCandidate(candidate);
       else this.#pendingIce.push(candidate);
     }
-    if (signal.type === "session_closed") this.close();
+    if (signal.type === "session_closed") {
+      this.#disconnect(signal.reason || "主机已结束远程桌面连接。");
+    }
     if (signal.type === "error") this.dispatchEvent(new CustomEvent("error", { detail: signal.message }));
   }
 

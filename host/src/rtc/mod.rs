@@ -288,12 +288,23 @@ fn process_clipboard_request(request: ClipboardRequest) -> anyhow::Result<Clipbo
             );
             clipboard::write_text(&text)?;
             if paste {
-                // Let Windows publish the new clipboard sequence before the
-                // foreground application handles the synthetic Ctrl+V.
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                input::paste_shortcut()?;
+                input::paste_text(&text)?;
             }
             info!(bytes = text.len(), paste, "wrote Web clipboard to Host");
+            Ok(ClipboardResponse::Ack { id })
+        }
+        ClipboardRequest::Paste { id } => {
+            let text = clipboard::read_text()?;
+            anyhow::ensure!(
+                text.len() <= MAX_CLIPBOARD_TEXT_BYTES,
+                "主机剪贴板文本超过 {} KiB 限制",
+                MAX_CLIPBOARD_TEXT_BYTES / 1024
+            );
+            input::paste_text(&text)?;
+            info!(
+                bytes = text.len(),
+                "pasted existing Host clipboard as Unicode text"
+            );
             Ok(ClipboardResponse::Ack { id })
         }
     }

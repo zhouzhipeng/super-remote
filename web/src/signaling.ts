@@ -9,10 +9,6 @@ export class SignalingSocket extends EventTarget {
     const scheme = location.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(`${scheme}//${location.host}/api/ws?ticket=${encodeURIComponent(ticket)}`);
     this.#socket = socket;
-    await new Promise<void>((resolve, reject) => {
-      socket.onopen = () => resolve();
-      socket.onerror = () => reject(new Error("signaling websocket failed"));
-    });
     socket.onmessage = (event) => {
       try {
         const signal = JSON.parse(String(event.data)) as ServerSignal;
@@ -21,7 +17,15 @@ export class SignalingSocket extends EventTarget {
         console.error("invalid signaling message", error);
       }
     };
-    socket.onclose = () => this.dispatchEvent(new Event("close"));
+    await new Promise<void>((resolve, reject) => {
+      let opened = false;
+      socket.onopen = () => { opened = true; resolve(); };
+      socket.onerror = () => reject(new Error("signaling websocket failed"));
+      socket.onclose = () => {
+        this.dispatchEvent(new Event("close"));
+        if (!opened) reject(new Error("signaling websocket closed before connecting"));
+      };
+    });
   }
 
   send(signal: ClientSignal): void {
