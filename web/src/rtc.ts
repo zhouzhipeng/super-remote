@@ -12,6 +12,15 @@ type ClipboardResponse =
   | { type: "ack"; id: number }
   | { type: "error"; id: number; message: string };
 
+type LocalIceSignal = {
+  type: "webrtc_ice";
+  session_id: string;
+  candidate: string;
+  sdp_mid: string | null;
+  sdp_mline_index: number | null;
+  username_fragment: string | null;
+};
+
 const MAX_CLIPBOARD_TEXT_BYTES = 12 * 1024;
 
 export class RemoteSession extends EventTarget {
@@ -21,6 +30,8 @@ export class RemoteSession extends EventTarget {
   #sessionId = "";
   #sessionToken = "";
   #pendingIce: RTCIceCandidateInit[] = [];
+  #pendingLocalIce: LocalIceSignal[] = [];
+  #offerSent = false;
   #input: InputController | null = null;
   #stats: StatsMonitor | null = null;
   #reportTimers: number[] = [];
@@ -87,10 +98,17 @@ export class RemoteSession extends EventTarget {
     };
     peer.onicecandidate = ({ candidate }) => {
       if (!candidate) return;
-      this.#signaling.send({
+      const signal: LocalIceSignal = {
         type: "webrtc_ice", session_id: this.#sessionId, candidate: candidate.candidate,
         sdp_mid: candidate.sdpMid, sdp_mline_index: candidate.sdpMLineIndex, username_fragment: candidate.usernameFragment,
-      });
+      };
+      // Chromium can emit host candidates synchronously while
+      // setLocalDescription() is resolving. Sending one before the offer makes
+      // the Host discard it because that session does not exist yet. Preserve
+      // WebSocket ordering explicitly; Safari generally gathers slowly enough
+      // that it did not expose this race.
+      if (this.#offerSent) this.#signaling.send(signal);
+      else this.#pendingLocalIce.push(signal);
     };
     peer.onconnectionstatechange = () => {
       if (peer.connectionState === "connected") {
@@ -108,8 +126,10 @@ export class RemoteSession extends EventTarget {
     const viewport = this.#physicalVideoArea();
     this.#signaling.send({
       type: "webrtc_offer", session_id: this.#sessionId, session_token: this.#sessionToken,
-      sdp: offer.sdp ?? "", viewport_width: viewport.width, viewport_height: viewport.height,
+      sdp: peer.localDescription?.sdp ?? offer.sdp ?? "", viewport_width: viewport.width, viewport_height: viewport.height,
     });
+    this.#offerSent = true;
+    for (const candidate of this.#pendingLocalIce.splice(0)) this.#signaling.send(candidate);
   }
 
   setMuted(muted: boolean): Promise<void> {
@@ -150,6 +170,7 @@ export class RemoteSession extends EventTarget {
     window.clearTimeout(this.#clipboardPullTimer);
     this.#clipboard?.removeEventListener("message", this.#onClipboardMessage);
     this.#clipboard = null;
+    this.#pendingLocalIce.length = 0;
     for (const request of this.#clipboardRequests.values()) {
       window.clearTimeout(request.timer);
       request.reject(new Error("远程会话已关闭"));

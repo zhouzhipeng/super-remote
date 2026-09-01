@@ -93,6 +93,20 @@ impl PeerConnectionEventHandler for Handler {
         let Ok(candidate) = event.candidate.to_json() else {
             return;
         };
+        let kind = candidate
+            .candidate
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find(|pair| pair[0].eq_ignore_ascii_case("typ"))
+            .map(|pair| pair[1].to_owned())
+            .unwrap_or_else(|| "unknown".to_owned());
+        info!(
+            session_id = %self.session_id,
+            direction = "host_to_browser",
+            %kind,
+            "sending ICE candidate"
+        );
         let _ = self
             .outbound
             .send(ClientSignal::WebrtcIce {
@@ -274,6 +288,9 @@ fn process_clipboard_request(request: ClipboardRequest) -> anyhow::Result<Clipbo
             );
             clipboard::write_text(&text)?;
             if paste {
+                // Let Windows publish the new clipboard sequence before the
+                // foreground application handles the synthetic Ctrl+V.
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 input::paste_shortcut()?;
             }
             info!(bytes = text.len(), paste, "wrote Web clipboard to Host");

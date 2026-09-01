@@ -516,6 +516,8 @@ def main() -> int:
         f'ffmpeg_capture_width = {primary_width}\n'
         f'ffmpeg_capture_height = {primary_height}\n'
         f'control_status_path = "{str(RUN_DIR / "host-state.json").replace("\\", "\\\\")}"\n'
+        '\n[[ice_servers]]\n'
+        'urls = ["stun:stun.l.google.com:19302"]\n'
     )
     # Parse before replacing the live configuration so launcher changes cannot
     # silently strand an already stopped stack with an invalid TOML file.

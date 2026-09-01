@@ -67,9 +67,18 @@ pub fn inject(event: InputEvent) -> anyhow::Result<()> {
 }
 
 pub fn paste_shortcut() -> anyhow::Result<()> {
-    // One native batch makes clipboard replacement + paste deterministic from
-    // the caller's perspective and avoids a stale Ctrl+V racing the data channel.
+    // A browser shortcut can leave Cmd-as-Ctrl or another modifier logically
+    // held until its later keyup arrives over the data channel. Clear every
+    // modifier first so the target always receives exactly Ctrl+V.
     send(&[
+        keyboard(0x1d, false, false), // left Ctrl
+        keyboard(0x1d, false, true),  // right Ctrl
+        keyboard(0x2a, false, false), // left Shift
+        keyboard(0x36, false, false), // right Shift
+        keyboard(0x38, false, false), // left Alt
+        keyboard(0x38, false, true),  // right Alt
+        keyboard(0x5b, false, true),  // left Windows
+        keyboard(0x5c, false, true),  // right Windows
         keyboard(0x1d, true, false),
         keyboard(0x2f, true, false),
         keyboard(0x2f, false, false),

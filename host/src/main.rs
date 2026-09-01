@@ -105,6 +105,14 @@ async fn main() -> anyhow::Result<()> {
                 sdp_mline_index,
                 username_fragment,
             } => {
+                let (candidate_kind, uses_mdns) = ice_candidate_diagnostics(&candidate);
+                info!(
+                    %session_id,
+                    direction = "browser_to_host",
+                    kind = candidate_kind,
+                    mdns = uses_mdns,
+                    "received ICE candidate"
+                );
                 if let Some(peer) = sessions
                     .lock()
                     .await
@@ -137,4 +145,36 @@ async fn main() -> anyhow::Result<()> {
     }
     control.offline();
     anyhow::bail!("signaling connection closed")
+}
+
+fn ice_candidate_diagnostics(candidate: &str) -> (&str, bool) {
+    let fields = candidate.split_ascii_whitespace().collect::<Vec<_>>();
+    let kind = fields
+        .windows(2)
+        .find(|pair| pair[0].eq_ignore_ascii_case("typ"))
+        .map(|pair| pair[1])
+        .unwrap_or("unknown");
+    let uses_mdns = fields
+        .iter()
+        .any(|field| field.to_ascii_lowercase().ends_with(".local"));
+    (kind, uses_mdns)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ice_candidate_diagnostics;
+
+    #[test]
+    fn describes_candidate_without_exposing_address() {
+        assert_eq!(
+            ice_candidate_diagnostics(
+                "candidate:1 1 UDP 2122260223 computer-name.local 55000 typ host"
+            ),
+            ("host", true)
+        );
+        assert_eq!(
+            ice_candidate_diagnostics("candidate:2 1 udp 1686052607 203.0.113.2 60000 typ srflx"),
+            ("srflx", false)
+        );
+    }
 }
