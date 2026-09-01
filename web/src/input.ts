@@ -1,4 +1,5 @@
 import { browserKeyboardProfile, remoteScanCode, type KeyboardProfile } from "./keymap.ts";
+import { ClipboardShortcutRouter } from "./clipboard-shortcuts.ts";
 
 const HEADER_LENGTH = 12;
 const ACK_REQUESTED = 0x01;
@@ -35,7 +36,7 @@ export class InputController {
   #lastRawUpdate = -Infinity;
   #moveSequence = 0;
   #pressed = new Set<string>();
-  #clipboardPasteKeys = new Set<string>();
+  #clipboardShortcuts = new ClipboardShortcutRouter();
   #keyboardProfile: KeyboardProfile;
 
   constructor(
@@ -155,14 +156,20 @@ export class InputController {
     const mapping = remoteScanCode(event.code, this.#keyboardProfile);
     if (!mapping) return;
     const clipboardModifier = event.ctrlKey || event.metaKey;
-    if (event.code === "KeyV" && (clipboardModifier || this.#clipboardPasteKeys.has(event.code))) {
-      // Let the browser emit its trusted paste event so clipboardData remains
-      // available even on a plain-HTTP LAN address, but never forward the V key.
-      // The Host performs clipboard replacement and Ctrl+V as one operation.
-      if (event.type === "keydown") this.#clipboardPasteKeys.add(event.code);
-      else this.#clipboardPasteKeys.delete(event.code);
-      event.stopPropagation();
-      return;
+    if (event.code === "KeyV" && (clipboardModifier || this.#clipboardShortcuts.pasteActive)) {
+      const pasteRoute = event.type === "keydown"
+        ? this.#clipboardShortcuts.beginPaste()
+        : this.#clipboardShortcuts.endPaste();
+      if (pasteRoute === "browser") {
+        // Let the browser emit its trusted paste event so clipboardData remains
+        // available even on a plain-HTTP LAN address, but never forward the V key.
+        // The Host performs clipboard replacement and Ctrl+V as one operation.
+        event.stopPropagation();
+        return;
+      }
+      // A copy/cut performed in this still-focused remote session already put
+      // the right text on the Host clipboard. Forward V normally instead of
+      // overwriting that text with a stale browser clipboard.
     }
     event.preventDefault();
     event.stopPropagation();
@@ -171,6 +178,7 @@ export class InputController {
     if (down) this.#pressed.add(event.code); else this.#pressed.delete(event.code);
     this.#sendKey(mapping[0], down, mapping[1]);
     if (!down && clipboardModifier && (event.code === "KeyC" || event.code === "KeyX")) {
+      this.#clipboardShortcuts.markRemoteCopy();
       this.onCopyShortcut();
     }
   };
@@ -198,7 +206,7 @@ export class InputController {
       if (mapping) this.#sendKey(mapping[0], false, mapping[1]);
     }
     this.#pressed.clear();
-    this.#clipboardPasteKeys.clear();
+    this.#clipboardShortcuts.reset();
   };
 
   #sendReliable(data: ArrayBufferView<ArrayBuffer>): void {

@@ -138,7 +138,9 @@ Bidirectional text clipboard uses its own reliable WebRTC data channel. `Ctrl+V`
 Host clipboard and injects the paste shortcut as one Host-side operation, while `Ctrl+C` reads
 the result back to the browser. The toolbar clipboard panel provides explicit read, send,
 send-and-paste and local-copy actions for mobile browsers and plain-HTTP LAN origins that deny
-background clipboard writes. Multi-monitor, secure desktop and ICE restart remain the V2 items
+background clipboard writes. Copy followed by paste while the remote page keeps focus stays on
+the Host clipboard, while leaving the page to copy locally resets the next paste to browser-to-Host
+synchronization. Multi-monitor, secure desktop and ICE restart remain the V2 items
 identified by the design.
 
 Run `cargo run -p remote-host --example hardware_probe` on the Host before deployment. It
