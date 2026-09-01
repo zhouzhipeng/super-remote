@@ -204,6 +204,13 @@ export class InputController {
     if (isLocalUiTarget(event.target)) return;
     if (!event.clipboardData) return;
     const text = event.clipboardData.getData("text/plain");
+    if (!text && document.activeElement === this.#pasteSink) {
+      // Safari can expose an empty ClipboardEvent while still inserting the
+      // real text into the focused textarea as the event's default action.
+      // Do not clear the Host clipboard or prevent the follow-up input event.
+      this.#video.dataset.clipboardPasteSource = "waiting-editable";
+      return;
+    }
     event.preventDefault();
     event.stopPropagation();
     const attempt = this.#clipboardShortcuts.pasteActive ? this.#pasteAttempt : ++this.#pasteAttempt;
