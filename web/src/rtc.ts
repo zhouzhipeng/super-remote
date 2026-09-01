@@ -134,7 +134,8 @@ export class RemoteSession extends EventTarget {
     try {
       await navigator.clipboard.writeText(text);
       copied = true;
-    } catch { /* HTTP and mobile permission fallback is exposed by the clipboard panel. */ }
+    } catch { /* Plain HTTP falls through to the hidden native-copy bridge below. */ }
+    if (!copied) copied = legacyCopyText(text);
     const detail = { text, copied, automatic };
     this.dispatchEvent(new CustomEvent<ClipboardSyncDetail>("clipboard", { detail }));
     return detail;
@@ -278,4 +279,21 @@ export class RemoteSession extends EventTarget {
       mediaError: this.video.error?.message ?? null,
     }).catch(() => undefined);
   }
+}
+
+function legacyCopyText(text: string): boolean {
+  const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const sink = document.createElement("textarea");
+  sink.className = "remote-clipboard-sink";
+  sink.tabIndex = -1;
+  sink.setAttribute("aria-hidden", "true");
+  sink.value = text;
+  document.body.append(sink);
+  sink.focus({ preventScroll: true });
+  sink.select();
+  let copied = false;
+  try { copied = document.execCommand("copy"); } catch { /* browser denied the legacy fallback */ }
+  sink.remove();
+  previousFocus?.focus({ preventScroll: true });
+  return copied;
 }

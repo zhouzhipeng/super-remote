@@ -263,6 +263,7 @@ fn process_clipboard_request(request: ClipboardRequest) -> anyhow::Result<Clipbo
                 "主机剪贴板文本超过 {} KiB 限制",
                 MAX_CLIPBOARD_TEXT_BYTES / 1024
             );
+            info!(bytes = text.len(), "read Host clipboard for Web client");
             Ok(ClipboardResponse::Content { id, text })
         }
         ClipboardRequest::Write { id, text, paste } => {
@@ -275,6 +276,7 @@ fn process_clipboard_request(request: ClipboardRequest) -> anyhow::Result<Clipbo
             if paste {
                 input::paste_shortcut()?;
             }
+            info!(bytes = text.len(), paste, "wrote Web clipboard to Host");
             Ok(ClipboardResponse::Ack { id })
         }
     }

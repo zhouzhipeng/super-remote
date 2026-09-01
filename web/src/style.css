@@ -39,4 +39,5 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .clipboard-panel textarea { width: 100%; min-height: 180px; max-height: 50vh; resize: vertical; border: 1px solid #3b455d; border-radius: 9px; padding: .8rem; color: #eef2ff; background: #080c14; line-height: 1.45; }
 .clipboard-actions { display: flex; flex-wrap: wrap; gap: .6rem; }
 .clipboard-panel output { min-height: 1.2rem; color: #aeb8cf; font-size: .85rem; }
+.remote-clipboard-sink { position: fixed; left: -10000px; top: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; font-size: 16px; }
 @media (max-width: 700px) { .devices header, .devices section { padding-left: 1rem; padding-right: 1rem; } #stats { display: none; } }

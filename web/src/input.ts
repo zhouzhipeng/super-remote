@@ -37,6 +37,10 @@ export class InputController {
   #moveSequence = 0;
   #pressed = new Set<string>();
   #clipboardShortcuts = new ClipboardShortcutRouter();
+  #pasteSink: HTMLTextAreaElement;
+  #pasteAttempt = 0;
+  #pasteHandled = 0;
+  #pasteFocusTimer = 0;
   #keyboardProfile: KeyboardProfile;
 
   constructor(
@@ -51,6 +55,14 @@ export class InputController {
     this.#fast = fast;
     this.#reliable = reliable;
     this.#keyboardProfile = browserKeyboardProfile();
+    this.#pasteSink = document.createElement("textarea");
+    this.#pasteSink.className = "remote-clipboard-sink";
+    this.#pasteSink.tabIndex = -1;
+    this.#pasteSink.setAttribute("aria-hidden", "true");
+    this.#pasteSink.setAttribute("autocomplete", "off");
+    this.#pasteSink.setAttribute("autocapitalize", "off");
+    this.#pasteSink.spellcheck = false;
+    (video.parentElement ?? document.body).append(this.#pasteSink);
     video.dataset.keyboardProfile = this.#keyboardProfile;
     video.dataset.inputMode = "pointermove";
     // Register the raw event unconditionally: browsers that do not implement it
@@ -64,6 +76,7 @@ export class InputController {
     window.addEventListener("keydown", this.#keyboard, true);
     window.addEventListener("keyup", this.#keyboard, true);
     window.addEventListener("paste", this.#paste, true);
+    this.#pasteSink.addEventListener("input", this.#pasteSinkInput);
     window.addEventListener("blur", this.#releaseAll);
     fast.bufferedAmountLowThreshold = 0;
     fast.addEventListener("bufferedamountlow", this.#flushPendingMove);
@@ -81,10 +94,13 @@ export class InputController {
     window.removeEventListener("keydown", this.#keyboard, true);
     window.removeEventListener("keyup", this.#keyboard, true);
     window.removeEventListener("paste", this.#paste, true);
+    this.#pasteSink.removeEventListener("input", this.#pasteSinkInput);
     window.removeEventListener("blur", this.#releaseAll);
     this.#fast.removeEventListener("bufferedamountlow", this.#flushPendingMove);
     this.#fast.removeEventListener("message", this.#inputAck);
     this.#reliable.removeEventListener("message", this.#inputAck);
+    window.clearTimeout(this.#pasteFocusTimer);
+    this.#pasteSink.remove();
     this.#releaseAll();
   }
 
@@ -161,10 +177,11 @@ export class InputController {
         ? this.#clipboardShortcuts.beginPaste()
         : this.#clipboardShortcuts.endPaste();
       if (pasteRoute === "browser") {
-        // Let the browser emit its trusted paste event so clipboardData remains
-        // available even on a plain-HTTP LAN address, but never forward the V key.
-        // The Host performs clipboard replacement and Ctrl+V as one operation.
-        event.stopPropagation();
+        // A video is not editable, so Safari and some Chromium configurations
+        // never dispatch paste to it. Move focus to an off-screen textarea before
+        // the browser runs the shortcut's default action. ClipboardEvent remains
+        // the HTTP-compatible path; the async API is an HTTPS fallback.
+        if (event.type === "keydown" && !event.repeat) this.#captureBrowserPaste();
         return;
       }
       // A copy/cut performed in this still-focused remote session already put
@@ -185,12 +202,45 @@ export class InputController {
 
   #paste = (event: ClipboardEvent): void => {
     if (isLocalUiTarget(event.target)) return;
-    const text = event.clipboardData?.getData("text/plain");
-    if (text === undefined) return;
+    if (!event.clipboardData) return;
+    const text = event.clipboardData.getData("text/plain");
     event.preventDefault();
     event.stopPropagation();
-    this.onPasteText(text);
+    const attempt = this.#clipboardShortcuts.pasteActive ? this.#pasteAttempt : ++this.#pasteAttempt;
+    this.#deliverBrowserPaste(text, "event", attempt);
   };
+
+  #pasteSinkInput = (): void => {
+    this.#deliverBrowserPaste(this.#pasteSink.value, "editable");
+  };
+
+  #captureBrowserPaste(): void {
+    this.#pasteAttempt += 1;
+    const attempt = this.#pasteAttempt;
+    this.#pasteSink.value = "";
+    this.#pasteSink.focus({ preventScroll: true });
+    this.#pasteSink.select();
+    this.#video.dataset.clipboardPasteSource = "waiting";
+    window.clearTimeout(this.#pasteFocusTimer);
+    this.#pasteFocusTimer = window.setTimeout(() => {
+      if (document.activeElement === this.#pasteSink) this.#video.focus({ preventScroll: true });
+    }, 300);
+    if (navigator.clipboard?.readText) {
+      void navigator.clipboard.readText().then((text) => {
+        if (this.#pasteHandled < attempt) this.#deliverBrowserPaste(text, "api", attempt);
+      }).catch(() => undefined);
+    }
+  }
+
+  #deliverBrowserPaste(text: string, source: "event" | "editable" | "api", attempt = this.#pasteAttempt): void {
+    if (attempt > 0 && this.#pasteHandled >= attempt) return;
+    this.#pasteHandled = Math.max(this.#pasteHandled, attempt);
+    window.clearTimeout(this.#pasteFocusTimer);
+    this.#pasteSink.value = "";
+    this.#video.dataset.clipboardPasteSource = source;
+    this.onPasteText(text);
+    this.#video.focus({ preventScroll: true });
+  }
 
   #sendKey(scanCode: number, down: boolean, extended: boolean): void {
     const view = packet(InputType.Keyboard, 4, ACK_REQUESTED);
@@ -207,6 +257,7 @@ export class InputController {
     }
     this.#pressed.clear();
     this.#clipboardShortcuts.reset();
+    window.clearTimeout(this.#pasteFocusTimer);
   };
 
   #sendReliable(data: ArrayBufferView<ArrayBuffer>): void {

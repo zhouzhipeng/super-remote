@@ -140,7 +140,9 @@ the result back to the browser. The toolbar clipboard panel provides explicit re
 send-and-paste and local-copy actions for mobile browsers and plain-HTTP LAN origins that deny
 background clipboard writes. Copy followed by paste while the remote page keeps focus stays on
 the Host clipboard, while leaving the page to copy locally resets the next paste to browser-to-Host
-synchronization. Multi-monitor, secure desktop and ICE restart remain the V2 items
+synchronization. Keyboard shortcuts use hidden browser-native copy and paste capture elements, so
+the clipboard toolbar is only a fallback and is not part of the normal desktop workflow.
+Multi-monitor, secure desktop and ICE restart remain the V2 items
 identified by the design.
 
 Run `cargo run -p remote-host --example hardware_probe` on the Host before deployment. It
