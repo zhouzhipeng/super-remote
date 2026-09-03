@@ -14,29 +14,33 @@ allowed to build an unbounded queue.
   WebSocket tickets, session authorization and short-lived coturn REST credentials.
 - `web`: Vite/TypeScript browser client with device/session UI, WebRTC, fullscreen,
   keyboard/mouse forwarding and a `getStats()` debug overlay.
-- `host`: Windows agent with webrtc-rs 0.20.x, trickle ICE, GDI/D3D11/NVENC
-  hardware H.264, WASAPI loopback/Opus system audio, strict DataChannel validation
+- `host`: Windows agent with webrtc-rs 0.20.x, trickle ICE, bundled FFmpeg
+  Desktop Duplication/GDI capture, automatic NVENC/AMF/software H.264 selection,
+  WASAPI loopback/Opus system audio, strict DataChannel validation
   and Win32 `SendInput` injection.
 - `control-panel`: native Rust/Win32 Windows control panel for live service, client,
   capture and encoder status; start/stop/restart actions; Web/QR shortcuts; and an
   optional capture-excluded, local-input-released privacy screen.
+- `launcher`: native Rust Windows launcher that handles elevation, credentials, display/LAN
+  discovery, firewall rules, QR generation and service supervision without Python.
 - `deploy`: production-oriented Nginx, signaling and authenticated coturn deployment.
 
 ## Local build
 
 Requirements: Rust 1.94+, Node.js 24+, npm 11+, Windows 10 1809 or later for the Host.
 
-For a one-command LAN test on Windows, run:
+For a one-command developer LAN test on Windows, run:
 
 ```powershell
 python start_remote_desktop.py
 ```
 
-The script detects the LAN address and physical primary display, downloads a project-local
-FFmpeg build when needed, requires an available NVENC or AMF H.264 hardware encoder,
-builds and starts Signaling/Web/Host plus the native Windows control panel, and writes a
-long-lived direct-access QR code to
-`.run/remote-desktop-qr.png`. Keep the terminal open; Ctrl+C stops the managed processes.
+The legacy developer script remains useful while changing capture pipelines. Production
+builds instead use `super-remote.exe`: it performs the same orchestration natively and uses
+the FFmpeg runtime included in the installer. The launcher probes the real encoder at startup,
+then selects NVENC + Desktop Duplication, AMF + GDI, or a reduced-resolution software H.264
+fallback. Target computers require no separate Python, Node.js or FFmpeg installation. Runtime
+state and the long-lived direct-access QR code are written under `C:\ProgramData\Super Remote`.
 The QR remains valid while `.run/secrets.json` is unchanged and contains a bearer token,
 so treat it as a permanent password and do not share it. Windows Firewall must allow the
 configured TCP Web port (8080 by default) from the local subnet, and the phone must be on
@@ -58,7 +62,8 @@ keyboard or mouse attached to the Host generates input; injected `SendInput` eve
 release it. “Web 客户端连接后静音主机声音”
 mutes the Host's default playback endpoint without silencing the WebRTC loopback stream;
 the endpoint remains muted after disconnect until the user explicitly unmutes it in Windows.
-Both preferences are stored in `.run/control-settings.json`.
+Both preferences are stored in `C:\ProgramData\Super Remote\control-settings.json` in an
+installed build (or `.run/control-settings.json` in a developer checkout).
 
 ```powershell
 npm --prefix web install
@@ -66,20 +71,22 @@ npm --prefix web run build
 cargo test --workspace
 ```
 
-To build a distributable Windows production package without replacing binaries used by a
-currently running Host, run:
+To build a distributable Windows installer without replacing binaries used by a currently
+running Host, install Inno Setup 6 and run:
 
 ```powershell
 python build_production.py
 ```
 
-The script uses an isolated Cargo target directory, runs Web/Rust tests, performs locked
-release builds, validates the PE binaries and Web assets, and writes a versioned runtime
-directory, ZIP archive, manifest with per-file SHA-256 hashes, and ZIP checksum under
-`artifacts/`. The archive contains no runtime credentials or `.run` data. After extracting
-it, start the packaged application with `python start_remote_desktop.py`; packaged launches
-validate the bundled files and skip npm/Cargo compilation. Use `--skip-tests`, `--no-archive`,
-`--output-dir`, or `--target-dir` when needed.
+The script uses an isolated Cargo target directory, builds the Web client before compiling it
+into `remote-signaling.exe`, runs Web/Rust tests, performs locked release builds, validates
+the PE binaries, and writes a standard `SuperRemote-<version>-windows-x64-setup.exe` plus a
+portable ZIP and SHA-256 files under `artifacts/`. The installer registers an all-users Start
+Menu shortcut and Windows uninstaller. Target computers need only Windows 10 1809 or later;
+they do not need Python, Node.js, Rust, a separately installed FFmpeg, or loose Web assets.
+The package includes the FFmpeg executable, its required shared libraries, and license files.
+Use `--skip-tests`,
+`--no-archive`, `--no-installer`, `--output-dir`, or `--target-dir` when needed.
 
 Set non-development secrets before starting the server. No insecure fallback credentials
 are compiled in.
@@ -108,13 +115,13 @@ display aspect ratio, never crops the source, and can stream the full physical p
 resolution to a high-DPI browser. Bitrate scales with the requested pixel count up to 20 Mbps,
 which keeps 60 FPS ahead of the WebRTC sender instead of queuing oversized encoded frames.
 It uses NVENC's quality-oriented low-latency P4 preset, spatial AQ, a one-frame CBR buffer, two
-encoder surfaces, forced IDR frames and zero-latency tuning. A one-frame backpressured handoff
-prevents a stale-frame queue while preserving every encoded H.264 reference frame. The
-source-driven sender avoids
-the frame-loss beat pattern caused by sampling capture with a second independent timer.
+encoder surfaces, forced IDR frames and zero-latency tuning. DDA is sampled slightly above the
+target rate, then surplus GPU frames are removed before NVENC to produce a stable 60 FPS encoded
+stream without ever discarding dependent H.264 P-frames. A one-frame backpressured handoff
+prevents a stale-frame queue while preserving every encoded H.264 reference frame.
 Capture, D3D11 conversion, NVENC and WASAPI are
 gated by WebRTC connection state: none of them starts while the Host is idle, and a normal
-disconnect stops them immediately. The browser requests the smallest supported playout
+disconnect stops them immediately. The browser requests a small one-to-two-frame playout
 buffer, and the Host uses exact 60 Hz timestamps to minimize frame jitter.
 Pointer movement bypasses animation-frame batching and uses raw pointer updates when the
 browser supports them. Click coordinates and button transitions are injected as one Win32
@@ -145,9 +152,10 @@ the clipboard toolbar is only a fallback and is not part of the normal desktop w
 Multi-monitor, secure desktop and ICE restart remain the V2 items
 identified by the design.
 
-Run `cargo run -p remote-host --example hardware_probe` on the Host before deployment. It
-requires a hardware Media Foundation encoder that can share the WGC D3D11 device; failure
-is reported explicitly instead of silently falling back to CPU encoding.
+The production launcher probes bundled FFmpeg encoders before starting Host. For native
+Media Foundation development diagnostics, run
+`cargo run -p remote-host --example hardware_probe`; this path is not used by the installed
+production capture pipeline.
 
 ## Production deployment
 

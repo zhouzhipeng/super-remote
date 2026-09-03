@@ -8,7 +8,8 @@ use remote_protocol::{
     device::DeviceSummary,
     signaling::{CreateSessionResponse, ServerSignal},
 };
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
+use tracing::info;
 use uuid::Uuid;
 
 use crate::auth::{AuthConfig, Principal};
@@ -32,6 +33,7 @@ pub struct AppState {
     pub devices: RwLock<HashMap<String, DeviceConnection>>,
     pub sessions: RwLock<HashMap<Uuid, SessionRecord>>,
     tickets: RwLock<HashMap<String, (Principal, Instant)>>,
+    session_creation: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -47,6 +49,7 @@ impl AppState {
             devices: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             tickets: RwLock::new(HashMap::new()),
+            session_creation: Mutex::new(()),
         }
     }
 
@@ -71,6 +74,10 @@ impl AppState {
         owner: &str,
         device_id: &str,
     ) -> Result<CreateSessionResponse, CreateSessionError> {
+        // Serialize the whole handoff, including messages sent to the Host. This
+        // guarantees that two browsers racing to connect cannot reorder their
+        // SessionRequested messages after ownership has already changed.
+        let _creation = self.session_creation.lock().await;
         let sender = {
             let devices = self.devices.read().await;
             let device = devices.get(device_id).ok_or(CreateSessionError::NotFound)?;
@@ -78,26 +85,77 @@ impl AppState {
         };
         let session_id = Uuid::new_v4();
         let session_token = Uuid::new_v4().simple().to_string();
-        self.sessions.write().await.insert(
-            session_id,
-            SessionRecord {
-                owner: owner.to_owned(),
-                device_id: device_id.to_owned(),
-                session_token: Some(session_token.clone()),
-                browser_sender: None,
-            },
-        );
-        sender
+        let replaced = {
+            let mut sessions = self.sessions.write().await;
+            let replaced_ids = sessions
+                .iter()
+                .filter_map(|(id, session)| (session.device_id == device_id).then_some(*id))
+                .collect::<Vec<_>>();
+            let replaced = replaced_ids
+                .into_iter()
+                .filter_map(|id| sessions.remove(&id).map(|session| (id, session)))
+                .collect::<Vec<_>>();
+            sessions.insert(
+                session_id,
+                SessionRecord {
+                    owner: owner.to_owned(),
+                    device_id: device_id.to_owned(),
+                    session_token: Some(session_token.clone()),
+                    browser_sender: None,
+                },
+            );
+            replaced
+        };
+
+        // The Host sees every old close before the new request on the same
+        // ordered channel. Late close/ICE events from an evicted session are
+        // harmless because its record was removed before any message was sent.
+        for (old_id, _) in &replaced {
+            if sender
+                .send(ServerSignal::SessionClosed {
+                    session_id: *old_id,
+                    reason: "replaced_by_new_connection".into(),
+                })
+                .await
+                .is_err()
+            {
+                self.remove_session_if_current(session_id).await;
+                return Err(CreateSessionError::Offline);
+            }
+        }
+        if sender
             .send(ServerSignal::SessionRequested {
                 session_id,
                 session_token: session_token.clone(),
             })
             .await
-            .map_err(|_| CreateSessionError::Offline)?;
+            .is_err()
+        {
+            self.remove_session_if_current(session_id).await;
+            return Err(CreateSessionError::Offline);
+        }
+
+        // Notify established old browsers directly as well. This is best effort:
+        // the Host-side peer close above is the authoritative forced disconnect.
+        for (old_id, old_session) in &replaced {
+            if let Some(browser) = &old_session.browser_sender {
+                let _ = browser.try_send(ServerSignal::SessionClosed {
+                    session_id: *old_id,
+                    reason: "replaced_by_new_connection".into(),
+                });
+            }
+        }
+        if !replaced.is_empty() {
+            info!(%device_id, %session_id, replaced = replaced.len(), "new session replaced all older device sessions");
+        }
         Ok(CreateSessionResponse {
             session_id,
             session_token,
         })
+    }
+
+    async fn remove_session_if_current(&self, session_id: Uuid) {
+        self.sessions.write().await.remove(&session_id);
     }
 
     pub async fn route_to_device(
@@ -170,5 +228,101 @@ impl AppState {
             Some(tx) => tx.send(message).await.is_ok(),
             None => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use remote_protocol::{device::DeviceCapabilities, signaling::ServerSignal};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn newest_session_atomically_replaces_every_older_device_session() {
+        let state = AppState::new(AuthConfig::for_tests());
+        let (device_tx, mut device_rx) = mpsc::channel(16);
+        state.devices.write().await.insert(
+            "host-1".into(),
+            DeviceConnection {
+                summary: DeviceSummary {
+                    id: "host-1".into(),
+                    name: "Test host".into(),
+                    online: true,
+                    capabilities: DeviceCapabilities::default(),
+                },
+                sender: Some(device_tx),
+            },
+        );
+
+        let first = state.create_session("user", "host-1").await.unwrap();
+        assert!(matches!(
+            device_rx.recv().await,
+            Some(ServerSignal::SessionRequested { session_id, .. }) if session_id == first.session_id
+        ));
+        let (browser_tx, mut browser_rx) = mpsc::channel(4);
+        assert!(
+            state
+                .authorize_offer(first.session_id, "user", &first.session_token, browser_tx)
+                .await
+        );
+
+        let second = state.create_session("user", "host-1").await.unwrap();
+        assert!(matches!(
+            device_rx.recv().await,
+            Some(ServerSignal::SessionClosed { session_id, reason })
+                if session_id == first.session_id && reason == "replaced_by_new_connection"
+        ));
+        assert!(matches!(
+            device_rx.recv().await,
+            Some(ServerSignal::SessionRequested { session_id, .. }) if session_id == second.session_id
+        ));
+        assert!(matches!(
+            browser_rx.recv().await,
+            Some(ServerSignal::SessionClosed { session_id, reason })
+                if session_id == first.session_id && reason == "replaced_by_new_connection"
+        ));
+
+        let sessions = state.sessions.read().await;
+        assert_eq!(sessions.len(), 1);
+        assert!(!sessions.contains_key(&first.session_id));
+        assert!(sessions.contains_key(&second.session_id));
+        drop(sessions);
+        assert!(
+            !state
+                .route_to_device(first.session_id, "user", ServerSignal::Pong { nonce: 1 })
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn newest_session_invalidates_an_older_pending_offer() {
+        let state = AppState::new(AuthConfig::for_tests());
+        let (device_tx, mut device_rx) = mpsc::channel(16);
+        state.devices.write().await.insert(
+            "host-1".into(),
+            DeviceConnection {
+                summary: DeviceSummary {
+                    id: "host-1".into(),
+                    name: "Test host".into(),
+                    online: true,
+                    capabilities: DeviceCapabilities::default(),
+                },
+                sender: Some(device_tx),
+            },
+        );
+
+        let first = state.create_session("user", "host-1").await.unwrap();
+        let _ = device_rx.recv().await;
+        let second = state.create_session("user", "host-1").await.unwrap();
+        let _ = device_rx.recv().await;
+        let _ = device_rx.recv().await;
+        let (browser_tx, _) = mpsc::channel(1);
+
+        assert!(
+            !state
+                .authorize_offer(first.session_id, "user", &first.session_token, browser_tx)
+                .await
+        );
+        assert!(state.sessions.read().await.contains_key(&second.session_id));
     }
 }

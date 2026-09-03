@@ -9,7 +9,9 @@ bitrate = 8000000
 monitor_index = 0
 
 # Omit h264_file in normal use: Host captures monitor_index with Windows.Graphics.Capture,
-# converts BGRA to NV12 on the GPU, and requires a Media Foundation hardware H.264 MFT.
+# converts BGRA to NV12 on the GPU, prefers a Media Foundation hardware H.264 MFT,
+# and automatically falls back to the Windows software H.264 MFT when driver
+# negotiation fails.
 # For transport-only integration tests, uncomment an Annex-B H.264 source:
 # h264_file = "sample.h264"
 # For a live LAN test when the strict Media Foundation hardware probe fails, the launcher

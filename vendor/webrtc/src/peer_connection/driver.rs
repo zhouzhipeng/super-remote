@@ -296,6 +296,9 @@ where
     /// Mirrors `SettingEngine::discard_local_candidates_during_ice_restart`, because discarding the
     /// old candidates and replacing the transports they name are the same decision (webrtc#868).
     discard_local_candidates_during_ice_restart: bool,
+    /// Disabled for deployments that send through a userspace TURN relay on
+    /// the same Windows host, where UDP GSO aggregates may not be segmented.
+    udp_gso_enabled: bool,
 }
 
 impl<I, A> PeerConnectionDriver<I, A>
@@ -417,6 +420,7 @@ where
         ice_servers: Vec<RTCIceServer>,
         ice_gather_policy: RTCIceTransportPolicy,
         discard_local_candidates_during_ice_restart: bool,
+        udp_gso_enabled: bool,
     ) -> Self {
         let runtime = Arc::clone(&inner.runtime);
         Self {
@@ -448,6 +452,7 @@ where
             ice_servers,
             ice_gather_policy,
             discard_local_candidates_during_ice_restart,
+            udp_gso_enabled,
         }
     }
 
@@ -1560,7 +1565,8 @@ where
             let plain_udp = tp.transport_protocol == TransportProtocol::UDP
                 && tp.peer_addr.port() != MDNS_PORT
                 && !self.turn_relayer.contains_local_addr(tp.local_addr)
-                && self.udp_sockets.contains_key(&tp.local_addr);
+                && self.udp_sockets.contains_key(&tp.local_addr)
+                && self.udp_gso_enabled;
             if !plain_udp {
                 // TCP / mDNS / TURN-relayed / unknown-socket: owned per-packet path.
                 // Move the message out (writes[i] is never read again) rather than

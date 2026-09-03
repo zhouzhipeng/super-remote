@@ -180,6 +180,7 @@ where
     handler: Option<Arc<dyn PeerConnectionEventHandler>>,
     mdns_mode: MulticastDnsMode,
     discard_local_candidates_during_ice_restart: bool,
+    udp_gso_enabled: bool,
     udp_addrs: Vec<A>,
     tcp_addrs: Vec<A>,
     dedicated_reactor: bool,
@@ -195,6 +196,7 @@ impl<A: ToSocketAddrs> Default for PeerConnectionBuilder<A, NoopInterceptor> {
             handler: None,
             mdns_mode: MulticastDnsMode::Disabled,
             discard_local_candidates_during_ice_restart: false,
+            udp_gso_enabled: true,
             udp_addrs: vec![],
             tcp_addrs: vec![],
             dedicated_reactor: false,
@@ -284,6 +286,7 @@ where
             mdns_mode: self.mdns_mode,
             discard_local_candidates_during_ice_restart: self
                 .discard_local_candidates_during_ice_restart,
+            udp_gso_enabled: self.udp_gso_enabled,
             udp_addrs: self.udp_addrs,
             tcp_addrs: self.tcp_addrs,
             dedicated_reactor: self.dedicated_reactor,
@@ -322,6 +325,17 @@ where
     /// Port `0` picks an ephemeral port per socket, freshly on every rebind.
     pub fn with_udp_addrs(mut self, udp_addrs: Vec<A>) -> Self {
         self.udp_addrs = udp_addrs;
+        self
+    }
+
+    /// Enables or disables UDP Generic Segmentation Offload for media bursts.
+    ///
+    /// GSO is enabled by default. Disable it when the selected peer may be a
+    /// userspace TURN relay on the same Windows host: some loopback/LAN paths
+    /// deliver the aggregate buffer as one oversized datagram instead of the
+    /// requested segments, while ordinary per-datagram sends remain portable.
+    pub fn with_udp_gso_enabled(mut self, enabled: bool) -> Self {
+        self.udp_gso_enabled = enabled;
         self
     }
 
@@ -459,6 +473,7 @@ where
                 .ok_or_else(|| std::io::Error::other("no event handler found"))?,
             self.mdns_mode,
             self.discard_local_candidates_during_ice_restart,
+            self.udp_gso_enabled,
             self.udp_addrs,
             self.tcp_addrs,
             self.dedicated_reactor,
@@ -805,6 +820,7 @@ where
         handler: Arc<dyn PeerConnectionEventHandler>,
         mdns_mode: MulticastDnsMode,
         discard_local_candidates_during_ice_restart: bool,
+        udp_gso_enabled: bool,
         udp_addrs: Vec<A>,
         tcp_addrs: Vec<A>,
         dedicated_reactor: bool,
@@ -861,6 +877,7 @@ where
                 ice_servers,
                 ice_gather_policy,
                 discard_local_candidates_during_ice_restart,
+                udp_gso_enabled,
             );
 
             if let Err(e) = driver.event_loop(driver_event_rx, init_tx).await {

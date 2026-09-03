@@ -1,27 +1,36 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod auth;
 mod local_clipboard;
 mod state;
 mod websocket;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{borrow::Cow, net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
 use auth::{AuthConfig, LoginRequest, LoginResponse, Principal, Role, TicketResponse};
 use axum::{
     Json, Router,
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    body::Body,
+    extract::{ConnectInfo, Query, Request, State},
+    http::{
+        HeaderMap, HeaderValue, StatusCode, Uri,
+        header::{CACHE_CONTROL, CONTENT_TYPE},
+    },
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
 use remote_protocol::{device::DeviceSummary, signaling::CreateSessionRequest};
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use state::AppState;
-use tower_http::{
-    services::{ServeDir, ServeFile},
-    trace::TraceLayer,
-};
+use tower_http::trace::TraceLayer;
 use tracing::info;
+
+#[derive(RustEmbed)]
+#[folder = "../web/dist/"]
+struct WebAssets;
 
 #[derive(Debug, Deserialize)]
 struct WsQuery {
@@ -48,8 +57,6 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("REMOTE_BIND must be a socket address")?;
     let state = Arc::new(AppState::new(config));
-    let web_dist = std::env::var("REMOTE_WEB_DIST").unwrap_or_else(|_| "web/dist".into());
-
     let api = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/login", post(login))
@@ -64,17 +71,67 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .nest("/api", api)
-        .fallback_service(
-            ServeDir::new(&web_dist)
-                .not_found_service(ServeFile::new(format!("{web_dist}/index.html"))),
-        )
+        .fallback(embedded_web_asset)
+        // The browser entry point changes whenever the Host is redeployed. A
+        // cached HTML document can keep an already-open Chrome tab on an old
+        // WebRTC policy indefinitely, so every navigation must revalidate the
+        // current hashed assets instead of replaying an earlier app shell.
+        .layer(middleware::from_fn(disable_http_cache))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!(%bind, "signaling server listening");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
+}
+
+async fn embedded_web_asset(uri: Uri) -> Response {
+    let requested = uri.path().trim_start_matches('/');
+    let path = if requested.is_empty() {
+        "index.html"
+    } else {
+        requested
+    };
+    let (asset, served_path) = match WebAssets::get(path) {
+        Some(asset) => (asset, path),
+        None => match WebAssets::get("index.html") {
+            Some(asset) => (asset, "index.html"),
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "embedded web application is missing",
+                )
+                    .into_response();
+            }
+        },
+    };
+    let content_type = mime_guess::from_path(served_path)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_owned();
+    let body = match asset.data {
+        Cow::Borrowed(bytes) => Body::from(bytes),
+        Cow::Owned(bytes) => Body::from(bytes),
+    };
+    let mut response = Response::new(body);
+    if let Ok(value) = HeaderValue::from_str(&content_type) {
+        response.headers_mut().insert(CONTENT_TYPE, value);
+    }
+    response
+}
+
+async fn disable_http_cache(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate, max-age=0"),
+    );
+    response
 }
 
 async fn login(State(state): State<Arc<AppState>>, Json(request): Json<LoginRequest>) -> Response {
@@ -266,13 +323,14 @@ async fn turn_credentials(State(state): State<Arc<AppState>>, headers: HeaderMap
 
 async fn ws_upgrade(
     ws: axum::extract::ws::WebSocketUpgrade,
+    ConnectInfo(peer_address): ConnectInfo<SocketAddr>,
     Query(query): Query<WsQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Response {
     match state.consume_ticket(&query.ticket).await {
-        Some(principal) => ws
-            .max_message_size(1 << 20)
-            .on_upgrade(move |socket| websocket::serve(socket, state, principal)),
+        Some(principal) => ws.max_message_size(1 << 20).on_upgrade(move |socket| {
+            websocket::serve(socket, state, principal, peer_address.ip())
+        }),
         None => api_error(
             StatusCode::UNAUTHORIZED,
             "invalid_ticket",
@@ -287,4 +345,17 @@ fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
         Json(serde_json::json!({ "code": code, "message": message })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod embedded_web_tests {
+    use super::WebAssets;
+
+    #[test]
+    fn production_web_application_is_embedded() {
+        let index = WebAssets::get("index.html").expect("web/dist/index.html must be embedded");
+        let html = std::str::from_utf8(index.data.as_ref()).expect("index.html must be UTF-8");
+        assert!(html.contains("<div id=\"app\"></div>"));
+        assert!(WebAssets::iter().any(|path| path.starts_with("assets/")));
+    }
 }

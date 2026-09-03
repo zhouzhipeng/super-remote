@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>TURN candidate diagnostic</title>
+<pre id="result">starting</pre>
+<script type="module">
+  const output = document.querySelector("#result");
+  const params = new URLSearchParams(location.search);
+  const peer = new RTCPeerConnection({
+    iceServers: [{
+      urls: params.get("url"),
+      username: params.get("username"),
+      credential: params.get("credential"),
+    }],
+    iceTransportPolicy: "relay",
+  });
+  const candidates = [];
+  let finished = false;
+  const finish = (error) => {
+    if (finished) return;
+    finished = true;
+    output.textContent = JSON.stringify({
+      ok: !error && candidates.some((candidate) => candidate.includes(" typ relay ")),
+      error: error ? String(error) : null,
+      candidates,
+      gatheringState: peer.iceGatheringState,
+    });
+    peer.close();
+  };
+  peer.onicecandidate = ({ candidate }) => {
+    if (candidate) candidates.push(candidate.candidate);
+    else finish(null);
+  };
+  try {
+    peer.createDataChannel("diagnostic");
+    await peer.setLocalDescription(await peer.createOffer());
+    setTimeout(() => finish("candidate gathering timed out"), 8_000);
+  } catch (error) {
+    finish(error);
+  }
+</script>

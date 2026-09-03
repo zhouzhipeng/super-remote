@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod audio;
 mod clipboard;
 mod config;
@@ -105,10 +107,11 @@ async fn main() -> anyhow::Result<()> {
                 sdp_mline_index,
                 username_fragment,
             } => {
-                let (candidate_kind, uses_mdns) = ice_candidate_diagnostics(&candidate);
+                let (transport, candidate_kind, uses_mdns) = ice_candidate_diagnostics(&candidate);
                 info!(
                     %session_id,
                     direction = "browser_to_host",
+                    %transport,
                     kind = candidate_kind,
                     mdns = uses_mdns,
                     "received ICE candidate"
@@ -147,8 +150,9 @@ async fn main() -> anyhow::Result<()> {
     anyhow::bail!("signaling connection closed")
 }
 
-fn ice_candidate_diagnostics(candidate: &str) -> (&str, bool) {
+fn ice_candidate_diagnostics(candidate: &str) -> (&str, &str, bool) {
     let fields = candidate.split_ascii_whitespace().collect::<Vec<_>>();
+    let transport = fields.get(2).copied().unwrap_or("unknown");
     let kind = fields
         .windows(2)
         .find(|pair| pair[0].eq_ignore_ascii_case("typ"))
@@ -157,7 +161,7 @@ fn ice_candidate_diagnostics(candidate: &str) -> (&str, bool) {
     let uses_mdns = fields
         .iter()
         .any(|field| field.to_ascii_lowercase().ends_with(".local"));
-    (kind, uses_mdns)
+    (transport, kind, uses_mdns)
 }
 
 #[cfg(test)]
@@ -170,11 +174,17 @@ mod tests {
             ice_candidate_diagnostics(
                 "candidate:1 1 UDP 2122260223 computer-name.local 55000 typ host"
             ),
-            ("host", true)
+            ("UDP", "host", true)
         );
         assert_eq!(
             ice_candidate_diagnostics("candidate:2 1 udp 1686052607 203.0.113.2 60000 typ srflx"),
-            ("srflx", false)
+            ("udp", "srflx", false)
+        );
+        assert_eq!(
+            ice_candidate_diagnostics(
+                "candidate:3 1 tcp 1518280447 192.0.2.10 62000 typ host tcptype passive"
+            ),
+            ("tcp", "host", false)
         );
     }
 }

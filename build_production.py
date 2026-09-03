@@ -11,6 +11,7 @@ from pathlib import Path
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import tomllib
@@ -19,9 +20,21 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent
 RUNTIME_BINARIES = (
+    "super-remote.exe",
     "remote-signaling.exe",
     "remote-host.exe",
     "remote-control-panel.exe",
+    "remote-turn.exe",
+)
+FFMPEG_RUNTIME_FILES = (
+    "ffmpeg.exe",
+    "avcodec-62.dll",
+    "avdevice-62.dll",
+    "avfilter-11.dll",
+    "avformat-62.dll",
+    "avutil-60.dll",
+    "swresample-6.dll",
+    "swscale-9.dll",
 )
 MANIFEST_NAME = "production-manifest.json"
 
@@ -106,19 +119,45 @@ def package_readme(version: str) -> str:
 
 Requirements:
 - Windows 10 1809 or later
-- Python 3.11 or later
-- NVIDIA NVENC or AMD AMF H.264 hardware encoder
-- Internet access on first launch if FFmpeg and the QR-code Python package are not cached
+- No separate Python, Node.js or FFmpeg installation
 
-Start from PowerShell:
+Start from the Start menu after installing, or run the portable executable directly:
 
-    python start_remote_desktop.py
+    super-remote.exe
 
-The launcher requests administrator privileges, detects the primary display and hardware
-encoder, then starts the bundled Signaling, Host and Control Panel binaries. Runtime data,
-credentials, logs and the permanent QR code are written under .run; downloaded tools are
-written under .tools. Neither directory is included in this production archive.
+The native launcher requests administrator privileges, detects the primary display and LAN
+address, then starts the bundled Signaling, Host, TURN and Control Panel binaries. The Web
+application is embedded in remote-signaling.exe. Runtime data, credentials, logs and the
+permanent QR code are written under C:\\ProgramData\\Super Remote. A bundled FFmpeg runtime
+selects NVIDIA NVENC, AMD AMF, or software H.264 automatically.
 """
+
+
+def find_ffmpeg_bundle() -> tuple[Path, Path, Path]:
+    candidates = sorted((ROOT / ".tools" / "ffmpeg8").glob("**/bin/ffmpeg.exe"))
+    for executable in candidates:
+        binary_dir = executable.parent
+        if all((binary_dir / name).is_file() for name in FFMPEG_RUNTIME_FILES):
+            bundle_root = binary_dir.parent
+            license_path = bundle_root / "LICENSE"
+            readme_path = bundle_root / "README.txt"
+            if license_path.is_file() and readme_path.is_file():
+                return binary_dir, license_path, readme_path
+    raise RuntimeError(
+        "缺少可分发的 FFmpeg 8 shared 运行时；预期位于 .tools/ffmpeg8/**/bin"
+    )
+
+
+def find_iscc() -> str | None:
+    direct = shutil.which("ISCC.exe") or shutil.which("iscc")
+    if direct:
+        return direct
+    candidates = (
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Inno Setup 6" / "ISCC.exe",
+        Path(os.environ.get("ProgramFiles(x86)", "")) / "Inno Setup 6" / "ISCC.exe",
+        Path(os.environ.get("ProgramFiles", "")) / "Inno Setup 6" / "ISCC.exe",
+    )
+    return next((str(path) for path in candidates if path.is_file()), None)
 
 
 def write_manifest(package_dir: Path, version: str, triple: str) -> dict[str, object]:
@@ -193,6 +232,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-tests", action="store_true", help="跳过 Web 和 Rust 测试")
     parser.add_argument("--no-archive", action="store_true", help="只生成目录，不生成 ZIP")
+    parser.add_argument("--no-installer", action="store_true", help="不生成 Windows Setup.exe")
     return parser.parse_args()
 
 
@@ -212,14 +252,17 @@ def main() -> int:
         raise RuntimeError("构建需要 Node.js/npm 和 Rust/Cargo")
 
     run([npm, "--prefix", "web", "ci", "--no-audit", "--no-fund"])
+    run([npm, "--prefix", "web", "run", "build"])
     if not args.skip_tests:
         run([npm, "--prefix", "web", "test"])
         run([cargo, "test", "--workspace", "--locked"])
-    run([npm, "--prefix", "web", "run", "build"])
 
     target_dir = args.target_dir.expanduser().resolve()
     build_env = os.environ.copy()
     build_env["CARGO_TARGET_DIR"] = str(target_dir)
+    build_env["RUSTFLAGS"] = " ".join(
+        filter(None, [build_env.get("RUSTFLAGS"), "-C target-feature=+crt-static"])
+    )
     run(
         [
             cargo,
@@ -227,6 +270,8 @@ def main() -> int:
             "--workspace",
             "--release",
             "--locked",
+            "--bin",
+            "super-remote",
             "--bin",
             "remote-signaling",
             "--bin",
@@ -238,9 +283,18 @@ def main() -> int:
     )
 
     release_dir = target_dir / "release"
+    run(
+        [
+            sys.executable,
+            str(ROOT / "build_turn_server.py"),
+            "--output",
+            str(release_dir / "remote-turn.exe"),
+        ]
+    )
     for name in RUNTIME_BINARIES:
         verify_binary(release_dir / name)
     verify_web_distribution(ROOT / "web" / "dist")
+    ffmpeg_dir, ffmpeg_license, ffmpeg_readme = find_ffmpeg_bundle()
 
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -248,16 +302,19 @@ def main() -> int:
     package_dir = output_dir / package_name
     archive_path = output_dir / f"{package_name}.zip"
     checksum_path = output_dir / f"{package_name}.zip.sha256"
+    installer_name = f"SuperRemote-{version}-windows-x64-setup.exe"
+    installer_path = output_dir / installer_name
+    installer_checksum_path = output_dir / f"{installer_name}.sha256"
 
     with tempfile.TemporaryDirectory(prefix=".super-remote-stage-", dir=output_dir) as temporary:
         stage = Path(temporary) / package_name
-        (stage / "target" / "release").mkdir(parents=True)
-        (stage / "web").mkdir(parents=True)
         (stage / "host").mkdir(parents=True)
         for name in RUNTIME_BINARIES:
-            shutil.copy2(release_dir / name, stage / "target" / "release" / name)
-        shutil.copytree(ROOT / "web" / "dist", stage / "web" / "dist")
-        shutil.copy2(ROOT / "start_remote_desktop.py", stage / "start_remote_desktop.py")
+            shutil.copy2(release_dir / name, stage / name)
+        for name in FFMPEG_RUNTIME_FILES:
+            shutil.copy2(ffmpeg_dir / name, stage / name)
+        shutil.copy2(ffmpeg_license, stage / "FFMPEG-LICENSE.txt")
+        shutil.copy2(ffmpeg_readme, stage / "FFMPEG-README.txt")
         shutil.copy2(ROOT / "README.md", stage / "README.md")
         shutil.copy2(
             ROOT / "host" / "remote-host.example.toml",
@@ -279,10 +336,40 @@ def main() -> int:
         verify_archive(package_dir, archive_path)
         checksum_path.write_text(f"{sha256(archive_path)}  {archive_path.name}\n", encoding="ascii")
 
+    if args.no_installer:
+        remove_exact(installer_path, output_dir)
+        remove_exact(installer_checksum_path, output_dir)
+    else:
+        iscc = find_iscc()
+        if not iscc:
+            raise RuntimeError(
+                "生成 Setup.exe 需要 Inno Setup 6（ISCC.exe）；请先执行 "
+                "winget install --id JRSoftware.InnoSetup -e"
+            )
+        remove_exact(installer_path, output_dir)
+        remove_exact(installer_checksum_path, output_dir)
+        run(
+            [
+                iscc,
+                f"/DSourceDir={package_dir}",
+                f"/DOutputDir={output_dir}",
+                f"/DAppVersion={version}",
+                f"/DOutputBaseFilename={Path(installer_name).stem}",
+                str(ROOT / "installer" / "super-remote.iss"),
+            ]
+        )
+        verify_binary(installer_path)
+        installer_checksum_path.write_text(
+            f"{sha256(installer_path)}  {installer_path.name}\n", encoding="ascii"
+        )
+
     print(f"生产目录：{package_dir}")
     if not args.no_archive:
         print(f"生产压缩包：{archive_path}")
         print(f"SHA-256：{checksum_path}")
+    if not args.no_installer:
+        print(f"Windows 安装程序：{installer_path}")
+        print(f"安装程序 SHA-256：{installer_checksum_path}")
     print(f"清单文件数：{len(manifest['files'])}")
     return 0
 

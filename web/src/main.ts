@@ -1,6 +1,7 @@
 import "./style.css";
 import { accessToken, listDevices, login, logout, setAccessToken } from "./api.ts";
-import { RemoteSession, type SessionDisconnectDetail } from "./rtc.ts";
+import { CONNECTION_STEPS, connectionProgressSnapshot } from "./connection-progress.ts";
+import { RemoteSession, type ConnectionProgressDetail, type SessionDisconnectDetail } from "./rtc.ts";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
@@ -26,7 +27,7 @@ async function devicesView(): Promise<void> {
 }
 
 async function sessionView(deviceId: string): Promise<void> {
-  app.innerHTML = `<main class="remote"><video id="remote" autoplay muted playsinline tabindex="0"></video><div class="toolbar-corner-hint" aria-hidden="true"><span>⌄</span><span>控制条</span></div><div class="toolbar"><button id="back" class="secondary">断开</button><button id="sound">开启声音</button><button id="clipboard" class="secondary">剪贴板</button><button id="fullscreen" class="secondary" aria-pressed="false">全屏</button><button id="toolbar-pin" class="secondary" aria-pressed="true">取消固定</button><span id="state">正在连接</span><span id="stats"></span></div><section class="clipboard-panel card" hidden aria-label="双向剪贴板"><header><strong>双向文本剪贴板</strong><button id="clipboard-close" class="secondary" aria-label="关闭剪贴板">关闭</button></header><textarea id="clipboard-text" placeholder="在这里粘贴手机/浏览器中的文本，或从主机读取文本" spellcheck="false"></textarea><div class="clipboard-actions"><button id="clipboard-read">从主机读取</button><button id="clipboard-send" class="secondary">发送到主机</button><button id="clipboard-paste">发送并粘贴</button><button id="clipboard-copy" class="secondary">复制到本机</button></div><output id="clipboard-status">Ctrl+C / Ctrl+V 也会自动同步文本</output></section><dialog class="disconnect-dialog card" aria-labelledby="disconnect-title" aria-describedby="disconnect-message"><div class="disconnect-icon" aria-hidden="true">!</div><h2 id="disconnect-title">连接已断开</h2><p id="disconnect-message">Web 连接已断开，请检查网络后重新连接。</p><button id="disconnect-confirm">返回设备列表</button></dialog></main>`;
+  app.innerHTML = `<main class="remote"><video id="remote" autoplay muted playsinline tabindex="0"></video>${connectionProgressMarkup()}<div class="toolbar-corner-hint" aria-hidden="true"><span>⌄</span><span>控制条</span></div><div class="toolbar"><button id="back" class="secondary">断开</button><button id="sound">开启声音</button><button id="clipboard" class="secondary">剪贴板</button><button id="fullscreen" class="secondary" aria-pressed="false">全屏</button><button id="toolbar-pin" class="secondary" aria-pressed="true">取消固定</button><span id="state">正在连接</span><span id="stats"></span></div><section class="clipboard-panel card" hidden aria-label="双向剪贴板"><header><strong>双向文本剪贴板</strong><button id="clipboard-close" class="secondary" aria-label="关闭剪贴板">关闭</button></header><textarea id="clipboard-text" placeholder="在这里粘贴手机/浏览器中的文本，或从主机读取文本" spellcheck="false"></textarea><div class="clipboard-actions"><button id="clipboard-read">从主机读取</button><button id="clipboard-send" class="secondary">发送到主机</button><button id="clipboard-paste">发送并粘贴</button><button id="clipboard-copy" class="secondary">复制到本机</button></div><output id="clipboard-status">Ctrl+C / Ctrl+V 也会自动同步文本</output></section><dialog class="disconnect-dialog card" aria-labelledby="disconnect-title" aria-describedby="disconnect-message"><div class="disconnect-icon" aria-hidden="true">!</div><h2 id="disconnect-title">连接已断开</h2><p id="disconnect-message">Web 连接已断开，请检查网络后重新连接。</p><button id="disconnect-confirm">返回设备列表</button></dialog></main>`;
   const remote = app.querySelector<HTMLElement>(".remote")!;
   const video = app.querySelector<HTMLVideoElement>("#remote")!;
   const toolbar = app.querySelector<HTMLElement>(".toolbar")!;
@@ -34,6 +35,12 @@ async function sessionView(deviceId: string): Promise<void> {
   const fullscreenButton = app.querySelector<HTMLButtonElement>("#fullscreen")!;
   const state = app.querySelector<HTMLSpanElement>("#state")!;
   const stats = app.querySelector<HTMLElement>("#stats")!;
+  const progressOverlay = app.querySelector<HTMLElement>(".connection-overlay")!;
+  const progressTitle = app.querySelector<HTMLElement>("#connection-title")!;
+  const progressDescription = app.querySelector<HTMLElement>("#connection-description")!;
+  const progressElapsed = app.querySelector<HTMLElement>("#connection-elapsed")!;
+  const progressFill = app.querySelector<HTMLElement>(".connection-progress-fill")!;
+  const progressSteps = [...app.querySelectorAll<HTMLElement>(".connection-step")];
   const clipboardButton = app.querySelector<HTMLButtonElement>("#clipboard")!;
   const clipboardPanel = app.querySelector<HTMLElement>(".clipboard-panel")!;
   const clipboardText = app.querySelector<HTMLTextAreaElement>("#clipboard-text")!;
@@ -41,12 +48,64 @@ async function sessionView(deviceId: string): Promise<void> {
   const disconnectDialog = app.querySelector<HTMLDialogElement>(".disconnect-dialog")!;
   const disconnectMessage = app.querySelector<HTMLParagraphElement>("#disconnect-message")!;
   let disposed = false;
+  let retiredByDisconnect = false;
+  let progressStarted = performance.now();
+  let progressTimer = 0;
+  let progressHideTimer = 0;
+  const stopProgressClock = (): void => {
+    window.clearInterval(progressTimer);
+    progressTimer = 0;
+  };
+  const startProgressClock = (): void => {
+    stopProgressClock();
+    progressStarted = performance.now();
+    progressElapsed.textContent = "0.0 秒";
+    progressTimer = window.setInterval(() => {
+      progressElapsed.textContent = `${((performance.now() - progressStarted) / 1000).toFixed(1)} 秒`;
+    }, 100);
+  };
+  const renderConnectionProgress = ({ phase, detail }: ConnectionProgressDetail): void => {
+    window.clearTimeout(progressHideTimer);
+    if (phase === "signaling") startProgressClock();
+    progressOverlay.hidden = false;
+    progressOverlay.classList.remove("is-complete", "is-failed");
+    progressOverlay.dataset.phase = phase;
+    const snapshot = connectionProgressSnapshot(phase, detail);
+    progressTitle.textContent = snapshot.title;
+    progressDescription.textContent = snapshot.description;
+    progressFill.style.width = `${snapshot.percent}%`;
+    progressOverlay.setAttribute("aria-label", `${snapshot.title}，${snapshot.description}`);
+    progressSteps.forEach((step, index) => {
+      step.classList.toggle("is-done", snapshot.activeStep > index);
+      step.classList.toggle("is-active", snapshot.activeStep === index);
+      step.classList.toggle("is-pending", snapshot.activeStep >= 0 && snapshot.activeStep < index);
+    });
+    state.textContent = snapshot.title;
+    if (phase === "ready") {
+      stopProgressClock();
+      progressOverlay.classList.add("is-complete");
+      progressHideTimer = window.setTimeout(() => { progressOverlay.hidden = true; }, 850);
+    } else if (phase === "failed") {
+      stopProgressClock();
+      progressOverlay.classList.add("is-failed");
+    }
+  };
   const createRemoteSession = (): RemoteSession => {
     const next = new RemoteSession(video, stats);
+    next.addEventListener("progress", (event) => {
+      renderConnectionProgress((event as CustomEvent<ConnectionProgressDetail>).detail);
+    });
     next.addEventListener("state", (event) => { state.textContent = stateLabel((event as CustomEvent<string>).detail); });
     next.addEventListener("error", (event) => { state.textContent = String((event as CustomEvent).detail); });
     next.addEventListener("disconnect", (event) => {
       if (disposed || next !== session) return;
+      // A session evicted by a newer browser is permanently retired. Showing
+      // the dialog changes the video layout and can trigger ResizeObserver;
+      // without this latch the old Safari page could create another session a
+      // few seconds later and steal ownership back from the negotiating Chrome.
+      retiredByDisconnect = true;
+      window.clearTimeout(resizeTimer);
+      resizeObserver.disconnect();
       const { message } = (event as CustomEvent<SessionDisconnectDetail>).detail;
       disconnectMessage.textContent = message;
       if (!disconnectDialog.open) disconnectDialog.showModal();
@@ -73,7 +132,7 @@ async function sessionView(deviceId: string): Promise<void> {
     forceResize ||= force;
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(() => {
-      if (disposed || session.state !== "connected") return;
+      if (disposed || retiredByDisconnect || session.state !== "connected") return;
       const area = physicalVideoArea(video);
       const forced = forceResize;
       forceResize = false;
@@ -226,6 +285,8 @@ async function sessionView(deviceId: string): Promise<void> {
     window.clearTimeout(resizeTimer);
     window.clearTimeout(toolbarHideTimer);
     document.removeEventListener("fullscreenchange", onFullscreenChange);
+    stopProgressClock();
+    window.clearTimeout(progressHideTimer);
     if (document.fullscreenElement === remote) void document.exitFullscreen();
     session.close();
     void devicesView();
@@ -240,7 +301,35 @@ async function sessionView(deviceId: string): Promise<void> {
       soundButton.textContent = muted ? "开启声音" : "静音";
     }).catch(() => { state.textContent = "浏览器阻止了声音播放，请再点一次"; });
   });
-  try { await session.connect(deviceId); } catch (error) { state.textContent = error instanceof Error ? error.message : String(error); }
+  try { await session.connect(deviceId); } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    state.textContent = message;
+    renderConnectionProgress({ phase: "failed", detail: message });
+  }
+}
+
+function connectionProgressMarkup(): string {
+  const steps = CONNECTION_STEPS.map((step, index) => `
+    <li class="connection-step ${index === 0 ? "is-active" : "is-pending"}" data-phase="${step.phase}">
+      <span class="connection-step-dot" aria-hidden="true"><i></i></span>
+      <span>${step.label}</span>
+    </li>`).join("");
+  return `<section class="connection-overlay" role="status" aria-live="polite" aria-labelledby="connection-title" aria-describedby="connection-description" data-phase="signaling">
+    <div class="connection-glow connection-glow-a" aria-hidden="true"></div>
+    <div class="connection-glow connection-glow-b" aria-hidden="true"></div>
+    <div class="connection-card">
+      <div class="connection-visual" aria-hidden="true">
+        <span class="connection-orbit orbit-one"></span>
+        <span class="connection-orbit orbit-two"></span>
+        <span class="connection-screen"><i></i></span>
+      </div>
+      <div class="connection-meta"><span><i></i> 实时安全连接</span><time id="connection-elapsed">0.0 秒</time></div>
+      <h1 id="connection-title">正在连接服务</h1>
+      <p id="connection-description">建立实时信令通道，准备发起远程会话</p>
+      <div class="connection-progress-track" aria-hidden="true"><span class="connection-progress-fill"></span></div>
+      <ol class="connection-steps">${steps}</ol>
+    </div>
+  </section>`;
 }
 
 function physicalVideoArea(video: HTMLVideoElement): { width: number; height: number } {

@@ -80,14 +80,28 @@ impl HostConfig {
         if config.h264_file.is_some() && config.ffmpeg_path.is_some() {
             bail!("h264_file and ffmpeg_path are mutually exclusive");
         }
-        if !matches!(config.ffmpeg_encoder.as_str(), "h264_nvenc" | "h264_amf") {
-            bail!("ffmpeg_encoder must be h264_nvenc or h264_amf");
-        }
-        if !matches!(config.ffmpeg_capture_mode.as_str(), "gdigrab" | "ddagrab") {
-            bail!("ffmpeg_capture_mode must be gdigrab or ddagrab");
-        }
-        if config.ffmpeg_capture_mode == "ddagrab" && config.ffmpeg_encoder != "h264_nvenc" {
-            bail!("ddagrab currently requires h264_nvenc on this host");
+        if config.ffmpeg_path.is_some() {
+            if !matches!(
+                config.ffmpeg_encoder.as_str(),
+                "h264_nvenc" | "h264_amf" | "libx264"
+            ) {
+                bail!(
+                    "ffmpeg_encoder must be h264_nvenc, h264_amf, or libx264 when ffmpeg_path is set"
+                );
+            }
+            if !matches!(config.ffmpeg_capture_mode.as_str(), "gdigrab" | "ddagrab") {
+                bail!("ffmpeg_capture_mode must be gdigrab or ddagrab when ffmpeg_path is set");
+            }
+            if config.ffmpeg_capture_mode == "ddagrab" && config.ffmpeg_encoder != "h264_nvenc" {
+                bail!("ddagrab currently requires h264_nvenc on this host");
+            }
+            if config.ffmpeg_encoder == "libx264" && config.ffmpeg_capture_mode != "gdigrab" {
+                bail!("libx264 requires gdigrab capture");
+            }
+        } else if config.ffmpeg_encoder != "mf_h264" || config.ffmpeg_capture_mode != "wgc" {
+            bail!(
+                "the native Windows pipeline requires ffmpeg_encoder=mf_h264 and ffmpeg_capture_mode=wgc"
+            );
         }
         if (config.ffmpeg_capture_width == 0) != (config.ffmpeg_capture_height == 0) {
             bail!("ffmpeg capture width and height must both be zero or both be non-zero");
@@ -184,11 +198,11 @@ const fn default_bitrate() -> u32 {
 }
 
 fn default_ffmpeg_encoder() -> String {
-    "h264_nvenc".into()
+    "mf_h264".into()
 }
 
 fn default_ffmpeg_capture_mode() -> String {
-    "gdigrab".into()
+    "wgc".into()
 }
 
 #[cfg(test)]
@@ -208,8 +222,8 @@ mod tests {
             monitor_index: 0,
             h264_file: None,
             ffmpeg_path: None,
-            ffmpeg_encoder: "h264_nvenc".into(),
-            ffmpeg_capture_mode: "gdigrab".into(),
+            ffmpeg_encoder: "mf_h264".into(),
+            ffmpeg_capture_mode: "wgc".into(),
             ffmpeg_capture_x: 0,
             ffmpeg_capture_y: 0,
             ffmpeg_capture_width: 2560,

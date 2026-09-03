@@ -29,9 +29,14 @@ RUN_DIR = ROOT / ".run"
 TOOLS_DIR = ROOT / ".tools"
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 DEFAULT_PORT = 8080
+TURN_TCP_PORT = 3478
+TURN_RELAY_MIN_PORT = 49160
+TURN_RELAY_MAX_PORT = 49200
+TURN_REALM = "super-remote"
 DEVICE_ID = "local-windows-pc"
 PERMANENT_EXPIRY = 253_402_300_799  # 9999-12-31T23:59:59Z
 PRODUCTION_MANIFEST = ROOT / "production-manifest.json"
+OBSOLETE_ICE_TCP_FIREWALL_RULE = "Super Remote Host ICE-TCP"
 
 
 def is_process_elevated() -> bool:
@@ -144,6 +149,7 @@ def stop_existing_stack() -> None:
     expected = {
         "host_pid": (ROOT / "target" / "release" / "remote-host.exe").resolve(),
         "signaling_pid": (ROOT / "target" / "release" / "remote-signaling.exe").resolve(),
+        "turn_pid": (ROOT / "target" / "release" / "remote-turn.exe").resolve(),
     }
     stopped_process_ids: list[int] = []
     for key, expected_path in expected.items():
@@ -172,6 +178,76 @@ def run(command: list[str], *, env: dict[str, str] | None = None) -> None:
     subprocess.run(command, cwd=ROOT, env=env, check=True)
 
 
+def remove_obsolete_ice_tcp_firewall_rule(host_executable: Path) -> None:
+    """Remove the ICE-TCP rule installed by the short-lived fallback release."""
+    subprocess.run(
+        [
+            "netsh.exe",
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            f"name={OBSOLETE_ICE_TCP_FIREWALL_RULE}",
+            f"program={host_executable.resolve()}",
+        ],
+        cwd=ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def configure_turn_firewall(udp_port: int) -> None:
+    """Allow only LAN clients to reach TURN control and its bounded relay range."""
+    rules = (
+        ("Super Remote TURN TCP", "TCP", str(TURN_TCP_PORT)),
+        ("Super Remote TURN UDP", "UDP", str(udp_port)),
+        (
+            "Super Remote TURN Relay UDP",
+            "UDP",
+            f"{TURN_RELAY_MIN_PORT}-{TURN_RELAY_MAX_PORT}",
+        ),
+    )
+    for name, protocol, local_port in rules:
+        subprocess.run(
+            [
+                "netsh.exe",
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                f"name={name}",
+            ],
+            cwd=ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        result = subprocess.run(
+            [
+                "netsh.exe",
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                f"name={name}",
+                "dir=in",
+                "action=allow",
+                f"protocol={protocol}",
+                f"localport={local_port}",
+                "remoteip=localsubnet",
+                "profile=any",
+                "enable=yes",
+            ],
+            cwd=ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"无法配置 TURN 防火墙规则：{name}")
+
+
 def validate_production_package() -> None:
     required = [
         ROOT / "web" / "dist" / "index.html",
@@ -179,6 +255,7 @@ def validate_production_package() -> None:
             "remote-signaling.exe",
             "remote-host.exe",
             "remote-control-panel.exe",
+            "remote-turn.exe",
         )),
     ]
     missing = [str(path.relative_to(ROOT)) for path in required if not path.is_file()]
@@ -400,6 +477,24 @@ def wait_for_health(base_url: str, process: subprocess.Popen[bytes], timeout: fl
     raise RuntimeError("等待信令服务超时")
 
 
+def wait_for_tcp_listener(
+    address: str,
+    port: int,
+    process: subprocess.Popen[bytes],
+    timeout: float = 10,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("TURN 服务启动失败，请查看 .run/turn.log")
+        try:
+            with socket.create_connection((address, port), timeout=0.5):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise RuntimeError("等待 TURN/TCP 服务超时")
+
+
 def wait_for_device(base_url: str, token: str, process: subprocess.Popen[bytes], timeout: float = 20) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -455,13 +550,18 @@ def main() -> int:
         credentials = {
             "jwt_secret": secrets.token_urlsafe(48),
             "device_token": secrets.token_urlsafe(36),
+            "turn_secret": secrets.token_urlsafe(48),
             "username": "admin",
             "password": secrets.token_urlsafe(12),
             "port": DEFAULT_PORT,
         }
         secrets_file.write_text(json.dumps(credentials, indent=2), encoding="utf-8")
     credentials_changed = False
-    for key, default in (("username", "admin"), ("port", DEFAULT_PORT)):
+    for key, default in (
+        ("username", "admin"),
+        ("port", DEFAULT_PORT),
+        ("turn_secret", secrets.token_urlsafe(48)),
+    ):
         if key not in credentials:
             credentials[key] = default
             credentials_changed = True
@@ -472,18 +572,22 @@ def main() -> int:
     username = credentials.get("username")
     password = credentials.get("password")
     port = credentials.get("port")
+    turn_secret = credentials.get("turn_secret")
     if not isinstance(username, str) or not username.strip():
         raise RuntimeError("登录账号不能为空")
     if not isinstance(password, str) or len(password.encode("utf-8")) < 12:
         raise RuntimeError("登录密码必须至少包含 12 个 UTF-8 字节")
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise RuntimeError("Web 服务端口必须是 1 到 65535 之间的整数")
+    if not isinstance(turn_secret, str) or len(turn_secret.encode("utf-8")) < 32:
+        raise RuntimeError("TURN 密钥必须至少包含 32 个 UTF-8 字节")
 
     if production_package:
         print("检测到生产二进制包，跳过 npm/Cargo 编译。", flush=True)
     else:
         run(["npm.cmd", "--prefix", "web", "install", "--no-audit", "--no-fund"])
         run(["npm.cmd", "--prefix", "web", "run", "build"])
+        run([sys.executable, str(ROOT / "build_turn_server.py")])
         build_command = [
             "cargo",
             "build",
@@ -524,6 +628,14 @@ def main() -> int:
     tomllib.loads(host_config_text)
     host_config.write_text(host_config_text, encoding="utf-8")
 
+    remove_obsolete_ice_tcp_firewall_rule(ROOT / "target" / "release" / "remote-host.exe")
+    # Reuse the Web origin's numeric port for TURN/UDP. TCP 8089 remains the
+    # HTTP/WebSocket service, while UDP 8089 is a separate socket and gives
+    # macOS Chrome a relay endpoint on the exact LAN address/port it already
+    # reached to load the application.
+    turn_udp_port = port
+    configure_turn_firewall(turn_udp_port)
+
     env = os.environ.copy()
     env.update(
         {
@@ -533,22 +645,56 @@ def main() -> int:
             "REMOTE_ADMIN_USER": username,
             "REMOTE_ADMIN_PASSWORD": password,
             "REMOTE_DEVICE_TOKEN": credentials["device_token"],
+            # Chrome on macOS can silently fail TURN/TCP candidate gathering
+            # while Safari on the same machine succeeds over UDP. Advertise
+            # both transports, with UDP first, so relay-only Chromium still
+            # has a working LAN path and TCP remains the fallback.
+            "REMOTE_TURN_URLS": (
+                f"turn:{ip}:{turn_udp_port}?transport=udp,"
+                f"turn:{ip}:{TURN_TCP_PORT}?transport=tcp"
+            ),
+            "REMOTE_TURN_SECRET": turn_secret,
             "RUST_LOG": "remote_signaling=info,remote_host=info",
         }
     )
+    turn_log = (RUN_DIR / "turn.log").open("ab", buffering=0)
     signaling_log = (RUN_DIR / "signaling.log").open("ab", buffering=0)
     host_log = (RUN_DIR / "host.log").open("ab", buffering=0)
     creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
-    signaling = subprocess.Popen(
-        [str(ROOT / "target" / "release" / "remote-signaling.exe")],
+    turn = subprocess.Popen(
+        [
+            str(ROOT / "target" / "release" / "remote-turn.exe"),
+            "--public-ip",
+            ip,
+            "--realm",
+            TURN_REALM,
+            "--tcp-port",
+            str(TURN_TCP_PORT),
+            "--udp-port",
+            str(turn_udp_port),
+            "--min-port",
+            str(TURN_RELAY_MIN_PORT),
+            "--max-port",
+            str(TURN_RELAY_MAX_PORT),
+        ],
         cwd=ROOT,
         env=env,
-        stdout=signaling_log,
+        stdout=turn_log,
         stderr=subprocess.STDOUT,
         creationflags=creation_flags,
     )
+    signaling: subprocess.Popen[bytes] | None = None
     host: subprocess.Popen[bytes] | None = None
     try:
+        wait_for_tcp_listener(ip, TURN_TCP_PORT, turn)
+        signaling = subprocess.Popen(
+            [str(ROOT / "target" / "release" / "remote-signaling.exe")],
+            cwd=ROOT,
+            env=env,
+            stdout=signaling_log,
+            stderr=subprocess.STDOUT,
+            creationflags=creation_flags,
+        )
         wait_for_health(base_url, signaling)
         access_token = permanent_access_token(credentials["jwt_secret"], username)
         host = subprocess.Popen(
@@ -575,6 +721,13 @@ def main() -> int:
             "port": port,
             "signaling_pid": signaling.pid,
             "host_pid": host.pid,
+            "turn_pid": turn.pid,
+            "turn_url": f"turn:{ip}:{turn_udp_port}?transport=udp",
+            "turn_urls": [
+                f"turn:{ip}:{turn_udp_port}?transport=udp",
+                f"turn:{ip}:{TURN_TCP_PORT}?transport=tcp",
+            ],
+            "turn_relay_ports": f"{TURN_RELAY_MIN_PORT}-{TURN_RELAY_MAX_PORT}/udp",
             "launcher_pid": os.getpid(),
             "desktop": f"{desktop_width}x{desktop_height}",
             "primary_display": f"{primary_width}x{primary_height}",
@@ -599,16 +752,30 @@ def main() -> int:
         print(f"手机访问：{base_url}", flush=True)
         print(f"二维码：{qr_path}", flush=True)
         print("二维码内含长期访问令牌；请勿转发。按 Ctrl+C 停止。", flush=True)
-        while signaling.poll() is None and host.poll() is None:
+        while turn.poll() is None and signaling.poll() is None and host.poll() is None:
             time.sleep(1)
-        raise RuntimeError("子进程意外退出，请查看 .run 目录中的日志")
+        exited = []
+        for name, process in (
+            ("remote-turn", turn),
+            ("remote-signaling", signaling),
+            ("remote-host", host),
+        ):
+            if process is None:
+                continue
+            return_code = process.poll()
+            if return_code is not None:
+                exited.append(f"{name}（退出码 {return_code}）")
+        raise RuntimeError(
+            f"{'、'.join(exited) or '子进程'}意外退出，请查看 .run 目录中的日志"
+        )
     except KeyboardInterrupt:
         print("\n正在停止…", flush=True)
         return 0
     finally:
-        for process in (host, signaling):
+        for process in (host, signaling, turn):
             if process is not None and process.poll() is None:
                 process.terminate()
+        turn_log.close()
         signaling_log.close()
         host_log.close()
 

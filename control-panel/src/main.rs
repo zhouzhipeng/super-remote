@@ -22,11 +22,14 @@ mod windows_app {
         Win32::{
             Foundation::{
                 COLORREF, CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM,
-                LRESULT, WAIT_TIMEOUT, WPARAM,
+                LRESULT, RECT, WAIT_TIMEOUT, WPARAM,
             },
             Graphics::Gdi::{
-                BLACK_BRUSH, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH,
-                FF_DONTCARE, FW_NORMAL, GetStockObject, HBRUSH, HGDIOBJ, PROOF_QUALITY,
+                BLACK_BRUSH, BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET,
+                DEFAULT_PITCH, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW,
+                EndPaint, FF_DONTCARE, FW_NORMAL, FillRect, GetStockObject, HBRUSH, HDC, HGDIOBJ,
+                PAINTSTRUCT, PROOF_QUALITY, PS_SOLID, RoundRect, SelectObject, SetBkColor,
+                SetBkMode, SetTextColor, TRANSPARENT,
             },
             Media::Audio::{
                 Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole,
@@ -44,31 +47,34 @@ mod windows_app {
                 },
             },
             UI::{
+                Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_SELECTED},
                 HiDpi::{
                     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
                     SetProcessDpiAwarenessContext,
                 },
                 Shell::ShellExecuteW,
                 WindowsAndMessaging::{
-                    BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_PUSHBUTTON,
+                    BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_OWNERDRAW,
                     CREATESTRUCTW, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
                     DispatchMessageW, ES_AUTOHSCROLL, ES_PASSWORD, FindWindowW, GWLP_USERDATA,
-                    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowTextLengthW,
-                    GetWindowTextW, HHOOK, HMENU, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW,
-                    KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, LLMHF_INJECTED,
-                    LLMHF_LOWER_IL_INJECTED, LWA_ALPHA, LoadCursorW, MB_ICONERROR, MB_OK, MSG,
-                    MSLLHOOKSTRUCT, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
-                    SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
-                    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_RESTORE, SW_SHOWNA,
-                    SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW,
-                    SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
-                    SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-                    SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
-                    WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE,
-                    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE,
-                    WM_NCHITTEST, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD,
-                    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-                    WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+                    GetClientRect, GetMessageW, GetSystemMetrics, GetWindowLongPtrW,
+                    GetWindowTextLengthW, GetWindowTextW, HHOOK, HMENU, HTTRANSPARENT,
+                    HWND_TOPMOST, IDC_ARROW, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+                    LLKHF_LOWER_IL_INJECTED, LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED, LWA_ALPHA,
+                    LoadCursorW, MB_ICONERROR, MB_OK, MSG, MSLLHOOKSTRUCT, MessageBoxW,
+                    PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSCREEN, SM_CXVIRTUALSCREEN,
+                    SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE,
+                    SW_RESTORE, SW_SHOWNA, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER,
+                    SWP_SHOWWINDOW, SendMessageW, SetForegroundWindow, SetLayeredWindowAttributes,
+                    SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
+                    SetWindowTextW, SetWindowsHookExW, ShowWindow, TranslateMessage,
+                    UnhookWindowsHookEx, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WH_MOUSE_LL,
+                    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE,
+                    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM,
+                    WM_GETFONT, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_SETFONT, WM_TIMER,
+                    WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+                    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW,
+                    WS_POPUP, WS_TABSTOP, WS_VISIBLE,
                 },
             },
         },
@@ -93,6 +99,20 @@ mod windows_app {
     const ID_WEB_PORT: usize = 111;
     const WM_LOCAL_PHYSICAL_INPUT: u32 = WM_APP + 1;
 
+    const COLOR_BACKGROUND: COLORREF = rgb(244, 247, 251);
+    const COLOR_HEADER: COLORREF = rgb(15, 23, 42);
+    const COLOR_CARD: COLORREF = rgb(255, 255, 255);
+    const COLOR_BORDER: COLORREF = rgb(226, 232, 240);
+    const COLOR_TEXT: COLORREF = rgb(30, 41, 59);
+    const COLOR_MUTED: COLORREF = rgb(100, 116, 139);
+    const COLOR_PRIMARY: COLORREF = rgb(37, 99, 235);
+    const COLOR_SUCCESS: COLORREF = rgb(22, 163, 74);
+    const COLOR_DANGER: COLORREF = rgb(220, 38, 38);
+
+    const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
+        COLORREF(red as u32 | ((green as u32) << 8) | ((blue as u32) << 16))
+    }
+
     static LOCAL_INPUT_WINDOW: AtomicIsize = AtomicIsize::new(0);
     static LOCAL_INPUT_ARMED: AtomicBool = AtomicBool::new(false);
 
@@ -110,7 +130,7 @@ mod windows_app {
         #[serde(default)]
         elevated: bool,
         #[serde(default)]
-        python_executable: String,
+        launcher_executable: String,
     }
 
     #[derive(Clone, Default, Deserialize)]
@@ -206,16 +226,25 @@ mod windows_app {
         root: PathBuf,
         run_dir: PathBuf,
         window: HWND,
+        title_label: HWND,
+        subtitle_label: HWND,
         service_label: HWND,
         client_label: HWND,
         video_label: HWND,
         address_label: HWND,
+        section_label: HWND,
+        credential_help: HWND,
         policy_label: HWND,
         audio_policy_label: HWND,
         action_label: HWND,
         port_edit: HWND,
         username_edit: HWND,
         password_edit: HWND,
+        start_button: HWND,
+        stop_button: HWND,
+        restart_button: HWND,
+        open_web_button: HWND,
+        open_qr_button: HWND,
         privacy_checkbox: HWND,
         host_mute_checkbox: HWND,
         overlay: HWND,
@@ -223,27 +252,42 @@ mod windows_app {
         privacy_visible: bool,
         privacy_latched: bool,
         client_connected: bool,
+        service_buttons_running: Option<bool>,
         audio_mute: Option<AudioMuteLease>,
         settings: PanelSettings,
+        background_brush: HBRUSH,
+        header_brush: HBRUSH,
+        card_brush: HBRUSH,
     }
 
     impl App {
         fn empty(root: PathBuf) -> Self {
-            let run_dir = root.join(".run");
+            let run_dir = std::env::var_os("SUPER_REMOTE_DATA_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| root.join(".run"));
             Self {
                 root,
                 run_dir,
                 window: HWND::default(),
+                title_label: HWND::default(),
+                subtitle_label: HWND::default(),
                 service_label: HWND::default(),
                 client_label: HWND::default(),
                 video_label: HWND::default(),
                 address_label: HWND::default(),
+                section_label: HWND::default(),
+                credential_help: HWND::default(),
                 policy_label: HWND::default(),
                 audio_policy_label: HWND::default(),
                 action_label: HWND::default(),
                 port_edit: HWND::default(),
                 username_edit: HWND::default(),
                 password_edit: HWND::default(),
+                start_button: HWND::default(),
+                stop_button: HWND::default(),
+                restart_button: HWND::default(),
+                open_web_button: HWND::default(),
+                open_qr_button: HWND::default(),
                 privacy_checkbox: HWND::default(),
                 host_mute_checkbox: HWND::default(),
                 overlay: HWND::default(),
@@ -251,17 +295,21 @@ mod windows_app {
                 privacy_visible: false,
                 privacy_latched: false,
                 client_connected: false,
+                service_buttons_running: None,
                 audio_mute: None,
                 settings: PanelSettings::default(),
+                background_brush: unsafe { CreateSolidBrush(COLOR_BACKGROUND) },
+                header_brush: unsafe { CreateSolidBrush(COLOR_HEADER) },
+                card_brush: unsafe { CreateSolidBrush(COLOR_CARD) },
             }
         }
 
         unsafe fn create_controls(&mut self, instance: HINSTANCE) -> windows::core::Result<()> {
             let dpi = unsafe { GetDpiForWindow(self.window) } as i32;
             let scale = |value: i32| value * dpi / 96;
-            let font = unsafe {
+            let base_font = unsafe {
                 CreateFontW(
-                    scale(-18),
+                    scale(-15),
                     0,
                     0,
                     0,
@@ -274,12 +322,12 @@ mod windows_app {
                     Default::default(),
                     PROOF_QUALITY,
                     u32::from(DEFAULT_PITCH.0 | FF_DONTCARE.0),
-                    w!("Microsoft YaHei UI"),
+                    w!("Segoe UI"),
                 )
             };
             let title_font = unsafe {
                 CreateFontW(
-                    scale(-26),
+                    scale(-28),
                     0,
                     0,
                     0,
@@ -292,24 +340,78 @@ mod windows_app {
                     Default::default(),
                     PROOF_QUALITY,
                     u32::from(DEFAULT_PITCH.0 | FF_DONTCARE.0),
-                    w!("Microsoft YaHei UI"),
+                    w!("Segoe UI"),
                 )
             };
-            let title = unsafe {
+            let section_font = unsafe {
+                CreateFontW(
+                    scale(-14),
+                    0,
+                    0,
+                    0,
+                    600,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET,
+                    Default::default(),
+                    Default::default(),
+                    PROOF_QUALITY,
+                    u32::from(DEFAULT_PITCH.0 | FF_DONTCARE.0),
+                    w!("Segoe UI"),
+                )
+            };
+            let detail_font = unsafe {
+                CreateFontW(
+                    scale(-13),
+                    0,
+                    0,
+                    0,
+                    FW_NORMAL.0 as i32,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET,
+                    Default::default(),
+                    Default::default(),
+                    PROOF_QUALITY,
+                    u32::from(DEFAULT_PITCH.0 | FF_DONTCARE.0),
+                    w!("Segoe UI"),
+                )
+            };
+
+            self.title_label = unsafe {
                 child(
                     self.window,
                     instance,
                     w!("STATIC"),
                     w!("Super Remote"),
                     scale(28),
-                    scale(22),
-                    scale(540),
-                    scale(42),
+                    scale(12),
+                    scale(620),
+                    scale(38),
                     0,
                     0,
                 )?
             };
-            unsafe { set_font(title, title_font.into()) };
+            self.subtitle_label = unsafe {
+                child(
+                    self.window,
+                    instance,
+                    w!("STATIC"),
+                    w!("安全、轻量的局域网远程控制"),
+                    scale(30),
+                    scale(50),
+                    scale(620),
+                    scale(20),
+                    0,
+                    0,
+                )?
+            };
+            unsafe {
+                set_font(self.title_label, title_font.into());
+                set_font(self.subtitle_label, detail_font.into());
+            }
 
             self.service_label = unsafe {
                 child(
@@ -317,10 +419,10 @@ mod windows_app {
                     instance,
                     w!("STATIC"),
                     w!("服务状态：正在读取…"),
-                    scale(30),
-                    scale(78),
-                    scale(540),
-                    scale(30),
+                    scale(42),
+                    scale(103),
+                    scale(616),
+                    scale(24),
                     0,
                     0,
                 )?
@@ -331,10 +433,10 @@ mod windows_app {
                     instance,
                     w!("STATIC"),
                     w!("Web 客户端：—"),
-                    scale(30),
-                    scale(112),
-                    scale(540),
-                    scale(30),
+                    scale(42),
+                    scale(135),
+                    scale(616),
+                    scale(24),
                     0,
                     0,
                 )?
@@ -345,10 +447,10 @@ mod windows_app {
                     instance,
                     w!("STATIC"),
                     w!("视频：—"),
-                    scale(30),
-                    scale(146),
-                    scale(540),
-                    scale(30),
+                    scale(42),
+                    scale(167),
+                    scale(616),
+                    scale(24),
                     0,
                     0,
                 )?
@@ -359,88 +461,111 @@ mod windows_app {
                     instance,
                     w!("STATIC"),
                     w!("访问地址：—"),
-                    scale(30),
-                    scale(180),
-                    scale(540),
-                    scale(30),
+                    scale(42),
+                    scale(199),
+                    scale(616),
+                    scale(24),
                     0,
                     0,
                 )?
             };
 
             unsafe {
-                child(
+                self.start_button = child(
                     self.window,
                     instance,
                     w!("BUTTON"),
                     w!("启动"),
-                    scale(30),
-                    scale(228),
-                    scale(104),
-                    scale(38),
-                    BS_PUSHBUTTON as u32,
+                    scale(24),
+                    scale(254),
+                    scale(112),
+                    scale(40),
+                    BS_OWNERDRAW as u32,
                     ID_START,
                 )?;
-                child(
+                self.stop_button = child(
                     self.window,
                     instance,
                     w!("BUTTON"),
                     w!("停止"),
-                    scale(144),
-                    scale(228),
-                    scale(104),
-                    scale(38),
-                    BS_PUSHBUTTON as u32,
+                    scale(24),
+                    scale(254),
+                    scale(112),
+                    scale(40),
+                    BS_OWNERDRAW as u32,
                     ID_STOP,
                 )?;
-                child(
+                self.restart_button = child(
                     self.window,
                     instance,
                     w!("BUTTON"),
                     w!("重启"),
-                    scale(258),
-                    scale(228),
-                    scale(104),
-                    scale(38),
-                    BS_PUSHBUTTON as u32,
+                    scale(146),
+                    scale(254),
+                    scale(112),
+                    scale(40),
+                    BS_OWNERDRAW as u32,
                     ID_RESTART,
                 )?;
-                child(
+                self.open_web_button = child(
                     self.window,
                     instance,
                     w!("BUTTON"),
                     w!("打开网页"),
-                    scale(372),
-                    scale(228),
-                    scale(104),
-                    scale(38),
-                    BS_PUSHBUTTON as u32,
+                    scale(268),
+                    scale(254),
+                    scale(134),
+                    scale(40),
+                    BS_OWNERDRAW as u32,
                     ID_OPEN_WEB,
                 )?;
-                child(
+                self.open_qr_button = child(
                     self.window,
                     instance,
                     w!("BUTTON"),
                     w!("查看二维码"),
-                    scale(486),
-                    scale(228),
-                    scale(104),
-                    scale(38),
-                    BS_PUSHBUTTON as u32,
+                    scale(412),
+                    scale(254),
+                    scale(142),
+                    scale(40),
+                    BS_OWNERDRAW as u32,
                     ID_OPEN_QR,
                 )?;
+                for button in [
+                    self.start_button,
+                    self.stop_button,
+                    self.restart_button,
+                    self.open_web_button,
+                    self.open_qr_button,
+                ] {
+                    set_font(button, section_font.into());
+                }
             }
 
+            self.section_label = unsafe {
+                child(
+                    self.window,
+                    instance,
+                    w!("STATIC"),
+                    w!("连接与访问"),
+                    scale(40),
+                    scale(323),
+                    scale(620),
+                    scale(22),
+                    0,
+                    0,
+                )?
+            };
             let port_label = unsafe {
                 child(
                     self.window,
                     instance,
                     w!("STATIC"),
                     w!("Web 端口"),
-                    scale(30),
-                    scale(296),
-                    scale(110),
-                    scale(32),
+                    scale(40),
+                    scale(353),
+                    scale(90),
+                    scale(20),
                     0,
                     0,
                 )?
@@ -451,10 +576,10 @@ mod windows_app {
                     instance,
                     w!("EDIT"),
                     w!("8080"),
-                    scale(140),
-                    scale(288),
+                    scale(40),
+                    scale(375),
                     scale(90),
-                    scale(38),
+                    scale(34),
                     WS_BORDER.0 | ES_AUTOHSCROLL as u32,
                     ID_WEB_PORT,
                 )?
@@ -465,10 +590,10 @@ mod windows_app {
                     instance,
                     w!("STATIC"),
                     w!("登录账号"),
-                    scale(250),
-                    scale(296),
-                    scale(90),
-                    scale(32),
+                    scale(148),
+                    scale(353),
+                    scale(100),
+                    scale(20),
                     0,
                     0,
                 )?
@@ -479,10 +604,10 @@ mod windows_app {
                     instance,
                     w!("EDIT"),
                     w!("admin"),
-                    scale(340),
-                    scale(288),
-                    scale(250),
-                    scale(38),
+                    scale(148),
+                    scale(375),
+                    scale(190),
+                    scale(34),
                     WS_BORDER.0 | ES_AUTOHSCROLL as u32,
                     ID_LOGIN_USERNAME,
                 )?
@@ -493,10 +618,10 @@ mod windows_app {
                     instance,
                     w!("STATIC"),
                     w!("登录密码"),
-                    scale(30),
-                    scale(342),
-                    scale(90),
-                    scale(32),
+                    scale(356),
+                    scale(353),
+                    scale(100),
+                    scale(20),
                     0,
                     0,
                 )?
@@ -507,10 +632,10 @@ mod windows_app {
                     instance,
                     w!("EDIT"),
                     w!(""),
-                    scale(120),
-                    scale(334),
-                    scale(270),
-                    scale(38),
+                    scale(356),
+                    scale(375),
+                    scale(172),
+                    scale(34),
                     WS_BORDER.0 | ES_AUTOHSCROLL as u32 | ES_PASSWORD as u32,
                     ID_LOGIN_PASSWORD,
                 )?
@@ -521,24 +646,24 @@ mod windows_app {
                     instance,
                     w!("BUTTON"),
                     w!("保存并重启服务"),
-                    scale(438),
-                    scale(334),
-                    scale(152),
-                    scale(38),
-                    BS_PUSHBUTTON as u32,
+                    scale(546),
+                    scale(375),
+                    scale(114),
+                    scale(34),
+                    BS_OWNERDRAW as u32,
                     ID_SAVE_LOGIN,
                 )?
             };
-            let credential_help = unsafe {
+            self.credential_help = unsafe {
                 child(
                     self.window,
                     instance,
                     w!("STATIC"),
                     w!("端口范围 1–65535；密码至少 12 字节，留空则保留。"),
-                    scale(30),
-                    scale(386),
-                    scale(560),
-                    scale(32),
+                    scale(40),
+                    scale(419),
+                    scale(620),
+                    scale(20),
                     0,
                     0,
                 )?
@@ -550,10 +675,10 @@ mod windows_app {
                     instance,
                     w!("BUTTON"),
                     w!("Web 客户端连接后启用本机隐私黑屏"),
-                    scale(30),
-                    scale(430),
-                    scale(550),
-                    scale(32),
+                    scale(40),
+                    scale(479),
+                    scale(620),
+                    scale(26),
                     BS_AUTOCHECKBOX as u32,
                     ID_PRIVACY,
                 )?
@@ -564,10 +689,10 @@ mod windows_app {
                     instance,
                     w!("STATIC"),
                     w!("所有显示器变黑；断线后须使用本机键盘或鼠标解除。"),
-                    scale(52),
-                    scale(466),
-                    scale(520),
-                    scale(32),
+                    scale(68),
+                    scale(511),
+                    scale(590),
+                    scale(22),
                     0,
                     0,
                 )?
@@ -578,10 +703,10 @@ mod windows_app {
                     instance,
                     w!("BUTTON"),
                     w!("Web 客户端连接后静音主机声音"),
-                    scale(30),
-                    scale(508),
-                    scale(550),
-                    scale(32),
+                    scale(40),
+                    scale(575),
+                    scale(620),
+                    scale(26),
                     BS_AUTOCHECKBOX as u32,
                     ID_HOST_MUTE,
                 )?
@@ -592,10 +717,10 @@ mod windows_app {
                     instance,
                     w!("STATIC"),
                     w!("静音本机默认播放设备；客户端断开后仍保持静音。"),
-                    scale(52),
-                    scale(544),
-                    scale(520),
-                    scale(32),
+                    scale(68),
+                    scale(607),
+                    scale(590),
+                    scale(22),
                     0,
                     0,
                 )?
@@ -606,10 +731,10 @@ mod windows_app {
                     instance,
                     w!("STATIC"),
                     w!(""),
-                    scale(30),
-                    scale(600),
-                    scale(550),
-                    scale(58),
+                    scale(28),
+                    scale(655),
+                    scale(644),
+                    scale(24),
                     0,
                     0,
                 )?
@@ -620,13 +745,14 @@ mod windows_app {
                 self.client_label,
                 self.video_label,
                 self.address_label,
+                self.section_label,
                 port_label,
                 self.port_edit,
                 username_label,
                 self.username_edit,
                 password_label,
                 self.password_edit,
-                credential_help,
+                self.credential_help,
                 save_login,
                 self.policy_label,
                 self.audio_policy_label,
@@ -634,7 +760,15 @@ mod windows_app {
                 self.privacy_checkbox,
                 self.host_mute_checkbox,
             ] {
-                unsafe { set_font(control, font.into()) };
+                unsafe { set_font(control, base_font.into()) };
+            }
+            unsafe {
+                set_font(self.section_label, section_font.into());
+                set_font(save_login, section_font.into());
+                set_font(self.credential_help, detail_font.into());
+                set_font(self.policy_label, detail_font.into());
+                set_font(self.audio_policy_label, detail_font.into());
+                set_font(self.action_label, detail_font.into());
             }
 
             self.settings =
@@ -712,8 +846,9 @@ mod windows_app {
                 && host.connection_state == "connected"
                 && host.capture_active;
             self.client_connected = connected;
+            self.sync_service_buttons(services_running);
 
-            set_text(
+            set_text_if_changed(
                 self.service_label,
                 &format!(
                     "服务：{} · Host {} · Signaling {}{}",
@@ -731,7 +866,7 @@ mod windows_app {
                     }
                 ),
             );
-            set_text(
+            set_text_if_changed(
                 self.client_label,
                 &format!(
                     "Web 客户端：{}",
@@ -756,7 +891,7 @@ mod windows_app {
             } else {
                 (0, 0, 0, 0, launcher.encoder.as_str(), 0)
             };
-            set_text(
+            set_text_if_changed(
                 self.video_label,
                 &format!(
                     "视频：{}x{} · {} FPS · {:.1} Mbps · {} · 主屏 {}",
@@ -768,7 +903,7 @@ mod windows_app {
                     monitor_index + 1
                 ),
             );
-            set_text(
+            set_text_if_changed(
                 self.address_label,
                 &format!(
                     "地址：{} · 主屏 {} · {}",
@@ -812,6 +947,27 @@ mod windows_app {
             self.write_runtime_state(services_running, connected);
         }
 
+        fn sync_service_buttons(&mut self, services_running: bool) {
+            if self.service_buttons_running == Some(services_running) {
+                return;
+            }
+            unsafe {
+                let _ = ShowWindow(
+                    self.start_button,
+                    if services_running { SW_HIDE } else { SW_SHOWNA },
+                );
+                for button in [
+                    self.stop_button,
+                    self.restart_button,
+                    self.open_web_button,
+                    self.open_qr_button,
+                ] {
+                    let _ = ShowWindow(button, if services_running { SW_SHOWNA } else { SW_HIDE });
+                }
+            }
+            self.service_buttons_running = Some(services_running);
+        }
+
         fn set_privacy_visible(&mut self, visible: bool) {
             if self.overlay.0.is_null() {
                 return;
@@ -838,7 +994,7 @@ mod windows_app {
                 self.privacy_visible = visible;
             }
             if visible {
-                set_text(
+                set_text_if_changed(
                     self.action_label,
                     if self.client_connected {
                         "所有显示器隐私黑屏已启用；断线后需使用本机键盘或鼠标解除。"
@@ -847,7 +1003,7 @@ mod windows_app {
                     },
                 );
             } else if visibility_changed {
-                set_text(self.action_label, "");
+                set_text_if_changed(self.action_label, "");
             }
         }
 
@@ -979,16 +1135,16 @@ mod windows_app {
                     shell_open(&launcher.qr, &self.root);
                 }
                 Action::Start | Action::Stop | Action::Restart => {
-                    let python = if launcher.python_executable.is_empty() {
-                        "python".into()
+                    let executable = if launcher.launcher_executable.is_empty() {
+                        self.root.join("super-remote.exe")
                     } else {
-                        launcher.python_executable
+                        PathBuf::from(launcher.launcher_executable)
                     };
                     let mut arguments = vec!["--from-control-panel"];
                     if matches!(kind, Action::Stop) {
                         arguments.push("--stop");
                     }
-                    spawn_launcher(&self.root, &python, &arguments);
+                    spawn_launcher(&self.root, &executable, &arguments);
                     set_text(
                         self.action_label,
                         match kind {
@@ -1060,7 +1216,7 @@ mod windows_app {
 
         let mut app = Box::new(App::empty(root));
         let app_ptr = (&mut *app) as *mut App;
-        let panel_width = 640;
+        let panel_width = 700;
         let panel_height = 720;
         let panel_x = (unsafe { GetSystemMetrics(SM_CXSCREEN) } - panel_width) / 2;
         let panel_y = (unsafe { GetSystemMetrics(SM_CYSCREEN) } - panel_height) / 2;
@@ -1084,7 +1240,7 @@ mod windows_app {
         unsafe {
             let dpi = GetDpiForWindow(app.window) as i32;
             let scale = |value: i32| value * dpi / 96;
-            let scaled_width = scale(640);
+            let scaled_width = scale(700);
             let scaled_height = scale(720);
             let scaled_x = (GetSystemMetrics(SM_CXSCREEN) - scaled_width) / 2;
             let scaled_y = (GetSystemMetrics(SM_CYSCREEN) - scaled_height) / 2;
@@ -1103,9 +1259,9 @@ mod windows_app {
             app.create_overlay(instance)
                 .map_err(|error| error.to_string())?;
             let _local_input_hooks = LocalInputHooks::install(app.window, instance)?;
+            app.refresh();
             let _ = ShowWindow(app.window, SW_SHOWNORMAL);
             SetTimer(Some(app.window), 1, 500, None);
-            app.refresh();
 
             let mut message = MSG::default();
             while GetMessageW(&mut message, None, 0, 0).as_bool() {
@@ -1154,8 +1310,13 @@ mod windows_app {
         {
             return PathBuf::from(argument);
         }
-        std::env::current_exe()
-            .ok()
+        let executable = std::env::current_exe().ok();
+        if let Some(directory) = executable.as_deref().and_then(Path::parent)
+            && directory.join("super-remote.exe").is_file()
+        {
+            return directory.to_path_buf();
+        }
+        executable
             .and_then(|path| path.parent()?.parent()?.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| PathBuf::from("."))
     }
@@ -1271,7 +1432,7 @@ mod windows_app {
 
     fn register_classes(instance: HINSTANCE) -> Result<(), String> {
         let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }.map_err(|error| error.to_string())?;
-        let panel_brush = unsafe { CreateSolidBrush(COLORREF(0x00f7f7f7)) };
+        let panel_brush = unsafe { CreateSolidBrush(COLOR_BACKGROUND) };
         let black = unsafe { GetStockObject(BLACK_BRUSH) };
         let panel = WNDCLASSW {
             hCursor: cursor,
@@ -1295,6 +1456,179 @@ mod windows_app {
         Ok(())
     }
 
+    unsafe fn paint_panel(window: HWND, app: &App) {
+        let mut paint = PAINTSTRUCT::default();
+        let hdc = unsafe { BeginPaint(window, &mut paint) };
+        let mut client = RECT::default();
+        if unsafe { GetClientRect(window, &mut client) }.is_ok() {
+            unsafe {
+                FillRect(hdc, &client, app.background_brush);
+            }
+            let dpi = unsafe { GetDpiForWindow(window) } as i32;
+            let scale = |value: i32| value * dpi / 96;
+            let header = RECT {
+                left: 0,
+                top: 0,
+                right: client.right,
+                bottom: scale(78),
+            };
+            unsafe {
+                FillRect(hdc, &header, app.header_brush);
+            }
+
+            let border_pen = unsafe { CreatePen(PS_SOLID, 1, COLOR_BORDER) };
+            let old_pen = unsafe { SelectObject(hdc, border_pen.into()) };
+            let old_brush = unsafe { SelectObject(hdc, app.card_brush.into()) };
+            for (left, top, right, bottom) in [
+                (24, 92, 676, 238),
+                (24, 310, 676, 451),
+                (24, 467, 676, 547),
+                (24, 563, 676, 643),
+            ] {
+                unsafe {
+                    let _ = RoundRect(
+                        hdc,
+                        scale(left),
+                        scale(top),
+                        scale(right),
+                        scale(bottom),
+                        scale(12),
+                        scale(12),
+                    );
+                }
+            }
+            unsafe {
+                SelectObject(hdc, old_brush);
+                SelectObject(hdc, old_pen);
+                let _ = DeleteObject(border_pen.into());
+            }
+        }
+        unsafe {
+            let _ = EndPaint(window, &paint);
+        }
+    }
+
+    unsafe fn paint_static(app: &App, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        let hdc = HDC(wparam.0 as *mut c_void);
+        let control = HWND(lparam.0 as *mut c_void);
+        unsafe {
+            SetBkMode(hdc, TRANSPARENT);
+        }
+        let (text, brush) = if control == app.title_label {
+            (rgb(248, 250, 252), app.header_brush)
+        } else if control == app.subtitle_label {
+            (rgb(203, 213, 225), app.header_brush)
+        } else if control == app.credential_help
+            || control == app.policy_label
+            || control == app.audio_policy_label
+        {
+            (COLOR_MUTED, app.card_brush)
+        } else if control == app.action_label {
+            (COLOR_PRIMARY, app.background_brush)
+        } else {
+            (COLOR_TEXT, app.card_brush)
+        };
+        unsafe {
+            SetTextColor(hdc, text);
+        }
+        LRESULT(brush.0 as isize)
+    }
+
+    unsafe fn paint_button_background(app: &App, wparam: WPARAM) -> LRESULT {
+        let hdc = HDC(wparam.0 as *mut c_void);
+        unsafe {
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, COLOR_TEXT);
+        }
+        LRESULT(app.card_brush.0 as isize)
+    }
+
+    unsafe fn paint_edit_background(app: &App, wparam: WPARAM) -> LRESULT {
+        let hdc = HDC(wparam.0 as *mut c_void);
+        unsafe {
+            SetBkColor(hdc, COLOR_CARD);
+            SetTextColor(hdc, COLOR_TEXT);
+        }
+        LRESULT(app.card_brush.0 as isize)
+    }
+
+    unsafe fn draw_owner_button(lparam: LPARAM) {
+        let item = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+        let disabled = item.itemState.0 & ODS_DISABLED.0 != 0;
+        let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
+        let (mut background, mut border, mut foreground) = match item.CtlID as usize {
+            ID_START => (COLOR_SUCCESS, COLOR_SUCCESS, rgb(255, 255, 255)),
+            ID_STOP => (rgb(254, 242, 242), rgb(254, 202, 202), COLOR_DANGER),
+            ID_RESTART => (COLOR_CARD, COLOR_BORDER, COLOR_TEXT),
+            ID_OPEN_WEB => (COLOR_PRIMARY, COLOR_PRIMARY, rgb(255, 255, 255)),
+            ID_OPEN_QR => (rgb(239, 246, 255), rgb(191, 219, 254), COLOR_PRIMARY),
+            ID_SAVE_LOGIN => (COLOR_HEADER, COLOR_HEADER, rgb(255, 255, 255)),
+            _ => (COLOR_CARD, COLOR_BORDER, COLOR_TEXT),
+        };
+        if disabled {
+            background = rgb(241, 245, 249);
+            border = COLOR_BORDER;
+            foreground = rgb(148, 163, 184);
+        } else if pressed {
+            background = match item.CtlID as usize {
+                ID_START => rgb(21, 128, 61),
+                ID_STOP => rgb(254, 226, 226),
+                ID_RESTART => rgb(241, 245, 249),
+                ID_OPEN_WEB => rgb(29, 78, 216),
+                ID_OPEN_QR => rgb(219, 234, 254),
+                ID_SAVE_LOGIN => rgb(30, 41, 59),
+                _ => background,
+            };
+        }
+
+        let brush = unsafe { CreateSolidBrush(background) };
+        let pen = unsafe { CreatePen(PS_SOLID, 1, border) };
+        let old_brush = unsafe { SelectObject(item.hDC, brush.into()) };
+        let old_pen = unsafe { SelectObject(item.hDC, pen.into()) };
+        unsafe {
+            let _ = RoundRect(
+                item.hDC,
+                item.rcItem.left,
+                item.rcItem.top,
+                item.rcItem.right,
+                item.rcItem.bottom,
+                10,
+                10,
+            );
+            SetBkMode(item.hDC, TRANSPARENT);
+            SetTextColor(item.hDC, foreground);
+        }
+        let font = unsafe { SendMessageW(item.hwndItem, WM_GETFONT, None, None) };
+        let old_font = if font.0 != 0 {
+            Some(unsafe { SelectObject(item.hDC, HGDIOBJ(font.0 as *mut c_void)) })
+        } else {
+            None
+        };
+        let mut text = window_text(item.hwndItem)
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let mut text_rect = item.rcItem;
+        unsafe {
+            DrawTextW(
+                item.hDC,
+                &mut text,
+                &mut text_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
+        if let Some(old_font) = old_font {
+            unsafe {
+                SelectObject(item.hDC, old_font);
+            }
+        }
+        unsafe {
+            SelectObject(item.hDC, old_pen);
+            SelectObject(item.hDC, old_brush);
+            let _ = DeleteObject(pen.into());
+            let _ = DeleteObject(brush.into());
+        }
+    }
+
     unsafe extern "system" fn panel_window_proc(
         window: HWND,
         message: u32,
@@ -1308,6 +1642,23 @@ mod windows_app {
         let app_ptr = unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) as *mut App };
         match message {
             WM_CREATE => LRESULT(0),
+            WM_PAINT if !app_ptr.is_null() => {
+                unsafe { paint_panel(window, &*app_ptr) };
+                LRESULT(0)
+            }
+            WM_CTLCOLORSTATIC if !app_ptr.is_null() => unsafe {
+                paint_static(&*app_ptr, wparam, lparam)
+            },
+            WM_CTLCOLORBTN if !app_ptr.is_null() => unsafe {
+                paint_button_background(&*app_ptr, wparam)
+            },
+            WM_CTLCOLOREDIT if !app_ptr.is_null() => unsafe {
+                paint_edit_background(&*app_ptr, wparam)
+            },
+            WM_DRAWITEM if !app_ptr.is_null() => {
+                unsafe { draw_owner_button(lparam) };
+                LRESULT(1)
+            }
             WM_TIMER if !app_ptr.is_null() => {
                 unsafe { (&mut *app_ptr).refresh() };
                 LRESULT(0)
@@ -1419,6 +1770,18 @@ mod windows_app {
         let _ = unsafe { SetWindowTextW(window, &text) };
     }
 
+    /// Update one native control only when its visible text actually changed.
+    /// The status timer runs twice per second; avoiding redundant SetWindowTextW
+    /// calls prevents transparent STATIC controls from erasing and repainting
+    /// their card background on every tick.
+    fn set_text_if_changed(window: HWND, text: &str) -> bool {
+        if window.0.is_null() || window_text(window) == text {
+            return false;
+        }
+        set_text(window, text);
+        true
+    }
+
     fn virtual_screen_bounds() -> [i32; 4] {
         [
             unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
@@ -1460,15 +1823,18 @@ mod windows_app {
         running
     }
 
-    fn spawn_launcher(root: &Path, python: &str, arguments: &[&str]) {
-        let log_path = root.join(".run/panel-actions.log");
+    fn spawn_launcher(root: &Path, executable: &Path, arguments: &[&str]) {
+        let data_dir = std::env::var_os("SUPER_REMOTE_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join(".run"));
+        let log_path = data_dir.join("panel-actions.log");
         let stdout = append_log(&log_path).ok();
         let stderr = append_log(&log_path).ok();
-        let mut command = Command::new(python);
+        let mut command = Command::new(executable);
         command
-            .arg(root.join("start_remote_desktop.py"))
             .args(arguments)
-            .current_dir(root);
+            .current_dir(root)
+            .env("SUPER_REMOTE_DATA_DIR", &data_dir);
         if let Some(stdout) = stdout {
             command.stdout(Stdio::from(stdout));
         }

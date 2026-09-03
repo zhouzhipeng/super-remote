@@ -9,16 +9,22 @@ use std::{
     time::Duration,
 };
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use rtc::{
     media::{Sample, io::h26x_reader::H26xSampleReader},
     rtp_transceiver::PayloadType,
 };
 use tokio::sync::{mpsc, oneshot, watch};
-use tracing::info;
+use tracing::{info, warn};
 use webrtc::media_stream::{Track, track_local::static_sample::TrackLocalStaticSample};
 
 use crate::{config::HostConfig, stats::HostStats};
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub async fn stream(
     config: Arc<HostConfig>,
@@ -117,20 +123,16 @@ async fn stream_ffmpeg(
     // excess without building a queue.
     let desktop_duplication_fps = (u32::from(config.fps) * 67 / 60).to_string();
     let gop = config.fps.to_string();
-    let scale = if config.ffmpeg_capture_mode == "ddagrab" {
-        format!(
-            "scale_d3d11=width={}:height={}:format=nv12,setpts=N/({}*TB)",
-            config.width, config.height, config.fps
-        )
-    } else {
-        format!(
-            "hwupload,scale_d3d11=width={}:height={}:format=nv12,setpts=N/({}*TB)",
-            config.width, config.height, config.fps
-        )
-    };
+    let scale = ffmpeg_video_filter(
+        &config.ffmpeg_capture_mode,
+        &config.ffmpeg_encoder,
+        config.width,
+        config.height,
+        config.fps,
+    );
     let profile = match config.ffmpeg_encoder.as_str() {
         "h264_amf" => "constrained_baseline",
-        "h264_nvenc" => "baseline",
+        "h264_nvenc" | "libx264" => "baseline",
         _ => unreachable!("validated by HostConfig::load"),
     };
     let mut args = vec![
@@ -149,11 +151,15 @@ async fn stream_ffmpeg(
             ),
         ]);
     } else {
+        if config.ffmpeg_encoder == "h264_nvenc" {
+            args.extend([
+                "-init_hw_device".to_owned(),
+                "d3d11va=desktop".to_owned(),
+                "-filter_hw_device".to_owned(),
+                "desktop".to_owned(),
+            ]);
+        }
         args.extend([
-            "-init_hw_device".to_owned(),
-            "d3d11va=desktop".to_owned(),
-            "-filter_hw_device".to_owned(),
-            "desktop".to_owned(),
             "-f".to_owned(),
             "gdigrab".to_owned(),
             "-draw_mouse".to_owned(),
@@ -187,6 +193,8 @@ async fn stream_ffmpeg(
     match config.ffmpeg_encoder.as_str() {
         "h264_nvenc" => args.extend(
             [
+                "-rc",
+                "cbr",
                 "-preset",
                 "p4",
                 "-tune",
@@ -214,15 +222,25 @@ async fn stream_ffmpeg(
             ]
             .map(str::to_owned),
         ),
-        "h264_amf" => args.extend(["-quality", "speed", "-usage", "lowlatency"].map(str::to_owned)),
+        "h264_amf" => args
+            .extend(["-rc", "cbr", "-quality", "speed", "-usage", "lowlatency"].map(str::to_owned)),
+        "libx264" => args.extend(
+            [
+                "-preset",
+                "ultrafast",
+                "-tune",
+                "zerolatency",
+                "-x264-params",
+                "scenecut=0:rc-lookahead=0:sync-lookahead=0",
+            ]
+            .map(str::to_owned),
+        ),
         _ => unreachable!("validated by HostConfig::load"),
     }
     args.extend(
         [
             "-profile:v",
             profile,
-            "-rc",
-            "cbr",
             "-b:v",
             &bitrate,
             "-maxrate",
@@ -239,12 +257,22 @@ async fn stream_ffmpeg(
         ]
         .map(str::to_owned),
     );
-    let mut child = Command::new(path)
+    let mut command = Command::new(&path);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+        .stderr(Stdio::inherit());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let mut child = command.spawn()?;
+    info!(
+        process_id = child.id(),
+        width = config.width,
+        height = config.height,
+        bitrate = config.bitrate,
+        "FFmpeg video capture started"
+    );
     let stdout = child
         .stdout
         .take()
@@ -267,6 +295,12 @@ async fn stream_ffmpeg(
     // The initial IDR carries the SPS/PPS needed to configure a browser decoder.
     // Deliver it reliably before switching to replaceable low-latency frames.
     let mut initial_frame_rx = initial_frame_rx;
+    let initial_frame_started = tokio::time::Instant::now();
+    let initial_frame_timeout = if config.ffmpeg_capture_mode == "ddagrab" {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(5)
+    };
     let initial_data = loop {
         tokio::select! {
             result = &mut initial_frame_rx => {
@@ -279,9 +313,39 @@ async fn stream_ffmpeg(
                     let _ = child.kill();
                     return Ok(());
                 }
+                if initial_frame_started.elapsed() >= initial_frame_timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if config.ffmpeg_capture_mode == "ddagrab" {
+                        info!(
+                            timeout_ms = initial_frame_timeout.as_millis(),
+                            "DDA produced no initial frame; retrying with GDI capture and NVENC"
+                        );
+                        let mut fallback_config = config.as_ref().clone();
+                        fallback_config.ffmpeg_capture_mode = "gdigrab".into();
+                        return Box::pin(stream_ffmpeg(
+                            path,
+                            Arc::new(fallback_config),
+                            track,
+                            payload_type,
+                            stats,
+                            active,
+                        ))
+                        .await;
+                    }
+                    anyhow::bail!(
+                        "FFmpeg produced no initial H.264 keyframe within {} ms",
+                        initial_frame_timeout.as_millis()
+                    );
+                }
             }
         }
     };
+    info!(
+        bytes = initial_data.len(),
+        "initial H.264 keyframe captured"
+    );
+    let initial_write_started = tokio::time::Instant::now();
     let initial_write = track
         .sample_writer(ssrc, payload_type)
         .write_sample(&Sample {
@@ -290,6 +354,10 @@ async fn stream_ffmpeg(
             ..Default::default()
         })
         .await;
+    info!(
+        elapsed_ms = initial_write_started.elapsed().as_millis(),
+        "initial H.264 keyframe submitted to WebRTC"
+    );
     if let Err(error) = initial_write {
         if !active.load(Ordering::Acquire) {
             let _ = child.kill();
@@ -350,6 +418,35 @@ async fn stream_ffmpeg(
     .await;
     let _ = child.kill();
     result
+}
+
+fn ffmpeg_video_filter(
+    capture_mode: &str,
+    encoder: &str,
+    width: u32,
+    height: u32,
+    fps: u16,
+) -> String {
+    if capture_mode == "ddagrab" {
+        // DDA is deliberately polled above the target rate so Windows timer
+        // quantization cannot starve a 60 Hz stream. Resample the GPU frames
+        // before NVENC: encoded P-frames must never be dropped, while forwarding
+        // all 67 samples with 60 Hz RTP durations makes the browser repeatedly
+        // drain and refill its jitter buffer.
+        format!("scale_d3d11=width={width}:height={height}:format=nv12,fps=fps={fps}:round=near")
+    } else if encoder == "libx264" {
+        format!(
+            "scale=width={width}:height={height}:flags=fast_bilinear,format=yuv420p,setpts=N/({fps}*TB)"
+        )
+    } else if encoder == "h264_amf" {
+        format!(
+            "scale=width={width}:height={height}:flags=fast_bilinear,format=nv12,setpts=N/({fps}*TB)"
+        )
+    } else {
+        format!(
+            "hwupload,scale_d3d11=width={width}:height={height}:format=nv12,setpts=N/({fps}*TB)"
+        )
+    }
 }
 
 fn read_latest_ffmpeg_frame(
@@ -433,8 +530,34 @@ async fn stream_windows_hardware(
             bitrate: capture_config.bitrate,
             keyframe_interval: u32::from(capture_config.fps),
         };
-        // Do not permit a software encoder fallback: it violates the MVP CPU/latency target.
-        let mut encoder = MfH264Encoder::new_with(capture_session.device(), video_config, true)?;
+        // Prefer the GPU encoder, but do not let a driver-specific Media Foundation
+        // negotiation failure strand an otherwise healthy WebRTC session. Some drivers
+        // enumerate a hardware H.264 MFT and then reject larger WGC input types.
+        let (mut encoder, mut using_hardware) = match MfH264Encoder::new_with(
+            capture_session.device(),
+            video_config,
+            true,
+        ) {
+            Ok(encoder) => (encoder, true),
+            Err(hardware_error) => {
+                warn!(
+                    error = %hardware_error,
+                    width = video_config.width,
+                    height = video_config.height,
+                    "hardware H.264 encoder unavailable; falling back to Media Foundation software encoding"
+                );
+                (
+                        MfH264Encoder::new(capture_session.device(), video_config).map_err(
+                            |software_error| {
+                                anyhow::anyhow!(
+                                    "hardware H.264 encoder failed ({hardware_error}); software fallback failed ({software_error})"
+                                )
+                            },
+                        )?,
+                        false,
+                    )
+            }
+        };
         while worker_active.load(Ordering::Acquire) {
             let mut frame = frame_rx.recv()?;
             // Capacity is one. Drain before encoding so the most recent GPU texture wins.
@@ -442,7 +565,27 @@ async fn stream_windows_hardware(
                 frame = newer;
             }
             let mut encoded = Vec::new();
-            encoder.encode(&frame.texture, frame.timestamp, &mut encoded)?;
+            if let Err(hardware_error) =
+                encoder.encode(&frame.texture, frame.timestamp, &mut encoded)
+            {
+                if !using_hardware {
+                    return Err(hardware_error.into());
+                }
+                warn!(
+                    error = %hardware_error,
+                    "hardware H.264 encoder failed while streaming; switching to software encoding"
+                );
+                encoder = MfH264Encoder::new(capture_session.device(), video_config).map_err(
+                    |software_error| {
+                        anyhow::anyhow!(
+                            "hardware H.264 stream failed ({hardware_error}); software fallback failed ({software_error})"
+                        )
+                    },
+                )?;
+                using_hardware = false;
+                encoded.clear();
+                encoder.encode(&frame.texture, frame.timestamp, &mut encoded)?;
+            }
             for sample in encoded {
                 if sample_tx.send(Some(sample)).is_err() {
                     return Ok(());
@@ -487,7 +630,7 @@ async fn track_ssrc(track: &Arc<TrackLocalStaticSample>) -> anyhow::Result<u32> 
 
 #[cfg(test)]
 mod tests {
-    use super::h264_vcl_nal;
+    use super::{ffmpeg_video_filter, h264_vcl_nal};
 
     #[test]
     fn only_h264_picture_slices_advance_time() {
@@ -496,5 +639,39 @@ mod tests {
         assert!(!h264_vcl_nal(&[0x06]));
         assert!(!h264_vcl_nal(&[0x0c]));
         assert!(!h264_vcl_nal(&[]));
+    }
+
+    #[test]
+    fn dda_frames_are_resampled_before_h264_encoding() {
+        let filter = ffmpeg_video_filter("ddagrab", "h264_nvenc", 2560, 1600, 60);
+        assert_eq!(
+            filter,
+            "scale_d3d11=width=2560:height=1600:format=nv12,fps=fps=60:round=near"
+        );
+        assert!(!filter.contains("setpts"));
+    }
+
+    #[test]
+    fn gdi_capture_keeps_its_fixed_rate_timestamps() {
+        assert_eq!(
+            ffmpeg_video_filter("gdigrab", "h264_nvenc", 1920, 1080, 60),
+            "hwupload,scale_d3d11=width=1920:height=1080:format=nv12,setpts=N/(60*TB)"
+        );
+    }
+
+    #[test]
+    fn software_ffmpeg_uses_cpu_scaling() {
+        assert_eq!(
+            ffmpeg_video_filter("gdigrab", "libx264", 1920, 1080, 30),
+            "scale=width=1920:height=1080:flags=fast_bilinear,format=yuv420p,setpts=N/(30*TB)"
+        );
+    }
+
+    #[test]
+    fn amf_fallback_uses_compatible_cpu_frames() {
+        assert_eq!(
+            ffmpeg_video_filter("gdigrab", "h264_amf", 1920, 1200, 30),
+            "scale=width=1920:height=1200:flags=fast_bilinear,format=nv12,setpts=N/(30*TB)"
+        );
     }
 }

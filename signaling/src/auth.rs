@@ -59,6 +59,18 @@ struct Claims {
 }
 
 impl AuthConfig {
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            jwt_secret: vec![b'j'; 32],
+            username: "test-user".into(),
+            password: "test-password".into(),
+            device_token: "test-device-token-value-1234".into(),
+            turn_urls: Vec::new(),
+            turn_secret: None,
+        }
+    }
+
     pub fn from_env() -> anyhow::Result<Self> {
         let jwt_secret = required("REMOTE_JWT_SECRET")?.into_bytes();
         if jwt_secret.len() < 32 {

@@ -33,6 +33,7 @@ fn main() -> anyhow::Result<()> {
         .map(str::parse)
         .transpose()?
         .unwrap_or(0);
+    let prefer_hardware = std::env::args().nth(4).as_deref() != Some("software");
 
     let (session, frames) = capture::start(
         CaptureConfig {
@@ -50,7 +51,7 @@ fn main() -> anyhow::Result<()> {
             bitrate: 8_000_000,
             keyframe_interval: 60,
         },
-        true,
+        prefer_hardware,
     )?;
     let mut frames_encoded = 0usize;
     let mut samples_encoded = 0usize;
@@ -64,7 +65,12 @@ fn main() -> anyhow::Result<()> {
         bytes_encoded += output.iter().map(|sample| sample.data.len()).sum::<usize>();
     }
     println!(
-        "hardware WGC/MF probe passed: {frames_encoded} frames, {samples_encoded} samples, {bytes_encoded} bytes"
+        "{} WGC/MF probe passed: {frames_encoded} frames, {samples_encoded} samples, {bytes_encoded} bytes",
+        if prefer_hardware {
+            "hardware"
+        } else {
+            "software"
+        }
     );
     Ok(())
 }

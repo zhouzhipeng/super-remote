@@ -4,12 +4,14 @@ use std::sync::{
 };
 
 use ::rtc::{
+    ice::mdns::MulticastDnsMode,
     interceptor::Registry,
     media_stream::MediaStreamTrack,
     peer_connection::configuration::{
         RTCConfigurationBuilder,
         interceptor_registry::register_default_interceptors,
         media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine},
+        setting_engine::SettingEngine,
     },
     peer_connection::{sdp::RTCSessionDescription, transport::RTCIceServer},
     rtp_transceiver::{
@@ -49,6 +51,7 @@ struct Handler {
     runtime: Arc<dyn Runtime>,
     stats: Arc<HostStats>,
     media_active: Arc<AtomicBool>,
+    retired: Arc<AtomicBool>,
     media_state: watch::Sender<MediaState>,
     control: Arc<ControlStatus>,
 }
@@ -56,6 +59,7 @@ struct Handler {
 pub struct AcceptedSession {
     pub peer: Arc<dyn PeerConnection>,
     media_active: Arc<AtomicBool>,
+    retired: Arc<AtomicBool>,
     media_state: watch::Sender<MediaState>,
 }
 
@@ -82,6 +86,9 @@ impl MediaState {
 
 impl AcceptedSession {
     pub fn stop_media(&self) {
+        // Retirement is permanent. A late Connected callback from a peer that
+        // is being replaced must never reopen capture or the hardware encoder.
+        self.retired.store(true, Ordering::Release);
         self.media_active.store(false, Ordering::Release);
         self.media_state.send_replace(MediaState::STOPPED);
     }
@@ -101,9 +108,16 @@ impl PeerConnectionEventHandler for Handler {
             .find(|pair| pair[0].eq_ignore_ascii_case("typ"))
             .map(|pair| pair[1].to_owned())
             .unwrap_or_else(|| "unknown".to_owned());
+        let transport = candidate
+            .candidate
+            .split_ascii_whitespace()
+            .nth(2)
+            .unwrap_or("unknown")
+            .to_owned();
         info!(
             session_id = %self.session_id,
             direction = "host_to_browser",
+            %transport,
             %kind,
             "sending ICE candidate"
         );
@@ -123,8 +137,20 @@ impl PeerConnectionEventHandler for Handler {
         info!(session_id = %self.session_id, %state, "peer connection state changed");
         match state {
             RTCPeerConnectionState::Connected => {
+                if self.retired.load(Ordering::Acquire) {
+                    self.media_active.store(false, Ordering::Release);
+                    self.media_state.send_replace(MediaState::STOPPED);
+                    return;
+                }
                 self.media_active.store(true, Ordering::Release);
                 self.media_state.send_replace(MediaState::RUNNING);
+                // stop_media() can race this callback between the first check
+                // and the writes above. Recheck so retirement always wins.
+                if self.retired.load(Ordering::Acquire) {
+                    self.media_active.store(false, Ordering::Release);
+                    self.media_state.send_replace(MediaState::STOPPED);
+                    return;
+                }
                 self.control.connected(self.session_id);
                 #[cfg(windows)]
                 {
@@ -165,7 +191,8 @@ impl PeerConnectionEventHandler for Handler {
         if matches!(
             state,
             RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
-        ) {
+        ) && !self.retired.load(Ordering::Acquire)
+        {
             let _ = self
                 .outbound
                 .send(ClientSignal::SessionClose {
@@ -348,6 +375,7 @@ pub async fn accept_offer(
     // Negotiation itself must stay idle. The event handler opens the media gate
     // only after ICE/DTLS reports a genuinely connected peer.
     let media_active = Arc::new(AtomicBool::new(false));
+    let retired = Arc::new(AtomicBool::new(false));
     let (media_state, media_state_rx) = watch::channel(MediaState::WAITING);
     let handler = Arc::new(Handler {
         session_id,
@@ -355,6 +383,7 @@ pub async fn accept_offer(
         runtime: runtime.clone(),
         stats: stats.clone(),
         media_active: media_active.clone(),
+        retired: retired.clone(),
         media_state: media_state.clone(),
         control,
     });
@@ -365,10 +394,20 @@ pub async fn accept_offer(
                     .with_ice_servers(ice_servers)
                     .build(),
             )
+            // Chromium on macOS publishes its LAN address as an mDNS `.local`
+            // candidate. The async wrapper defaults its network driver to mDNS
+            // Disabled even though rtc::SettingEngine defaults to QueryOnly.
+            // Pass the engine explicitly so the Host resolves Chrome's LAN
+            // candidate instead of depending on unreliable NAT hairpinning.
+            .with_setting_engine(host_setting_engine())
             .with_media_engine(media_engine)
             .with_interceptor_registry(registry)
             .with_handler(handler)
             .with_runtime(runtime)
+            // Chrome uses the bundled TURN/TCP server when its direct WebRTC UDP
+            // path is blocked. That relay runs on this Windows host; use ordinary
+            // UDP datagrams so loopback never receives an unsegmented GSO aggregate.
+            .with_udp_gso_enabled(false)
             .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
             .build()
             .await?,
@@ -458,8 +497,15 @@ pub async fn accept_offer(
     Ok(AcceptedSession {
         peer: peer as Arc<dyn PeerConnection>,
         media_active,
+        retired,
         media_state,
     })
+}
+
+fn host_setting_engine() -> SettingEngine {
+    let mut settings = SettingEngine::default();
+    settings.set_multicast_dns_mode(MulticastDnsMode::QueryOnly);
+    settings
 }
 
 async fn wait_until_running(state: &mut watch::Receiver<MediaState>) -> anyhow::Result<bool> {
@@ -551,4 +597,17 @@ async fn negotiated_payload_type(sender: &Arc<dyn RtpSender>) -> anyhow::Result<
         .first()
         .map(|codec| codec.payload_type)
         .ok_or_else(|| anyhow::anyhow!("no negotiated video codec"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MulticastDnsMode, host_setting_engine};
+
+    #[test]
+    fn host_resolves_browser_mdns_candidates() {
+        assert_eq!(
+            host_setting_engine().multicast_dns().mode,
+            MulticastDnsMode::QueryOnly
+        );
+    }
 }
