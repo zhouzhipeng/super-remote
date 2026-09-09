@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     io::{BufReader, Read},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -21,10 +21,37 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{info, warn};
 use webrtc::media_stream::{Track, track_local::static_sample::TrackLocalStaticSample};
 
-use crate::{config::HostConfig, stats::HostStats};
+use crate::{config::HostConfig, ffmpeg_options, stats::HostStats};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+// std::process::Child alone does not kill on drop. Decoder/parser errors and
+// cancelled async sessions must release their FFmpeg process just like normal
+// disconnects; the launcher's job additionally covers abrupt Host termination.
+struct CaptureProcess(Child);
+
+impl std::ops::Deref for CaptureProcess {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for CaptureProcess {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for CaptureProcess {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
 
 pub async fn stream(
     config: Arc<HostConfig>,
@@ -114,20 +141,12 @@ async fn stream_ffmpeg(
     stats: Arc<HostStats>,
     active: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    let bitrate = config.bitrate.to_string();
-    // A one-frame VBV makes every IDR consume nearly the complete budget and
-    // causes visible quality/brightness pumping in Safari. Four frames still
-    // keep latency low while giving the encoder enough room for a clean IDR.
-    let buffer_size = ffmpeg_buffer_size(config.bitrate, config.fps).to_string();
     let fps = config.fps.to_string();
     // Poll Desktop Duplication slightly faster than the RTP cadence. Display
     // refresh and Windows timer quantization otherwise leave a 60 Hz request at
-    // roughly 55-57 delivered frames/s. The latest-frame slot below absorbs the
-    // excess without building a queue.
+    // roughly 55-57 delivered frames/s. Resample before encoding; never drop
+    // encoded reference frames to correct capture cadence.
     let desktop_duplication_fps = (u32::from(config.fps) * 67 / 60).to_string();
-    // A two-second GOP reduces periodic IDR pulses without making recovery from
-    // packet loss unreasonably slow. WebRTC can still request an earlier IDR.
-    let gop = ffmpeg_gop_frames(config.fps).to_string();
     let scale = ffmpeg_video_filter(
         &config.ffmpeg_capture_mode,
         &config.ffmpeg_encoder,
@@ -135,15 +154,12 @@ async fn stream_ffmpeg(
         config.height,
         config.fps,
     );
-    let profile = match config.ffmpeg_encoder.as_str() {
-        "h264_amf" => "constrained_baseline",
-        "h264_nvenc" | "libx264" => "baseline",
-        _ => unreachable!("validated by HostConfig::load"),
-    };
     let mut args = vec![
         "-hide_banner".to_owned(),
         "-loglevel".to_owned(),
-        "warning".to_owned(),
+        "info".to_owned(),
+        "-nostdin".to_owned(),
+        "-nostats".to_owned(),
     ];
     if config.ffmpeg_capture_mode == "ddagrab" {
         args.extend([
@@ -192,76 +208,14 @@ async fn stream_ffmpeg(
         scale,
         "-fps_mode".to_owned(),
         "passthrough".to_owned(),
-        "-c:v".to_owned(),
-        config.ffmpeg_encoder.clone(),
     ]);
-    match config.ffmpeg_encoder.as_str() {
-        "h264_nvenc" => args.extend(
-            [
-                "-rc",
-                "cbr",
-                "-preset",
-                "p4",
-                "-tune",
-                "ull",
-                "-delay",
-                "0",
-                "-surfaces",
-                "2",
-                "-zerolatency",
-                "1",
-                "-forced-idr",
-                "1",
-                "-rc-lookahead",
-                "0",
-                "-spatial-aq",
-                "1",
-                "-aq-strength",
-                "8",
-                "-temporal-aq",
-                "0",
-                "-strict_gop",
-                "1",
-                "-slices",
-                "1",
-            ]
-            .map(str::to_owned),
-        ),
-        "h264_amf" => args
-            .extend(["-rc", "cbr", "-quality", "speed", "-usage", "lowlatency"].map(str::to_owned)),
-        "libx264" => args.extend(
-            [
-                "-preset",
-                "ultrafast",
-                "-tune",
-                "zerolatency",
-                "-x264-params",
-                "scenecut=0:rc-lookahead=0:sync-lookahead=0",
-            ]
-            .map(str::to_owned),
-        ),
-        _ => unreachable!("validated by HostConfig::load"),
-    }
-    args.extend(
-        [
-            "-profile:v",
-            profile,
-            "-b:v",
-            &bitrate,
-            "-maxrate",
-            &bitrate,
-            "-bufsize",
-            &buffer_size,
-            "-g",
-            &gop,
-            "-bf",
-            "0",
-            "-f",
-            "h264",
-            "pipe:1",
-        ]
-        .map(str::to_owned),
-    );
+    args.extend(ffmpeg_options::encoding_args(
+        &config.ffmpeg_encoder,
+        config.bitrate,
+        config.fps,
+    ));
+    // Flush each encoded packet even on static screens with tiny delta frames.
+    args.extend(["-flush_packets", "1", "-f", "h264", "pipe:1"].map(str::to_owned));
     let mut command = Command::new(&path);
     command
         .args(args)
@@ -270,12 +224,13 @@ async fn stream_ffmpeg(
         .stderr(Stdio::inherit());
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
-    let mut child = command.spawn()?;
+    let mut child = CaptureProcess(command.spawn()?);
     info!(
         process_id = child.id(),
         width = config.width,
         height = config.height,
         bitrate = config.bitrate,
+        fixed_qp = ffmpeg_options::fixed_qp(&config.ffmpeg_encoder),
         "FFmpeg video capture started"
     );
     let stdout = child
@@ -297,14 +252,12 @@ async fn stream_ffmpeg(
     let duration = Duration::from_secs_f64(1.0 / f64::from(config.fps));
     let ssrc = track_ssrc(&track).await?;
     // The initial IDR carries the SPS/PPS needed to configure a browser decoder.
-    // Deliver it reliably before switching to replaceable low-latency frames.
+    // Deliver it reliably before the subsequent reference frames.
     let mut initial_frame_rx = initial_frame_rx;
     let initial_frame_started = tokio::time::Instant::now();
-    let initial_frame_timeout = if config.ffmpeg_capture_mode == "ddagrab" {
-        Duration::from_secs(2)
-    } else {
-        Duration::from_secs(5)
-    };
+    // Match the startup probe's driver-initialization grace period. A cold GPU
+    // must not silently switch a verified DDA pipeline to GDI after two seconds.
+    let initial_frame_timeout = Duration::from_secs(15);
     let initial_data = loop {
         tokio::select! {
             result = &mut initial_frame_rx => {
@@ -320,23 +273,6 @@ async fn stream_ffmpeg(
                 if initial_frame_started.elapsed() >= initial_frame_timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    if config.ffmpeg_capture_mode == "ddagrab" {
-                        info!(
-                            timeout_ms = initial_frame_timeout.as_millis(),
-                            "DDA produced no initial frame; retrying with GDI capture and NVENC"
-                        );
-                        let mut fallback_config = config.as_ref().clone();
-                        fallback_config.ffmpeg_capture_mode = "gdigrab".into();
-                        return Box::pin(stream_ffmpeg(
-                            path,
-                            Arc::new(fallback_config),
-                            track,
-                            payload_type,
-                            stats,
-                            active,
-                        ))
-                        .await;
-                    }
                     anyhow::bail!(
                         "FFmpeg produced no initial H.264 keyframe within {} ms",
                         initial_frame_timeout.as_millis()
@@ -347,6 +283,7 @@ async fn stream_ffmpeg(
     };
     info!(
         bytes = initial_data.len(),
+        elapsed_ms = initial_frame_started.elapsed().as_millis(),
         "initial H.264 keyframe captured"
     );
     let initial_write_started = tokio::time::Instant::now();
@@ -438,14 +375,6 @@ async fn stream_ffmpeg(
     result
 }
 
-fn ffmpeg_buffer_size(bitrate: u32, fps: u16) -> u32 {
-    bitrate.div_ceil(u32::from(fps)).saturating_mul(4)
-}
-
-fn ffmpeg_gop_frames(fps: u16) -> u32 {
-    u32::from(fps).saturating_mul(2)
-}
-
 fn ffmpeg_video_filter(
     capture_mode: &str,
     encoder: &str,
@@ -485,8 +414,14 @@ fn read_latest_ffmpeg_frame(
     let mut prefix = BytesMut::new();
     let mut initial_frame_tx = Some(initial_frame_tx);
     while active.load(Ordering::Acquire) {
-        let Ok(sample) = reader.next_sample() else {
-            break;
+        let sample = match reader.next_sample() {
+            Ok(sample) => sample,
+            Err(error) => {
+                if active.load(Ordering::Acquire) {
+                    warn!(%error, "FFmpeg H.264 reader stopped");
+                }
+                break;
+            }
         };
         let nal_type = sample.data.first().map_or(0, |header| header & 0x1f);
         if nal_type == 12 {
@@ -656,7 +591,7 @@ async fn track_ssrc(track: &Arc<TrackLocalStaticSample>) -> anyhow::Result<u32> 
 
 #[cfg(test)]
 mod tests {
-    use super::{ffmpeg_buffer_size, ffmpeg_gop_frames, ffmpeg_video_filter, h264_vcl_nal};
+    use super::{ffmpeg_video_filter, h264_vcl_nal};
 
     #[test]
     fn only_h264_picture_slices_advance_time() {
@@ -699,11 +634,5 @@ mod tests {
             ffmpeg_video_filter("gdigrab", "h264_amf", 1920, 1200, 30),
             "scale=width=1920:height=1200:flags=fast_bilinear,format=nv12,setpts=N/(30*TB)"
         );
-    }
-
-    #[test]
-    fn ffmpeg_rate_control_has_a_stable_low_latency_window() {
-        assert_eq!(ffmpeg_buffer_size(20_000_000, 60), 1_333_336);
-        assert_eq!(ffmpeg_gop_frames(60), 120);
     }
 }

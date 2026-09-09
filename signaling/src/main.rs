@@ -3,6 +3,7 @@
 mod auth;
 mod local_clipboard;
 mod state;
+mod turn_mux;
 mod websocket;
 
 use std::{borrow::Cow, net::SocketAddr, sync::Arc};
@@ -52,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = AuthConfig::from_env()?;
+    let turn_tcp_bridge = config.turn_tcp_bridge;
     let bind: SocketAddr = std::env::var("REMOTE_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8080".into())
         .parse()
@@ -81,10 +83,11 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
+    let listener = turn_mux::WebTurnListener::new(listener, turn_tcp_bridge);
     info!(%bind, "signaling server listening");
     axum::serve(
         listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        app.into_make_service_with_connect_info::<turn_mux::PeerAddress>(),
     )
     .await?;
     Ok(())
@@ -312,7 +315,19 @@ async fn turn_credentials(State(state): State<Arc<AppState>>, headers: HeaderMap
         }
     };
     match state.auth.turn_credentials(&user.subject) {
-        Some(credentials) => Json(credentials).into_response(),
+        Some(credentials) => {
+            #[derive(Serialize)]
+            struct BrowserTurnCredentials {
+                #[serde(flatten)]
+                credentials: remote_protocol::signaling::TurnCredentials,
+                tcp_mux: bool,
+            }
+            Json(BrowserTurnCredentials {
+                credentials,
+                tcp_mux: state.auth.turn_tcp_bridge.is_some(),
+            })
+            .into_response()
+        }
         None => api_error(
             StatusCode::NOT_FOUND,
             "turn_not_configured",
@@ -323,7 +338,7 @@ async fn turn_credentials(State(state): State<Arc<AppState>>, headers: HeaderMap
 
 async fn ws_upgrade(
     ws: axum::extract::ws::WebSocketUpgrade,
-    ConnectInfo(peer_address): ConnectInfo<SocketAddr>,
+    ConnectInfo(turn_mux::PeerAddress(peer_address)): ConnectInfo<turn_mux::PeerAddress>,
     Query(query): Query<WsQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Response {

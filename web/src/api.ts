@@ -1,4 +1,5 @@
 import type { DeviceSummary } from "./types.ts";
+import { browserIceServers, type BrowserTurnCredentials } from "./ice.ts";
 
 const TOKEN_KEY = "remote.accessToken";
 
@@ -48,14 +49,13 @@ export async function websocketTicket(): Promise<string> {
 }
 
 export async function iceServers(): Promise<RTCIceServer[]> {
-  const servers: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
+  let turn: BrowserTurnCredentials | undefined;
   try {
-    const turn = await request<{ urls: string[]; username: string; credential: string }>("/turn-credentials");
-    servers.push({ urls: turn.urls, username: turn.username, credential: turn.credential });
+    turn = await request<BrowserTurnCredentials>("/turn-credentials");
   } catch {
     // TURN is optional for local/LAN development. The server returns 404 when not configured.
   }
-  return servers;
+  return browserIceServers(navigator.userAgent, window.location.href, turn);
 }
 
 export async function reportClient(report: Record<string, unknown>): Promise<void> {

@@ -2,6 +2,37 @@ import type { ServerSignal } from "./types.ts";
 
 type ServerIceSignal = Extract<ServerSignal, { type: "webrtc_ice" }>;
 
+export type BrowserTurnCredentials = {
+  urls: string[];
+  username: string;
+  credential: string;
+  tcp_mux?: boolean;
+};
+
+export function browserIceServers(userAgent: string, pageUrl: string, turn?: BrowserTurnCredentials): RTCIceServer[] {
+  const chromium = shouldUseChromiumLanCompatibility(userAgent);
+  const servers: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
+  // Independent discovery fallback when the Google STUN hostname is blocked.
+  if (chromium) servers.push({ urls: "stun:stun.cloudflare.com:3478" });
+  if (!turn) return servers;
+  servers.push({ urls: turn.urls, username: turn.username, credential: turn.credential });
+  if (chromium && turn.tcp_mux === true) {
+    const page = new URL(pageUrl);
+    // A raw FRP TCP mapping carries TURN/TCP on the very same Web port. Derive
+    // it from the address the browser actually opened, never a configured LAN
+    // IP, public server IP, or fixed port. HTTP(S) reverse proxies cannot carry
+    // raw TURN; do not assume an HTTPS origin also provides a TLS TURN service.
+    if (page.protocol === "http:") {
+      servers.push({
+        urls: `turn:${page.hostname}:${page.port || "80"}?transport=tcp`,
+        username: turn.username,
+        credential: turn.credential,
+      });
+    }
+  }
+  return servers;
+}
+
 export function remoteIceCandidate(signal: ServerIceSignal): RTCIceCandidateInit {
   return {
     candidate: signal.candidate,
@@ -26,10 +57,8 @@ export function chromiumCompatibleIceServers(servers: RTCIceServer[]): RTCIceSer
     const urls = typeof server.urls === "string" ? [server.urls] : server.urls;
     return urls
       // Keep every discovery mechanism, but isolate each URL so a failing
-      // transport cannot suppress the others. Real macOS Chrome 151 succeeds
-      // on this network only after the public STUN server produces an srflx
-      // candidate; removing STUN left one unusable mDNS host candidate because
-      // that browser also declined to allocate either advertised TURN route.
+      // transport cannot suppress the others. Private TURN addresses are useful
+      // on a LAN, but are not a reliable fallback for an Internet/FRP client.
       .map((url) => ({ ...server, urls: url }));
   });
   return isolatedServers.sort((left, right) => iceServerRank(String(left.urls)) - iceServerRank(String(right.urls)));

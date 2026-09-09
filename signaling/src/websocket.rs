@@ -167,10 +167,9 @@ async fn handle_signal(
             if mdns_rewritten {
                 // macOS Chromium masks its LAN address behind a randomized
                 // `.local` hostname. Windows mDNS resolution is not reliable
-                // across every network profile, while this authenticated
-                // WebSocket already proves the browser's reachable LAN IP.
-                // Preserve the ICE port/priority and substitute that observed
-                // address so the Host can check the real peer immediately.
+                // across every network profile. For a private LAN peer only,
+                // try the observed IP while preserving ICE port/priority. It
+                // is still a candidate, not proof of UDP reachability.
                 info!(%session_id, "rewrote browser mDNS candidate from websocket peer address");
             }
             let message = ServerSignal::WebrtcIce {
@@ -224,6 +223,16 @@ async fn handle_signal(
 }
 
 fn rewrite_mdns_candidate(candidate: String, peer_ip: IpAddr) -> (String, bool) {
+    // FRP commonly connects to signaling over loopback. That address belongs
+    // to the proxy, not the browser. A public TCP source also cannot supply a
+    // browser's private UDP port mapping; let STUN/TURN discover it instead.
+    let is_lan_peer = match peer_ip {
+        IpAddr::V4(ip) => ip.is_private(),
+        IpAddr::V6(ip) => ip.is_unique_local(),
+    };
+    if !is_lan_peer {
+        return (candidate, false);
+    }
     let mut fields = candidate
         .split_ascii_whitespace()
         .map(str::to_owned)
@@ -288,6 +297,26 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(candidate, srflx);
+    }
+
+    #[test]
+    fn does_not_replace_mdns_with_frp_loopback_or_public_tcp_address() {
+        let original = "candidate:1 1 udp 2122260223 browser.local 54877 typ host";
+        for address in [
+            "127.0.0.1",
+            "::1",
+            "203.0.113.10",
+            "0.0.0.0",
+            "::ffff:127.0.0.1",
+        ] {
+            let (candidate, changed) =
+                rewrite_mdns_candidate(original.into(), address.parse().unwrap());
+            assert!(
+                !changed,
+                "incorrectly rewrote a proxy/NAT candidate: {address}"
+            );
+            assert_eq!(candidate, original);
+        }
     }
 
     #[test]

@@ -1,5 +1,11 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg(windows)]
+#[path = "../../host/src/ffmpeg_options.rs"]
+mod ffmpeg_options;
+#[cfg(windows)]
+mod process_tree;
+
 #[cfg(not(windows))]
 fn main() {
     eprintln!("Super Remote is only available on Windows");
@@ -16,11 +22,12 @@ mod windows_launcher {
         net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
         os::windows::process::CommandExt,
         path::{Path, PathBuf},
-        process::{Child, Command, Stdio},
+        process::{Command, Stdio},
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
+    use crate::process_tree::{ExistingProcess, ManagedChild, ServiceJob};
     use anyhow::{Context, bail};
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -81,29 +88,22 @@ mod windows_launcher {
         max_width: Option<u32>,
     }
 
-    struct ManagedChild(Child);
+    #[derive(Debug)]
+    struct ShutdownRequested;
 
-    impl std::ops::Deref for ManagedChild {
-        type Target = Child;
-
-        fn deref(&self) -> &Self::Target {
-            &self.0
+    impl std::fmt::Display for ShutdownRequested {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("服务启动已取消")
         }
     }
 
-    impl std::ops::DerefMut for ManagedChild {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.0
-        }
-    }
+    impl std::error::Error for ShutdownRequested {}
 
-    impl Drop for ManagedChild {
-        fn drop(&mut self) {
-            if self.0.try_wait().ok().flatten().is_none() {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
+    fn check_shutdown(marker: &Path) -> anyhow::Result<()> {
+        if marker.is_file() {
+            return Err(ShutdownRequested.into());
         }
+        Ok(())
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +160,38 @@ mod windows_launcher {
 
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
             .context("无法启用 DPI 感知")?;
+        let arguments = env::args().collect::<Vec<_>>();
+        if arguments
+            .get(1)
+            .is_some_and(|argument| argument == "--diagnose-video")
+        {
+            anyhow::ensure!(
+                arguments.len() == 4,
+                "--diagnose-video requires runtime and output directories"
+            );
+            let runtime = PathBuf::from(&arguments[2]);
+            let directory = PathBuf::from(&arguments[3]);
+            anyhow::ensure!(
+                runtime.is_absolute() && directory.is_absolute(),
+                "diagnostic paths must be absolute"
+            );
+            fs::create_dir_all(&directory)?;
+            let (width, height, _, _) = display_geometry()?;
+            let selected = select_video_pipeline(
+                &runtime,
+                &directory.join("diagnostic-shutdown.requested"),
+                width,
+                height,
+            )?;
+            write_json(
+                &directory.join("video-diagnostic.json"),
+                &serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"), "encoder": selected.encoder,
+                    "fps": selected.fps, "capture_mode": selected.capture_mode,
+                }),
+            )?;
+            return Ok(());
+        }
         let root = application_root()?;
         let data_dir = application_data_dir();
         fs::create_dir_all(&data_dir).context("无法创建程序数据目录")?;
@@ -172,12 +204,46 @@ mod windows_launcher {
                 stop_control_panel(&root, &data_dir)?;
             }
             remove_firewall_rules(&root);
+            let _ = fs::remove_file(
+                data_dir.join(format!("shutdown-{}.requested", std::process::id())),
+            );
             return Ok(());
         }
 
+        let job = ServiceJob::new().context("无法创建服务进程组")?;
+        let shutdown_marker = data_dir.join(format!("shutdown-{}.requested", std::process::id()));
+        // Publish the supervisor before startup, so closing the panel during a
+        // restart can cancel it even before status.json has new service PIDs.
+        write_json(
+            &data_dir.join("supervisor-state.json"),
+            &serde_json::json!({
+                "launcher_pid": std::process::id(),
+                "process_tree_managed": true,
+            }),
+        )?;
+        let result = run_services(&root, &data_dir, &job, &shutdown_marker);
+        let stopped = job.stop();
+        let _ = fs::remove_file(&shutdown_marker);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.is::<ShutdownRequested>())
+        {
+            return stopped;
+        }
+        result.and(stopped)
+    }
+
+    fn run_services(
+        root: &Path,
+        data_dir: &Path,
+        job: &ServiceJob,
+        shutdown_marker: &Path,
+    ) -> anyhow::Result<()> {
+        check_shutdown(shutdown_marker)?;
         require_runtime_files(&root)?;
         let (primary_width, primary_height, desktop_width, desktop_height) = display_geometry()?;
-        let video_pipeline = select_video_pipeline(&root)?;
+        let video_pipeline =
+            select_video_pipeline(&root, shutdown_marker, primary_width, primary_height)?;
         let (stream_width, stream_height) =
             stream_dimensions(primary_width, primary_height, video_pipeline.max_width);
         let ip = lan_ip()?;
@@ -202,6 +268,7 @@ mod windows_launcher {
             video_pipeline,
         )?;
         configure_firewall(&root, credentials.port)?;
+        check_shutdown(shutdown_marker)?;
 
         let common_environment = BTreeMap::from([
             ("REMOTE_BIND", format!("0.0.0.0:{}", credentials.port)),
@@ -217,6 +284,10 @@ mod windows_launcher {
                 ),
             ),
             ("REMOTE_TURN_SECRET", credentials.turn_secret.clone()),
+            (
+                "REMOTE_TURN_TCP_BRIDGE",
+                format!("127.0.0.1:{TURN_TCP_PORT}"),
+            ),
             ("RUST_LOG", "remote_signaling=info,remote_host=info".into()),
             (
                 "SUPER_REMOTE_DATA_DIR",
@@ -225,6 +296,7 @@ mod windows_launcher {
         ]);
 
         let mut turn = spawn_logged(
+            job,
             &root.join("remote-turn.exe"),
             &[
                 "--public-ip".into(),
@@ -250,9 +322,11 @@ mod windows_launcher {
             &mut turn,
             "TURN",
             Duration::from_secs(10),
+            shutdown_marker,
         )?;
 
         let mut signaling = spawn_logged(
+            job,
             &root.join("remote-signaling.exe"),
             &[],
             &root,
@@ -264,10 +338,12 @@ mod windows_launcher {
             credentials.port,
             &mut signaling,
             Duration::from_secs(20),
+            shutdown_marker,
         )?;
 
         let config_path = data_dir.join("remote-host.toml");
         let mut host = spawn_logged(
+            job,
             &root.join("remote-host.exe"),
             &[config_path.to_string_lossy().into_owned()],
             &root,
@@ -280,6 +356,7 @@ mod windows_launcher {
             &access_token,
             &mut host,
             Duration::from_secs(20),
+            shutdown_marker,
         )?;
 
         let qr_path = data_dir.join("remote-desktop-qr.svg");
@@ -312,7 +389,7 @@ mod windows_launcher {
             data_dir: data_dir.to_string_lossy().into_owned(),
         };
         write_json(&data_dir.join("status.json"), &status)?;
-        let shutdown_marker = data_dir.join(format!("shutdown-{}.requested", std::process::id()));
+        check_shutdown(shutdown_marker)?;
 
         let mut panel = Command::new(root.join("remote-control-panel.exe"));
         panel
@@ -323,11 +400,11 @@ mod windows_launcher {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
-        let _ = panel.spawn();
+        let _panel = panel.spawn().context("无法启动控制面板")?;
+        let panel = wait_for_control_panel(root, data_dir, shutdown_marker)?;
 
         loop {
-            if shutdown_marker.is_file() {
-                let _ = fs::remove_file(&shutdown_marker);
+            if shutdown_marker.is_file() || panel.wait(Duration::ZERO)? {
                 return Ok(());
             }
             let exits = [
@@ -341,8 +418,33 @@ mod windows_launcher {
             {
                 bail!("{name} 服务意外退出（{status}），请检查 {name} 日志");
             }
-            thread::sleep(Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    fn wait_for_control_panel(
+        root: &Path,
+        data_dir: &Path,
+        shutdown_marker: &Path,
+    ) -> anyhow::Result<ExistingProcess> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            check_shutdown(shutdown_marker)?;
+            let state: Value = serde_json::from_slice(
+                &fs::read(data_dir.join("panel-state.json")).unwrap_or_default(),
+            )
+            .unwrap_or_default();
+            if let Some(id) = state["panel_pid"]
+                .as_u64()
+                .and_then(|id| u32::try_from(id).ok())
+                && let Some(panel) =
+                    ExistingProcess::open(id, &root.join("remote-control-panel.exe"))?
+            {
+                return Ok(panel);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        bail!("控制面板未能启动，后台服务已停止")
     }
 
     fn default_username() -> String {
@@ -615,71 +717,174 @@ mod windows_launcher {
         Ok(())
     }
 
-    fn select_video_pipeline(root: &Path) -> anyhow::Result<VideoPipeline> {
+    fn select_video_pipeline(
+        root: &Path,
+        shutdown_marker: &Path,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<VideoPipeline> {
         let ffmpeg = root.join("ffmpeg.exe");
-        if probe_ffmpeg_encoder(&ffmpeg, "h264_nvenc") {
-            return Ok(VideoPipeline {
-                encoder: "h264_nvenc",
-                capture_mode: "ddagrab",
-                label: "NVIDIA NVENC H.264",
-                capture_label: "Desktop Duplication",
-                fps: 60,
-                bitrate: 20_000_000,
-                max_width: None,
-            });
-        }
-        if probe_ffmpeg_encoder(&ffmpeg, "h264_amf") {
-            return Ok(VideoPipeline {
-                encoder: "h264_amf",
-                capture_mode: "gdigrab",
-                label: "AMD AMF H.264",
-                capture_label: "Windows GDI Capture",
-                fps: 30,
-                bitrate: 12_000_000,
-                max_width: Some(1920),
-            });
-        }
-        if probe_ffmpeg_encoder(&ffmpeg, "libx264") {
-            return Ok(VideoPipeline {
-                encoder: "libx264",
-                capture_mode: "gdigrab",
-                label: "FFmpeg H.264 (software)",
-                capture_label: "Windows GDI Capture",
-                fps: 30,
-                bitrate: 8_000_000,
-                max_width: Some(1600),
-            });
-        }
-        bail!("内置 FFmpeg 无法初始化任何 H.264 编码器")
+        require_verified_60fps(|| {
+            check_shutdown(shutdown_marker)?;
+            let ready = probe_ffmpeg_encoder(&ffmpeg, "h264_nvenc", shutdown_marker)?
+                && probe_desktop_pipeline(&ffmpeg, shutdown_marker, width, height)?;
+            if !ready {
+                // A previous GPU process may still be releasing driver resources.
+                // Keep cancellation responsive while giving initialization time.
+                for _ in 0..10 {
+                    check_shutdown(shutdown_marker)?;
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+            Ok(ready)
+        })
+        .with_context(|| {
+            format!(
+                "无法启动 60 FPS 恒定画质采集，未降级到 30 FPS。请检查 {}",
+                shutdown_marker
+                    .parent()
+                    .unwrap_or(root)
+                    .join("encoder-probes.log")
+                    .display()
+            )
+        })
     }
 
-    fn probe_ffmpeg_encoder(ffmpeg: &Path, encoder: &str) -> bool {
-        Command::new(ffmpeg)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=c=black:s=1920x1080:r=1",
-                "-frames:v",
-                "1",
-                "-an",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:v",
-                encoder,
-                "-f",
-                "null",
-                "NUL",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-            .is_ok_and(|status| status.success())
+    fn require_verified_60fps(
+        mut probe: impl FnMut() -> anyhow::Result<bool>,
+    ) -> anyhow::Result<VideoPipeline> {
+        for _ in 0..3 {
+            if probe()? {
+                return Ok(VideoPipeline {
+                    encoder: "h264_nvenc",
+                    capture_mode: "ddagrab",
+                    label: "NVIDIA NVENC H.264",
+                    capture_label: "Desktop Duplication",
+                    fps: 60,
+                    bitrate: 20_000_000,
+                    max_width: None,
+                });
+            }
+        }
+        bail!(
+            "NVENC / Desktop Duplication 连续三次初始化未通过；60 FPS 模式需要可用的 NVIDIA 编码器"
+        )
+    }
+
+    fn probe_desktop_pipeline(
+        ffmpeg: &Path,
+        shutdown_marker: &Path,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<bool> {
+        // Validate the real capture -> GPU conversion -> constant-QP encoder,
+        // not just a CPU black frame. Frames go to the null muxer, never disk.
+        let mut arguments = [
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            "ddagrab=output_idx=0:draw_mouse=1:framerate=67:dup_frames=1",
+            "-vf",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        arguments.push(format!(
+            "scale_d3d11=width={width}:height={height}:format=nv12,fps=fps=60:round=near"
+        ));
+        arguments
+            .extend(["-frames:v", "120", "-an", "-fps_mode", "passthrough"].map(str::to_owned));
+        arguments.extend(crate::ffmpeg_options::encoding_args(
+            "h264_nvenc",
+            20_000_000,
+            60,
+        ));
+        arguments.extend(["-f", "null", "NUL"].map(str::to_owned));
+        run_video_probe(ffmpeg, "ddagrab-nvenc-60fps", shutdown_marker, &arguments)
+    }
+
+    fn probe_ffmpeg_encoder(
+        ffmpeg: &Path,
+        encoder: &str,
+        shutdown_marker: &Path,
+    ) -> anyhow::Result<bool> {
+        let arguments = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=1920x1080:r=60",
+            "-frames:v",
+            "1",
+            "-an",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            encoder,
+            "-f",
+            "null",
+            "NUL",
+        ]
+        .map(str::to_owned);
+        run_video_probe(ffmpeg, encoder, shutdown_marker, &arguments)
+    }
+
+    fn run_video_probe(
+        ffmpeg: &Path,
+        encoder: &str,
+        shutdown_marker: &Path,
+        arguments: &[String],
+    ) -> anyhow::Result<bool> {
+        check_shutdown(shutdown_marker)?;
+        // Probes also launch FFmpeg. Give each a short-lived job so cancellation
+        // or a hung GPU driver cannot leave a startup probe behind either.
+        let job = ServiceJob::new()?;
+        let log_path = shutdown_marker
+            .parent()
+            .context("探测日志目录不存在")?
+            .join("encoder-probes.log");
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        writeln!(
+            log,
+            "\n[{}] launcher={} version={} encoder={} probe starting",
+            unix_seconds(),
+            std::process::id(),
+            env!("CARGO_PKG_VERSION"),
+            encoder
+        )?;
+        let child = job.spawn(
+            ffmpeg,
+            arguments,
+            ffmpeg.parent().context("FFmpeg 没有父目录")?,
+            &log,
+            &BTreeMap::new(),
+        )?;
+        let result = (|| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                check_shutdown(shutdown_marker)?;
+                if let Some(status) = child.try_wait()? {
+                    writeln!(log, "encoder={encoder} exit={status}")?;
+                    return Ok(status.success());
+                }
+                if Instant::now() >= deadline {
+                    writeln!(log, "encoder={encoder} timed out")?;
+                    return Ok(false);
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        })();
+        job.stop()?;
+        result
     }
 
     fn stream_dimensions(width: u32, height: u32, max_width: Option<u32>) -> (u32, u32) {
@@ -695,6 +900,7 @@ mod windows_launcher {
     }
 
     fn spawn_logged(
+        job: &ServiceJob,
         executable: &Path,
         arguments: &[String],
         root: &Path,
@@ -705,20 +911,7 @@ mod windows_launcher {
             .create(true)
             .append(true)
             .open(log_path)?;
-        let stderr = stdout.try_clone()?;
-        let mut command = Command::new(executable);
-        command
-            .args(arguments)
-            .current_dir(root)
-            .envs(environment)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-        command
-            .spawn()
-            .map(ManagedChild)
-            .with_context(|| format!("无法启动 {}", executable.display()))
+        job.spawn(executable, arguments, root, &stdout, environment)
     }
 
     fn http_get(
@@ -757,11 +950,13 @@ mod windows_launcher {
     fn wait_for_health(
         address: Ipv4Addr,
         port: u16,
-        child: &mut Child,
+        child: &mut ManagedChild,
         timeout: Duration,
+        shutdown_marker: &Path,
     ) -> anyhow::Result<()> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
+            check_shutdown(shutdown_marker)?;
             if let Some(status) = child.try_wait()? {
                 bail!("信令服务启动失败（{status}）");
             }
@@ -776,12 +971,14 @@ mod windows_launcher {
     fn wait_for_tcp_listener(
         address: Ipv4Addr,
         port: u16,
-        child: &mut Child,
+        child: &mut ManagedChild,
         name: &str,
         timeout: Duration,
+        shutdown_marker: &Path,
     ) -> anyhow::Result<()> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
+            check_shutdown(shutdown_marker)?;
             if let Some(status) = child.try_wait()? {
                 bail!("{name} 服务启动失败（{status}）");
             }
@@ -802,11 +999,13 @@ mod windows_launcher {
         address: Ipv4Addr,
         port: u16,
         token: &str,
-        child: &mut Child,
+        child: &mut ManagedChild,
         timeout: Duration,
+        shutdown_marker: &Path,
     ) -> anyhow::Result<()> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
+            check_shutdown(shutdown_marker)?;
             if let Some(status) = child.try_wait()? {
                 bail!("Host 启动失败（{status}）");
             }
@@ -852,54 +1051,70 @@ mod windows_launcher {
     }
 
     fn stop_existing_stack(root: &Path, data_dir: &Path) -> anyhow::Result<()> {
-        let path = data_dir.join("status.json");
-        let Ok(Value::Object(status)) =
-            serde_json::from_slice::<Value>(&fs::read(path).unwrap_or_default())
-        else {
-            return Ok(());
+        let status: Value =
+            serde_json::from_slice(&fs::read(data_dir.join("status.json")).unwrap_or_default())
+                .unwrap_or_default();
+        let supervisor: Value = serde_json::from_slice(
+            &fs::read(data_dir.join("supervisor-state.json")).unwrap_or_default(),
+        )
+        .unwrap_or_default();
+        let pid = |state: &Value, field: &str| {
+            state
+                .get(field)
+                .and_then(Value::as_u64)
+                .and_then(|id| u32::try_from(id).ok())
+                .filter(|id| *id != std::process::id())
+                .unwrap_or(0)
         };
-        if let Some(launcher_pid) = status
-            .get("launcher_pid")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-        {
-            let _ = fs::write(
-                data_dir.join(format!("shutdown-{launcher_pid}.requested")),
-                b"requested\n",
-            );
-        }
+        let expected_launcher = root.join("super-remote.exe");
+        let current = ExistingProcess::open(pid(&supervisor, "launcher_pid"), &expected_launcher)?;
+        let managed = current.is_some() && supervisor["process_tree_managed"] == true;
+        let launcher = match current {
+            Some(process) => Some(process),
+            None => ExistingProcess::open(pid(&status, "launcher_pid"), &expected_launcher)?,
+        };
+        let mut services = Vec::new();
         for (field, name) in [
             ("host_pid", "remote-host.exe"),
             ("signaling_pid", "remote-signaling.exe"),
             ("turn_pid", "remote-turn.exe"),
         ] {
-            let Some(pid) = status
-                .get(field)
-                .and_then(Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-            else {
-                continue;
-            };
-            let expected = root
-                .join(name)
-                .canonicalize()
-                .unwrap_or_else(|_| root.join(name));
-            let Some(actual) = process_image_path(pid).and_then(|path| path.canonicalize().ok())
-            else {
-                continue;
-            };
-            if actual != expected {
+            if let Some(process) = ExistingProcess::open(pid(&status, field), &root.join(name))? {
+                services.push(process);
+            }
+        }
+        if managed && let Some(launcher) = &launcher {
+            fs::write(
+                data_dir.join(format!("shutdown-{}.requested", launcher.id)),
+                b"requested\n",
+            )
+            .context("无法提交服务停止请求")?;
+            if !launcher.wait(Duration::from_secs(30))? {
+                // Kill only the supervisor, not its UI child. Closing its job
+                // handle makes Windows terminate all services and descendants.
+                launcher.terminate()?;
+            }
+        }
+        // Legacy installations have no job. Stop Host's tree BEFORE allowing
+        // their supervisor to exit, otherwise FFmpeg can lose its parent first.
+        for process in services {
+            if process.wait(Duration::ZERO)? {
                 continue;
             }
-            let result = Command::new("taskkill.exe")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
+            Command::new("taskkill.exe")
+                .args(["/PID", &process.id.to_string(), "/T", "/F"])
+                .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .creation_flags(CREATE_NO_WINDOW)
                 .status()?;
-            if !result.success() && process_image_path(pid).is_some() {
-                bail!("无法停止旧进程 {pid}");
+            if !process.wait(Duration::from_secs(10))? {
+                bail!("无法停止旧进程 {}", process.id);
             }
+        }
+        if let Some(launcher) = launcher {
+            launcher.terminate()?;
+            let _ = fs::remove_file(data_dir.join(format!("shutdown-{}.requested", launcher.id)));
         }
         Ok(())
     }
@@ -1029,6 +1244,56 @@ mod windows_launcher {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn stopping_stack_waits_for_all_processes_but_keeps_panel_for_restart() {
+            use super::*;
+            use crate::process_tree::tests::{TestDirectory, start_test_stack};
+            let directory = TestDirectory::new();
+            for _ in 0..2 {
+                let (mut owner, mut panel) = start_test_stack(&directory.0);
+                let status: Value =
+                    serde_json::from_slice(&fs::read(directory.0.join("status.json")).unwrap())
+                        .unwrap();
+                let mut processes = Vec::new();
+                for (key, name) in [
+                    ("host_pid", "remote-host.exe"),
+                    ("signaling_pid", "remote-signaling.exe"),
+                    ("turn_pid", "remote-turn.exe"),
+                ] {
+                    processes.push(
+                        ExistingProcess::open(
+                            status[key].as_u64().unwrap() as u32,
+                            &directory.0.join(name),
+                        )
+                        .unwrap()
+                        .unwrap(),
+                    );
+                }
+                let descendant: u32 = fs::read_to_string(directory.0.join("descendant.pid"))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let descendant =
+                    ExistingProcess::open(descendant, &directory.0.join("remote-host.exe"))
+                        .unwrap()
+                        .unwrap();
+                stop_existing_stack(&directory.0, &directory.0).unwrap();
+                assert!(owner.0.try_wait().unwrap().is_some());
+                assert!(
+                    panel.0.try_wait().unwrap().is_none(),
+                    "Stop must preserve the control panel"
+                );
+                for process in processes {
+                    assert!(process.wait(Duration::ZERO).unwrap());
+                }
+                assert!(descendant.wait(Duration::ZERO).unwrap());
+                // A repeated Stop and a later Start on the same data directory
+                // must both work with stale status/PID files from the last run.
+                stop_existing_stack(&directory.0, &directory.0).unwrap();
+                fs::remove_file(directory.0.join("descendant.pid")).unwrap();
+            }
+        }
+
         use std::ffi::OsStr;
 
         use super::{lan_ip, quote_argument, stream_dimensions, write_qr_code};
@@ -1059,6 +1324,66 @@ mod windows_launcher {
             assert_eq!(stream_dimensions(1920, 1080, Some(1600)), (1600, 900));
             assert_eq!(stream_dimensions(1280, 800, Some(1600)), (1280, 800));
             assert_eq!(stream_dimensions(2560, 1600, None), (2560, 1600));
+        }
+
+        #[test]
+        #[ignore = "requires bundled FFmpeg and an NVIDIA GPU; encodes synthetic frames only"]
+        fn real_nvenc_probe_uses_the_service_job() {
+            use super::{PathBuf, env, fs, probe_ffmpeg_encoder};
+            let root = PathBuf::from(env::var("SUPER_REMOTE_TEST_RUNTIME").expect("runtime path"));
+            let directory = PathBuf::from(
+                env::var("SUPER_REMOTE_TEST_DIAGNOSTICS").expect("diagnostic directory"),
+            );
+            fs::create_dir_all(&directory).unwrap();
+            let marker = directory.join("test-shutdown.requested");
+            let result =
+                probe_ffmpeg_encoder(&root.join("ffmpeg.exe"), "h264_nvenc", &marker).unwrap();
+            eprintln!(
+                "{}",
+                fs::read_to_string(directory.join("encoder-probes.log")).unwrap()
+            );
+            assert!(
+                result,
+                "NVENC failed inside the launcher's real process job"
+            );
+        }
+
+        #[test]
+        fn sixty_fps_selection_retries_transient_failures_without_lowering_quality() {
+            let mut attempts = 0;
+            let pipeline = super::require_verified_60fps(|| {
+                attempts += 1;
+                Ok(attempts == 3)
+            })
+            .unwrap();
+            assert_eq!(attempts, 3);
+            assert_eq!(pipeline.fps, 60);
+            assert_eq!(pipeline.encoder, "h264_nvenc");
+            assert_eq!(pipeline.capture_mode, "ddagrab");
+            assert_eq!(pipeline.max_width, None);
+            assert_eq!(crate::ffmpeg_options::fixed_qp(pipeline.encoder), Some(18));
+        }
+
+        #[test]
+        fn sixty_fps_selection_never_silently_returns_a_thirty_fps_pipeline() {
+            let mut attempts = 0;
+            let result = super::require_verified_60fps(|| {
+                attempts += 1;
+                Ok(false)
+            });
+            assert!(result.is_err());
+            assert_eq!(attempts, 3);
+        }
+
+        #[test]
+        fn sixty_fps_selection_does_not_retry_shutdown() {
+            let mut attempts = 0;
+            let result = super::require_verified_60fps(|| {
+                attempts += 1;
+                Err(super::ShutdownRequested.into())
+            });
+            assert!(result.err().unwrap().is::<super::ShutdownRequested>());
+            assert_eq!(attempts, 1);
         }
 
         #[test]
@@ -1109,6 +1434,13 @@ mod windows_launcher {
 #[cfg(windows)]
 fn main() {
     if let Err(error) = windows_launcher::run() {
-        windows_launcher::show_error(&format!("{error:#}"));
+        if std::env::args().any(|argument| argument == "--stop") {
+            // The control panel owns error presentation. Do not strand a hidden
+            // stop helper behind a modal dialog or report failure as exit code 0.
+            eprintln!("停止服务失败：{error:#}");
+        } else {
+            windows_launcher::show_error(&format!("{error:#}"));
+        }
+        std::process::exit(1);
     }
 }

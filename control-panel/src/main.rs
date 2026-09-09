@@ -12,9 +12,9 @@ mod windows_app {
         fs::{self, File, OpenOptions},
         net::{Ipv4Addr, SocketAddrV4, TcpListener},
         path::{Path, PathBuf},
-        process::{Command, Stdio},
+        process::{Child, Command, Stdio},
         sync::atomic::{AtomicBool, AtomicIsize, Ordering},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use serde::{Deserialize, Serialize};
@@ -52,6 +52,7 @@ mod windows_app {
                     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
                     SetProcessDpiAwarenessContext,
                 },
+                Input::KeyboardAndMouse::EnableWindow,
                 Shell::ShellExecuteW,
                 WindowsAndMessaging::{
                     BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_OWNERDRAW,
@@ -84,6 +85,7 @@ mod windows_app {
     const PANEL_CLASS: PCWSTR = w!("SuperRemoteControlPanel");
     const OVERLAY_CLASS: PCWSTR = w!("SuperRemotePrivacyOverlay");
     const PANEL_TITLE: PCWSTR = w!("Super Remote 控制面板");
+    const PANEL_SUBTITLE: &str = concat!("版本 v", env!("CARGO_PKG_VERSION"), " · 安全、轻量的远程控制");
     const MUTEX_NAME: PCWSTR = w!("Local\\SuperRemoteControlPanel-822272a");
 
     const ID_START: usize = 101;
@@ -124,6 +126,10 @@ mod windows_app {
         port: u16,
         host_pid: u32,
         signaling_pid: u32,
+        #[serde(default)]
+        turn_pid: u32,
+        #[serde(default)]
+        launcher_pid: u32,
         primary_display: String,
         encoder: String,
         capture_mode: String,
@@ -143,6 +149,8 @@ mod windows_app {
         height: u32,
         fps: u16,
         bitrate: u32,
+        #[serde(default)]
+        fixed_qp: Option<u8>,
         encoder: String,
         monitor_index: usize,
     }
@@ -253,11 +261,18 @@ mod windows_app {
         privacy_latched: bool,
         client_connected: bool,
         service_buttons_running: Option<bool>,
+        launchers: Vec<Child>,
+        shutdown: Option<PendingShutdown>,
         audio_mute: Option<AudioMuteLease>,
         settings: PanelSettings,
         background_brush: HBRUSH,
         header_brush: HBRUSH,
         card_brush: HBRUSH,
+    }
+
+    struct PendingShutdown {
+        worker: Child,
+        started: Instant,
     }
 
     impl App {
@@ -296,6 +311,8 @@ mod windows_app {
                 privacy_latched: false,
                 client_connected: false,
                 service_buttons_running: None,
+                launchers: Vec::new(),
+                shutdown: None,
                 audio_mute: None,
                 settings: PanelSettings::default(),
                 background_brush: unsafe { CreateSolidBrush(COLOR_BACKGROUND) },
@@ -394,12 +411,13 @@ mod windows_app {
                     0,
                 )?
             };
+            let subtitle = HSTRING::from(PANEL_SUBTITLE);
             self.subtitle_label = unsafe {
                 child(
                     self.window,
                     instance,
                     w!("STATIC"),
-                    w!("安全、轻量的局域网远程控制"),
+                    PCWSTR(subtitle.as_ptr()),
                     scale(30),
                     scale(50),
                     scale(620),
@@ -894,11 +912,15 @@ mod windows_app {
             set_text_if_changed(
                 self.video_label,
                 &format!(
-                    "视频：{}x{} · {} FPS · {:.1} Mbps · {} · 主屏 {}",
+                    "视频：{}x{} · {} FPS · {} · {} · 主屏 {}",
                     width,
                     height,
                     fps,
-                    bitrate as f64 / 1_000_000.0,
+                    if host_fresh && host.fixed_qp.is_some() {
+                        "恒定画质".to_owned()
+                    } else {
+                        format!("{:.1} Mbps", bitrate as f64 / 1_000_000.0)
+                    },
                     encoder,
                     monitor_index + 1
                 ),
@@ -1124,7 +1146,10 @@ mod windows_app {
             }
         }
 
-        fn action(&self, kind: Action) {
+        fn action(&mut self, kind: Action) {
+            if self.shutdown.is_some() {
+                return;
+            }
             let launcher: LauncherStatus =
                 read_json(&self.run_dir.join("status.json")).unwrap_or_default();
             match kind {
@@ -1144,7 +1169,13 @@ mod windows_app {
                     if matches!(kind, Action::Stop) {
                         arguments.push("--stop");
                     }
-                    spawn_launcher(&self.root, &executable, &arguments);
+                    match spawn_launcher(&self.root, &executable, &arguments) {
+                        Ok(child) => self.launchers.push(child),
+                        Err(error) => {
+                            set_text(self.action_label, &format!("无法提交服务操作：{error}"));
+                            return;
+                        }
+                    }
                     set_text(
                         self.action_label,
                         match kind {
@@ -1156,6 +1187,96 @@ mod windows_app {
                     );
                 }
                 _ => {}
+            }
+        }
+
+        fn begin_shutdown(&mut self) {
+            if self.shutdown.is_some() {
+                return;
+            }
+            // A just-submitted Start/Restart may not have published its new
+            // supervisor PID yet. Cancel it by its retained Child handle/PID.
+            self.launchers
+                .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
+            for child in &self.launchers {
+                if let Err(error) = fs::write(
+                    self.run_dir
+                        .join(format!("shutdown-{}.requested", child.id())),
+                    b"requested\n",
+                ) {
+                    set_text(
+                        self.action_label,
+                        &format!("无法提交退出请求：{error}。请重试。"),
+                    );
+                    return;
+                }
+            }
+            // Use this installation's launcher, not an arbitrary stale path in
+            // status.json. The stop helper validates and waits for every PID.
+            match spawn_launcher(
+                &self.root,
+                &self.root.join("super-remote.exe"),
+                &["--stop", "--from-control-panel"],
+            ) {
+                Ok(worker) => {
+                    self.shutdown = Some(PendingShutdown {
+                        worker,
+                        started: Instant::now(),
+                    });
+                    set_text(
+                        self.action_label,
+                        "正在停止所有服务和 FFmpeg，完成后自动退出…",
+                    );
+                    set_text(self.window, "Super Remote · 正在退出…");
+                    let _ = unsafe { EnableWindow(self.window, false) };
+                }
+                Err(error) => set_text(
+                    self.action_label,
+                    &format!("无法停止服务，应用尚未退出：{error}"),
+                ),
+            }
+        }
+
+        fn poll_shutdown(&mut self) {
+            let Some(shutdown) = &mut self.shutdown else {
+                return;
+            };
+            let error = match shutdown.worker.try_wait() {
+                Ok(None) => return, // Keep pumping paint/timer messages.
+                Err(error) => Some(format!("无法确认停止结果：{error}")),
+                Ok(Some(status)) if !status.success() => {
+                    Some("停止服务失败，请查看 panel-actions.log 并重试。".to_owned())
+                }
+                Ok(Some(_)) => {
+                    self.launchers
+                        .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
+                    let status: LauncherStatus =
+                        read_json(&self.run_dir.join("status.json")).unwrap_or_default();
+                    let running = [
+                        status.launcher_pid,
+                        status.host_pid,
+                        status.signaling_pid,
+                        status.turn_pid,
+                    ]
+                    .into_iter()
+                    .any(process_running);
+                    if running || !self.launchers.is_empty() {
+                        if shutdown.started.elapsed() < Duration::from_secs(45) {
+                            return;
+                        }
+                        Some("仍有后台服务未退出，窗口已保留；请再次关闭以重试。".to_owned())
+                    } else {
+                        self.shutdown = None;
+                        unsafe { DestroyWindow(self.window).ok() };
+                        return;
+                    }
+                }
+            };
+            self.shutdown = None;
+            let _ = unsafe { EnableWindow(self.window, true) };
+            set_text(self.window, "Super Remote 控制面板");
+            if let Some(error) = error {
+                set_text(self.action_label, &error);
             }
         }
 
@@ -1660,7 +1781,12 @@ mod windows_app {
                 LRESULT(1)
             }
             WM_TIMER if !app_ptr.is_null() => {
-                unsafe { (&mut *app_ptr).refresh() };
+                let app = unsafe { &mut *app_ptr };
+                if app.shutdown.is_some() {
+                    app.poll_shutdown();
+                } else {
+                    app.refresh();
+                }
                 LRESULT(0)
             }
             WM_LOCAL_PHYSICAL_INPUT if !app_ptr.is_null() => {
@@ -1672,6 +1798,9 @@ mod windows_app {
                 let notification = (wparam.0 >> 16) & 0xffff;
                 if notification == BN_CLICKED as usize {
                     let app = unsafe { &mut *app_ptr };
+                    if app.shutdown.is_some() {
+                        return LRESULT(0);
+                    }
                     match id {
                         ID_START => app.action(Action::Start),
                         ID_STOP => app.action(Action::Stop),
@@ -1686,8 +1815,8 @@ mod windows_app {
                 }
                 LRESULT(0)
             }
-            WM_CLOSE => {
-                let _ = unsafe { DestroyWindow(window) };
+            WM_CLOSE if !app_ptr.is_null() => {
+                unsafe { (&mut *app_ptr).begin_shutdown() };
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -1823,7 +1952,11 @@ mod windows_app {
         running
     }
 
-    fn spawn_launcher(root: &Path, executable: &Path, arguments: &[&str]) {
+    fn spawn_launcher(
+        root: &Path,
+        executable: &Path,
+        arguments: &[&str],
+    ) -> std::io::Result<Child> {
         let data_dir = std::env::var_os("SUPER_REMOTE_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join(".run"));
@@ -1834,6 +1967,9 @@ mod windows_app {
         command
             .args(arguments)
             .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .env("SUPER_REMOTE_DATA_DIR", &data_dir);
         if let Some(stdout) = stdout {
             command.stdout(Stdio::from(stdout));
@@ -1843,7 +1979,7 @@ mod windows_app {
         }
         use std::os::windows::process::CommandExt;
         command.creation_flags((DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP).0);
-        let _ = command.spawn();
+        command.spawn()
     }
 
     fn append_log(path: &Path) -> std::io::Result<File> {
@@ -1905,6 +2041,208 @@ mod windows_app {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::os::windows::process::CommandExt;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+
+        struct HiddenPanel {
+            app: Box<App>,
+            directory: PathBuf,
+        }
+
+        impl HiddenPanel {
+            fn new() -> Self {
+                let directory = std::env::temp_dir().join(format!(
+                    "super-remote-panel-test-{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                fs::create_dir(&directory).unwrap();
+                let mut app = Box::new(App::empty(directory.clone()));
+                // Never read/write the user's actual SUPER_REMOTE_DATA_DIR.
+                app.run_dir = directory.join(".run");
+                fs::create_dir(&app.run_dir).unwrap();
+                let instance = HINSTANCE(unsafe { GetModuleHandleW(None) }.unwrap().0);
+                static REGISTER: std::sync::Once = std::sync::Once::new();
+                REGISTER.call_once(|| unsafe {
+                    let class = WNDCLASSW {
+                        lpfnWndProc: Some(panel_window_proc),
+                        hInstance: instance,
+                        lpszClassName: w!("SuperRemoteLifecycleTest"),
+                        ..Default::default()
+                    };
+                    assert_ne!(RegisterClassW(&class), 0);
+                });
+                app.window = unsafe {
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        w!("SuperRemoteLifecycleTest"),
+                        PANEL_TITLE,
+                        WS_OVERLAPPEDWINDOW,
+                        0,
+                        0,
+                        320,
+                        120,
+                        None,
+                        None,
+                        Some(instance),
+                        Some((&mut *app as *mut App).cast()),
+                    )
+                }
+                .unwrap();
+                app.action_label = unsafe {
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        w!("STATIC"),
+                        w!(""),
+                        WS_CHILD,
+                        0,
+                        0,
+                        300,
+                        40,
+                        Some(app.window),
+                        None,
+                        Some(instance),
+                        None,
+                    )
+                }
+                .unwrap();
+                Self { app, directory }
+            }
+
+            fn send(&self, message: u32) {
+                unsafe { SendMessageW(self.app.window, message, None, None) };
+            }
+
+            fn exists(&self) -> bool {
+                unsafe { IsWindow(Some(self.app.window)) }.as_bool()
+            }
+        }
+
+        impl Drop for HiddenPanel {
+            fn drop(&mut self) {
+                if let Some(shutdown) = &mut self.app.shutdown {
+                    let _ = shutdown.worker.kill();
+                    let _ = shutdown.worker.wait();
+                }
+                for child in &mut self.app.launchers {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                if self.exists() {
+                    unsafe { DestroyWindow(self.app.window).ok() };
+                }
+                for brush in [
+                    self.app.background_brush,
+                    self.app.header_brush,
+                    self.app.card_brush,
+                ] {
+                    let _ = unsafe { DeleteObject(brush.into()).ok() };
+                }
+                let _ = fs::remove_dir_all(&self.directory);
+            }
+        }
+
+        fn shutdown_worker(code: u32) -> Child {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "windows_app::tests::shutdown_worker_fixture",
+                ])
+                .env("SUPER_REMOTE_TEST_EXIT_CODE", code.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(0x0800_0000)
+                .spawn()
+                .unwrap()
+        }
+
+        #[test]
+        fn header_displays_the_compiled_package_version() {
+            let mut panel = HiddenPanel::new();
+            let instance = HINSTANCE(unsafe { GetModuleHandleW(None) }.unwrap().0);
+            unsafe { panel.app.create_controls(instance) }.unwrap();
+            let subtitle = window_text(panel.app.subtitle_label);
+            assert_eq!(subtitle, PANEL_SUBTITLE);
+            assert!(subtitle.starts_with(&format!("版本 v{} · ", env!("CARGO_PKG_VERSION"))));
+            // Status refreshes must not repeatedly repaint an unchanged header.
+            assert!(!set_text_if_changed(panel.app.subtitle_label, PANEL_SUBTITLE));
+        }
+
+        #[test]
+        #[ignore = "hidden subprocess fixture for shutdown tests"]
+        fn shutdown_worker_fixture() {
+            let code: i32 = std::env::var("SUPER_REMOTE_TEST_EXIT_CODE")
+                .unwrap()
+                .parse()
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            std::process::exit(code);
+        }
+
+        #[test]
+        fn close_keeps_window_open_when_stop_cannot_be_started() {
+            let panel = HiddenPanel::new();
+            panel.send(WM_CLOSE);
+            assert!(panel.exists());
+            assert!(panel.app.shutdown.is_none());
+            assert!(window_text(panel.app.action_label).contains("应用尚未退出"));
+        }
+
+        #[test]
+        fn close_waits_for_shutdown_and_ignores_repeated_close_requests() {
+            let mut panel = HiddenPanel::new();
+            let worker = shutdown_worker(0);
+            let id = worker.id();
+            panel.app.shutdown = Some(PendingShutdown {
+                worker,
+                started: Instant::now(),
+            });
+            panel.send(WM_CLOSE);
+            panel.send(WM_CLOSE);
+            panel.send(WM_TIMER);
+            assert!(panel.exists());
+            assert_eq!(panel.app.shutdown.as_ref().unwrap().worker.id(), id);
+            panel.app.shutdown.as_mut().unwrap().worker.wait().unwrap();
+            panel.send(WM_TIMER);
+            assert!(!panel.exists());
+        }
+
+        #[test]
+        fn unsuccessful_stop_preserves_window_and_shows_retry_message() {
+            let mut panel = HiddenPanel::new();
+            let mut worker = shutdown_worker(7);
+            worker.wait().unwrap();
+            panel.app.shutdown = Some(PendingShutdown {
+                worker,
+                started: Instant::now(),
+            });
+            panel.send(WM_TIMER);
+            assert!(panel.exists());
+            assert!(panel.app.shutdown.is_none());
+            assert!(window_text(panel.app.action_label).contains("停止服务失败"));
+        }
+
+        #[test]
+        fn close_cancels_a_start_before_status_is_published() {
+            let mut panel = HiddenPanel::new();
+            let worker = shutdown_worker(0);
+            let id = worker.id();
+            panel.app.launchers.push(worker);
+            panel.send(WM_CLOSE);
+            assert!(
+                panel
+                    .app
+                    .run_dir
+                    .join(format!("shutdown-{id}.requested"))
+                    .is_file()
+            );
+            assert!(panel.exists()); // No launcher in the isolated test installation.
+        }
 
         #[test]
         fn privacy_stays_latched_after_disconnect_until_local_release() {

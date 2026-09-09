@@ -68,10 +68,8 @@ export class RemoteSession extends EventTarget {
       : configuredIceServers;
     const peer = new RTCPeerConnection({
       iceServers: peerIceServers,
-      // Chrome 151 on this Mac previously connected through its mDNS host
-      // candidate. Forcing `relay` removed that known-good LAN path while the
-      // macOS Chrome network service produced no private TURN candidates at
-      // all. Keep TURN configured as fallback, but restore host candidates.
+      // Prefer direct UDP when reachable; keep authenticated TURN/TCP as a
+      // fallback for clients whose only reachable entry point is FRP TCP.
       iceTransportPolicy: "all",
       bundlePolicy: "max-bundle",
     });
@@ -124,15 +122,15 @@ export class RemoteSession extends EventTarget {
     }
     peer.ontrack = (event) => {
       if (event.track.kind === "video") {
-        // Preserve text and one-pixel UI details on Retina displays. Safari
-        // treats `detail` as a screen-content hint when its decoder supports it.
+        // Optional content hint; encoded resolution/quality is set by the Host.
         try { event.track.contentHint = "detail"; } catch { /* optional browser hint */ }
         this.#requestLowLatencyPlayback();
       }
       if (!this.#remoteStream.getTracks().some((track) => track.id === event.track.id)) {
         this.#remoteStream.addTrack(event.track);
       }
-      this.video.srcObject = this.#remoteStream;
+      // Adding audio to an existing stream must not reset video playback.
+      if (this.video.srcObject !== this.#remoteStream) this.video.srcObject = this.#remoteStream;
       this.#progress("video", `已收到${event.track.kind === "video" ? "视频" : "音频"}轨道，正在等待首帧`);
       const play = () => { void this.video.play().catch(() => {
         this.dispatchEvent(new CustomEvent("error", { detail: "请点击“开启声音”" }));
@@ -200,15 +198,15 @@ export class RemoteSession extends EventTarget {
       if (peer.iceGatheringState === "complete") {
         this.#progress("candidates", `候选收集完成，共发现 ${this.#localCandidateCount} 条本地路径`);
         if (this.#localCandidateCount === 0) {
-          candidateFailed("Chrome 未能生成任何网络候选；旧连接已保留，请检查浏览器网络权限");
+          candidateFailed("浏览器未能生成任何网络候选；旧连接已保留，请检查网络或中继服务");
         }
       }
     };
     const offer = await peer.createOffer();
-    this.#progress("candidates", "正在预检新连接路径；确认可用后才会接管旧连接");
+    this.#progress("candidates", "正在收集新连接的网络候选；生成候选后再接管旧连接");
     await peer.setLocalDescription(offer);
     const candidateTimeout = window.setTimeout(() => {
-      candidateFailed("Chrome 在 10 秒内未能生成网络候选；旧连接已保留");
+      candidateFailed("浏览器在 10 秒内未能生成网络候选；旧连接已保留");
     }, 10_000);
     try {
       await firstCandidate;
@@ -221,9 +219,9 @@ export class RemoteSession extends EventTarget {
 
     // Only now create the authoritative session. This is the atomic takeover
     // point: the signaling server evicts every older device session, but a
-    // broken browser can no longer destroy a healthy Safari connection before
-    // it has proved that it owns at least one usable ICE path.
-    this.#progress("session", "已找到可用局域网路径，正在接管旧连接");
+    // browser with no candidates cannot evict a healthy session. Gathering a
+    // candidate does not prove reachability; ICE checks run after the answer.
+    this.#progress("session", "已生成网络候选，正在建立会话并验证连通性");
     const { session_id, session_token } = await createSession(deviceId);
     this.#sessionId = session_id;
     this.#sessionToken = session_token;
@@ -497,6 +495,7 @@ export class RemoteSession extends EventTarget {
       remoteCandidateCount: this.#remoteCandidateCount,
       candidatePairs,
       userAgent: navigator.userAgent,
+      pageOrigin: window.location.origin,
       visibility: document.visibilityState,
       readyState: this.video.readyState,
       paused: this.video.paused,

@@ -12,6 +12,7 @@ use crate::config::HostConfig;
 
 #[derive(Clone, Serialize)]
 struct HostSnapshot {
+    version: &'static str,
     host_pid: u32,
     online: bool,
     connection_state: String,
@@ -21,6 +22,7 @@ struct HostSnapshot {
     height: u32,
     fps: u16,
     bitrate: u32,
+    fixed_qp: Option<u8>,
     encoder: String,
     monitor_index: usize,
     updated_at_unix_ms: u128,
@@ -36,6 +38,7 @@ impl ControlStatus {
         let status = Self {
             path: config.control_status_path.clone(),
             snapshot: Mutex::new(HostSnapshot {
+                version: env!("CARGO_PKG_VERSION"),
                 host_pid: std::process::id(),
                 online: false,
                 connection_state: "starting".into(),
@@ -45,6 +48,7 @@ impl ControlStatus {
                 height: config.height,
                 fps: config.fps,
                 bitrate: config.bitrate,
+                fixed_qp: crate::ffmpeg_options::fixed_qp(&config.ffmpeg_encoder),
                 encoder: config.ffmpeg_encoder.clone(),
                 monitor_index: config.monitor_index,
                 updated_at_unix_ms: now_ms(),

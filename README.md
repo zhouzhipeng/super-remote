@@ -1,8 +1,8 @@
 # Browser Remote Desktop
 
 Browser-first remote desktop monorepo using Rust, WebRTC and a TypeScript client. The
-implementation follows the supplied design's real-time-first rules: media bypasses the
-signaling service, H.264 is negotiated with constrained-baseline-compatible parameters,
+implementation follows the supplied design's real-time-first rules: media uses WebRTC
+(with an optional TURN/TCP bridge on the Web listener), H.264 is negotiated with constrained-baseline-compatible parameters,
 pointer motion uses an unordered/unreliable channel, state transitions use a reliable
 channel, coordinates are normalized after letterbox removal, and old input state is not
 allowed to build an unbounded queue.
@@ -15,7 +15,7 @@ allowed to build an unbounded queue.
 - `web`: Vite/TypeScript browser client with device/session UI, WebRTC, fullscreen,
   keyboard/mouse forwarding and a `getStats()` debug overlay.
 - `host`: Windows agent with webrtc-rs 0.20.x, trickle ICE, bundled FFmpeg
-  Desktop Duplication/GDI capture, automatic NVENC/AMF/software H.264 selection,
+  Desktop Duplication/GDI capture, NVENC/AMF/software H.264 backends,
   WASAPI loopback/Opus system audio, strict DataChannel validation
   and Win32 `SendInput` injection.
 - `control-panel`: native Rust/Win32 Windows control panel for live service, client,
@@ -37,19 +37,85 @@ python start_remote_desktop.py
 
 The legacy developer script remains useful while changing capture pipelines. Production
 builds instead use `super-remote.exe`: it performs the same orchestration natively and uses
-the FFmpeg runtime included in the installer. The launcher probes the real encoder at startup,
-then selects NVENC + Desktop Duplication, AMF + GDI, or a reduced-resolution software H.264
-fallback. Target computers require no separate Python, Node.js or FFmpeg installation. Runtime
+the FFmpeg runtime included in the installer. The native launcher now requires the
+60 FPS constant-quality NVENC + Desktop Duplication pipeline, at full primary-display
+resolution. It checks both synthetic encoding and 120 real desktop frames with the
+production encoder options, discards the encoded test output, and retries up to three
+times (15 seconds maximum per probe). Failures and timeouts are recorded in
+`C:\ProgramData\Super Remote\encoder-probes.log`. It reports an explicit error rather
+than silently reducing to 30 FPS, GDI or 1920-pixel capture. This strict launcher mode
+requires working NVIDIA NVENC; AMF/software remain developer Host backends, not an
+automatic substitute. Steady-state capture is still off while no client is connected;
+the brief startup diagnostic is the exception. Target computers require no separate
+Python, Node.js or FFmpeg installation. Runtime
 state and the long-lived direct-access QR code are written under `C:\ProgramData\Super Remote`.
-The QR remains valid while `.run/secrets.json` is unchanged and contains a bearer token,
-so treat it as a permanent password and do not share it. Windows Firewall must allow the
-configured TCP Web port (8080 by default) from the local subnet, and the phone must be on
-the same LAN.
+The QR contains a bearer token, so treat it as a permanent password and do not
+share it. Windows Firewall must allow the configured TCP Web port (8080 by default)
+from the local subnet for direct LAN access.
+
+### FRP TCP access
+
+The native launcher also enables an authenticated TURN/TCP bridge on the Web port.
+For a **raw FRP TCP** mapping, Chrome derives this fallback from the page it opened:
+`http://remote.example:45678/` automatically adds
+`turn:remote.example:45678?transport=tcp`. There is no hardcoded public IP, domain,
+or external port, and no extra public UDP port mapping is required for this path.
+The local Web port and FRP's external port may differ. Direct UDP/STUN remains
+available; Safari retains its existing ICE configuration. Chrome additionally
+uses an independent STUN discovery fallback if the Google STUN hostname fails.
+
+HTTP/WebSocket requests and TURN binary streams share the listener without being
+mixed inside the WebSocket signaling protocol. TURN still requires the same
+short-lived, authenticated credentials; the bridge only connects to the bundled
+loopback TURN service. It does not turn the installation into an unauthenticated
+relay. TCP relaying can add latency under packet loss; direct UDP remains preferred.
+
+This automatic fallback is for plain HTTP over a raw TCP tunnel, **not** an HTTP/HTTPS
+reverse proxy. It does not add TLS to plain HTTP. HTTPS deployments should retain
+their explicitly configured, publicly reachable TURN/TLS service. Standalone
+signaling opts into the bridge with `REMOTE_TURN_TCP_BRIDGE=127.0.0.1:3478` alongside
+its existing `REMOTE_TURN_URLS` and `REMOTE_TURN_SECRET`; the native launcher sets
+these automatically. A server without the bridge does not advertise this capability.
+
+`web/tests/run-frp-tcp-e2e.mjs` runs the embedded Web UI, real Rust signaling and
+bundled TURN behind an isolated TCP forwarder with a random external port. Its
+synthetic H.264 Host never captures the desktop or injects input. The test forces
+the Chrome client to use only the derived TCP relay and verifies decoded H.264,
+data-channel round trips and rejection of unauthenticated TURN allocation.
+Build Web and `remote-signaling` first, then run with `PLAYWRIGHT_PACKAGE`,
+`CHROME_EXECUTABLE`, `TURN_EXECUTABLE` and `TEST_RELAY_IP` (the Host's physical LAN
+IPv4) set. No installed service or existing browser session is stopped.
+
+NVENC uses constant QP 18 with spatial/temporal AQ disabled to keep static desktop
+detail stable across periodic keyframes. H.264 remains lossy; this is not pixel-exact
+lossless streaming. Bandwidth varies with screen activity;
+the configured `bitrate` is still used by the developer AMF/software backends but is not a
+bandwidth ceiling for the NVENC constant-quality path. The panel labels this mode
+as “恒定画质”; the Web toolbar reports measured network bitrate. Retina clients
+continue negotiating physical pixels up to the captured display resolution.
+
+To verify static-image stability with the bundled FFmpeg and the real GPU, run
+`python scripts/measure_ffmpeg_stability.py --ffmpeg "D:\Program Files\Super Remote\ffmpeg.exe" --production`.
+This developer-only check loads the actual Rust encoder arguments, compares decoded
+pixel hashes across keyframes on CPU/GPU inputs, and verifies a moving 60 FPS clip.
+It writes test clips and measurements under `target/video-stability/` without
+capturing the live desktop or connecting to an active remote session.
 
 The control panel is opened automatically with the elevated Host. It shows the Host and
 Signaling process state, browser connection state, active stream size/FPS/bitrate/encoder,
 primary-display capture details and whether the capture pipeline is idle. Use its buttons
 to start, stop or restart the stack, open the Web client, or view the current QR code. The
+close button (or Alt+F4) first stops Host, Signaling, TURN and their FFmpeg descendants,
+waits for the supervisor to exit, and then closes the panel. While stopping, repeated
+close requests and new service operations are ignored; a failed stop keeps the panel
+open with an error. Stop/Restart buttons continue to preserve the control panel.
+Services enter a Windows kill-on-close Job Object at process creation, so killing the
+supervisor also reclaims its service tree. The supervisor monitors the panel process
+and stops the stack if the panel unexpectedly exits. FFmpeg startup probes and cancelled
+capture sessions are cleaned up too. Cleanup validates executable paths and does not
+kill other installations or unrelated programs with the same filename.
+
+The
 Web port, login account and password can be changed in the panel; saving preserves the
 JWT/device secrets and restarts the services so the new address and login take effect. The
 port must be between 1 and 65535. Passwords must contain at least 12 UTF-8 bytes and remain
@@ -114,7 +180,7 @@ NVENC H.264 sized to the browser's physical video area → WebRTC. The output pr
 display aspect ratio, never crops the source, and can stream the full physical primary-display
 resolution to a high-DPI browser. Bitrate scales with the requested pixel count up to 20 Mbps,
 which keeps 60 FPS ahead of the WebRTC sender instead of queuing oversized encoded frames.
-It uses NVENC's quality-oriented low-latency P4 preset, spatial AQ, a one-frame CBR buffer, two
+It uses NVENC's quality-oriented low-latency P4 preset, constant QP 18 with AQ disabled, two
 encoder surfaces, forced IDR frames and zero-latency tuning. DDA is sampled slightly above the
 target rate, then surplus GPU frames are removed before NVENC to produce a stable 60 FPS encoded
 stream without ever discarding dependent H.264 P-frames. A one-frame backpressured handoff

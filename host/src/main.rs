@@ -6,6 +6,7 @@ mod config;
 mod control;
 #[cfg(windows)]
 mod display_power;
+mod ffmpeg_options;
 mod input;
 mod rtc;
 mod signaling;
@@ -39,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
                 .add_directive("remote_host=info".parse()?),
         )
         .init();
+    info!(version = env!("CARGO_PKG_VERSION"), "remote Host starting");
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "remote-host.toml".into());

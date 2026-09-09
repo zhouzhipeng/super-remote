@@ -2,10 +2,62 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  browserIceServers,
   chromiumCompatibleIceServers,
   remoteIceCandidate,
   shouldUseChromiumLanCompatibility,
 } from "../src/ice.ts";
+
+const chromeAgent = "Mozilla/5.0 Chrome/153.0.0.0 Safari/537.36";
+const safariAgent = "Mozilla/5.0 Version/18.5 Safari/605.1.15";
+const credentials = {
+  urls: ["turn:192.168.1.10:3478?transport=tcp"],
+  username: "expiring-test-user", credential: "temporary-test-secret", tcp_mux: true,
+};
+
+test("Chrome derives its FRP TURN/TCP route from the current Web origin, not a fixed server", () => {
+  for (const [page, expected] of [
+    ["http://203.0.113.12:45678/remote#token=not-a-turn-password", "turn:203.0.113.12:45678?transport=tcp"],
+    ["http://remote.example:32123/", "turn:remote.example:32123?transport=tcp"],
+    ["http://remote.example/", "turn:remote.example:80?transport=tcp"],
+    ["http://[2001:db8::1]:45678/", "turn:[2001:db8::1]:45678?transport=tcp"],
+  ]) {
+    const servers = browserIceServers(chromeAgent, page, credentials);
+    assert.deepEqual(servers.at(-1), {
+      urls: expected, username: credentials.username, credential: credentials.credential,
+    });
+    assert.ok(JSON.stringify(servers).includes("stun:stun.cloudflare.com:3478"));
+    assert.ok(!JSON.stringify(servers).includes("not-a-turn-password"));
+  }
+});
+
+test("does not advertise a TCP bridge absent on older/standalone servers", () => {
+  for (const tcp_mux of [false, undefined]) {
+    const servers = browserIceServers(chromeAgent, "http://remote.example:45678/", { ...credentials, tcp_mux });
+    assert.equal(servers.length, 3);
+    assert.ok(!JSON.stringify(servers).includes("remote.example"));
+  }
+});
+
+test("does not guess raw TURN or TURN/TLS support from an HTTPS reverse proxy", () => {
+  const servers = browserIceServers(chromeAgent, "https://remote.example/", credentials);
+  assert.equal(servers.length, 3);
+  assert.ok(!JSON.stringify(servers).includes("remote.example"));
+});
+
+test("preserves Safari's existing ICE routes and credentials", () => {
+  assert.deepEqual(browserIceServers(safariAgent, "http://remote.example:45678/", credentials), [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: credentials.urls, username: credentials.username, credential: credentials.credential },
+  ]);
+});
+
+test("Chrome retains two independent discovery servers when TURN is unavailable", () => {
+  assert.deepEqual(browserIceServers(chromeAgent, "http://remote.example/"), [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun.cloudflare.com:3478" },
+  ]);
+});
 
 test("associates transport-level Host candidates with the bundled media section", () => {
   assert.deepEqual(remoteIceCandidate({

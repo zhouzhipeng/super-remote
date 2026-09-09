@@ -17,6 +17,7 @@ pub struct AuthConfig {
     device_token: String,
     turn_urls: Vec<String>,
     turn_secret: Option<Vec<u8>>,
+    pub turn_tcp_bridge: Option<std::net::SocketAddr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +69,7 @@ impl AuthConfig {
             device_token: "test-device-token-value-1234".into(),
             turn_urls: Vec::new(),
             turn_secret: None,
+            turn_tcp_bridge: None,
         }
     }
 
@@ -98,6 +100,9 @@ impl AuthConfig {
             turn_secret: std::env::var("REMOTE_TURN_SECRET")
                 .ok()
                 .map(String::into_bytes),
+            turn_tcp_bridge: crate::turn_mux::bridge_target(
+                std::env::var("REMOTE_TURN_TCP_BRIDGE").ok(),
+            )?,
         })
     }
 

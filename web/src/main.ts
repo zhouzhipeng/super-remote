@@ -52,6 +52,7 @@ async function sessionView(deviceId: string): Promise<void> {
   let progressStarted = performance.now();
   let progressTimer = 0;
   let progressHideTimer = 0;
+  let pictureReady = false;
   const stopProgressClock = (): void => {
     window.clearInterval(progressTimer);
     progressTimer = 0;
@@ -65,6 +66,17 @@ async function sessionView(deviceId: string): Promise<void> {
     }, 100);
   };
   const renderConnectionProgress = ({ phase, detail }: ConnectionProgressDetail): void => {
+    if (phase === "signaling") pictureReady = false;
+    // Once video is visible, transient waiting/ICE/playing events must never
+    // cover it with the animated loading screen. Keep recovery status inline.
+    if (pictureReady) {
+      if (phase === "reconnecting" || phase === "failed") {
+        state.textContent = detail ?? connectionProgressSnapshot(phase).title;
+      } else if (phase === "ready") {
+        state.textContent = "已连接";
+      }
+      return;
+    }
     window.clearTimeout(progressHideTimer);
     if (phase === "signaling") startProgressClock();
     progressOverlay.hidden = false;
@@ -82,6 +94,7 @@ async function sessionView(deviceId: string): Promise<void> {
     });
     state.textContent = snapshot.title;
     if (phase === "ready") {
+      pictureReady = true;
       stopProgressClock();
       progressOverlay.classList.add("is-complete");
       progressHideTimer = window.setTimeout(() => { progressOverlay.hidden = true; }, 850);
