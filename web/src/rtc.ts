@@ -123,6 +123,12 @@ export class RemoteSession extends EventTarget {
       this.video.addEventListener(name, this.#onMediaEvent);
     }
     peer.ontrack = (event) => {
+      if (event.track.kind === "video") {
+        // Preserve text and one-pixel UI details on Retina displays. Safari
+        // treats `detail` as a screen-content hint when its decoder supports it.
+        try { event.track.contentHint = "detail"; } catch { /* optional browser hint */ }
+        this.#requestLowLatencyPlayback();
+      }
       if (!this.#remoteStream.getTracks().some((track) => track.id === event.track.id)) {
         this.#remoteStream.addTrack(event.track);
       }
@@ -424,10 +430,9 @@ export class RemoteSession extends EventTarget {
   }
 
   #requestLowLatencyPlayback(): void {
-    // One to two frames are enough to absorb LAN/capture scheduling variance.
-    // A zero-sized buffer exposes every small arrival-time fluctuation as a
-    // repeated or skipped frame, which is especially visible on 60 FPS video.
-    const jitterBufferMs = 35;
+    // Stability is preferred over shaving the final few milliseconds. Around
+    // five 60 Hz frames absorb capture, encoder and Safari compositor variance.
+    const jitterBufferMs = 80;
     const playoutDelaySeconds = jitterBufferMs / 1000;
     type LowLatencyReceiver = RTCRtpReceiver & {
       jitterBufferTarget?: number;
@@ -453,6 +458,12 @@ export class RemoteSession extends EventTarget {
   async #report(stage: string): Promise<void> {
     const reports = this.#peer ? [...(await this.#peer.getStats()).values()] : [];
     const inbound = reports.find((item) => item.type === "inbound-rtp" && item.kind === "video");
+    const videoInbound = inbound as (RTCInboundRtpStreamStats & {
+      freezeCount?: number;
+      totalFreezesDuration?: number;
+      jitterBufferDelay?: number;
+      jitterBufferEmittedCount?: number;
+    }) | undefined;
     const audioInbound = reports.find((item) => item.type === "inbound-rtp" && item.kind === "audio");
     const candidates = new Map(reports
       .filter((item) => item.type === "local-candidate" || item.type === "remote-candidate")
@@ -502,6 +513,11 @@ export class RemoteSession extends EventTarget {
       bytesReceived: inbound?.bytesReceived ?? null,
       packetsLost: inbound?.packetsLost ?? null,
       framesDropped: quality?.droppedVideoFrames ?? null,
+      freezeCount: videoInbound?.freezeCount ?? null,
+      totalFreezesDuration: videoInbound?.totalFreezesDuration ?? null,
+      averageJitterBufferMs: videoInbound?.jitterBufferEmittedCount
+        ? ((videoInbound.jitterBufferDelay ?? 0) / videoInbound.jitterBufferEmittedCount) * 1000
+        : null,
       mediaError: this.video.error?.message ?? null,
     }).catch(() => undefined);
   }

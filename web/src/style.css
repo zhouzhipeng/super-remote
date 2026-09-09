@@ -21,7 +21,19 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .status { position: absolute; right: 1.2rem; top: 1.2rem; width: 9px; height: 9px; border-radius: 50%; background: #596174; }
 .status.online { background: #42d392; box-shadow: 0 0 12px #42d392; }
 .remote { position: relative; width: 100vw; height: 100vh; overflow: hidden; background: black; display: grid; grid-template-rows: minmax(0, 1fr) auto; }
-.remote video { display: block; width: 100%; height: 100%; object-fit: contain; outline: none; touch-action: none; user-select: none; }
+.remote video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  outline: none;
+  touch-action: none;
+  user-select: none;
+  background: #000;
+  image-rendering: auto;
+  backface-visibility: hidden;
+  transform: translateZ(0);
+}
 .connection-overlay { position: absolute; z-index: 2; inset: 0 0 48px; display: grid; place-items: center; overflow: hidden; padding: 1.25rem; isolation: isolate; color: #f7f9ff; background: radial-gradient(circle at 50% 38%, #18385a73 0, #09111ee6 35%, #03060cf5 78%); transition: opacity 500ms ease, visibility 500ms ease; }
 .connection-overlay[hidden] { display: none; }
 .connection-overlay::before { content: ""; position: absolute; z-index: -2; inset: 0; opacity: .36; background-image: linear-gradient(#8bbcff0a 1px, transparent 1px), linear-gradient(90deg, #8bbcff0a 1px, transparent 1px); background-size: 34px 34px; mask-image: radial-gradient(circle at center, #000 10%, transparent 72%); }

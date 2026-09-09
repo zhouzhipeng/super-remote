@@ -115,14 +115,19 @@ async fn stream_ffmpeg(
     active: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let bitrate = config.bitrate.to_string();
-    let buffer_size = (config.bitrate / u32::from(config.fps)).to_string();
+    // A one-frame VBV makes every IDR consume nearly the complete budget and
+    // causes visible quality/brightness pumping in Safari. Four frames still
+    // keep latency low while giving the encoder enough room for a clean IDR.
+    let buffer_size = ffmpeg_buffer_size(config.bitrate, config.fps).to_string();
     let fps = config.fps.to_string();
     // Poll Desktop Duplication slightly faster than the RTP cadence. Display
     // refresh and Windows timer quantization otherwise leave a 60 Hz request at
     // roughly 55-57 delivered frames/s. The latest-frame slot below absorbs the
     // excess without building a queue.
     let desktop_duplication_fps = (u32::from(config.fps) * 67 / 60).to_string();
-    let gop = config.fps.to_string();
+    // A two-second GOP reduces periodic IDR pulses without making recovery from
+    // packet loss unreasonably slow. WebRTC can still request an earlier IDR.
+    let gop = ffmpeg_gop_frames(config.fps).to_string();
     let scale = ffmpeg_video_filter(
         &config.ffmpeg_capture_mode,
         &config.ffmpeg_encoder,
@@ -277,11 +282,10 @@ async fn stream_ffmpeg(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("FFmpeg stdout was not piped"))?;
-    // A one-frame handoff adds at most one frame of buffering. Blocking the
-    // producer when it is full applies backpressure before NVENC can build a
-    // backlog and, critically, never removes a reference P-frame from the H.264
-    // chain. RTP frame batching keeps this handoff empty during normal operation.
-    let (frame_tx, mut frame_rx) = mpsc::channel::<Bytes>(1);
+    // Keep a short, bounded runway so bursty Desktop Duplication delivery can be
+    // emitted at an even cadence. Blocking the producer preserves every H.264
+    // reference frame and pushes back into FFmpeg instead of growing latency.
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Bytes>(4);
     let (initial_frame_tx, initial_frame_rx) = oneshot::channel();
     let reader_active = active.clone();
     std::thread::Builder::new()
@@ -369,6 +373,8 @@ async fn stream_ffmpeg(
     let mut sent_in_window = 0u64;
     let mut max_write_time = Duration::ZERO;
     let mut report_at = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut next_frame_at = tokio::time::Instant::now() + duration;
+    let mut pacing_rebases = 0u64;
     let result = async {
         while active.load(Ordering::Acquire) {
             let data = tokio::select! {
@@ -382,6 +388,15 @@ async fn stream_ffmpeg(
                     continue;
                 }
             };
+            let now = tokio::time::Instant::now();
+            if now < next_frame_at {
+                tokio::time::sleep_until(next_frame_at).await;
+            } else {
+                // Never send a late backlog as a burst. Rebase the cadence at
+                // the current frame so Safari always sees evenly spaced RTP.
+                next_frame_at = now;
+                pacing_rebases += 1;
+            }
             let write_started = tokio::time::Instant::now();
             let write_result = track
                 .sample_writer(ssrc, payload_type)
@@ -405,19 +420,30 @@ async fn stream_ffmpeg(
                     width = config.width,
                     height = config.height,
                     sent_frames = sent_in_window,
+                    pacing_rebases,
                     max_rtp_write_us = max_write_time.as_micros(),
                     "video pipeline five-second window"
                 );
                 sent_in_window = 0;
+                pacing_rebases = 0;
                 max_write_time = Duration::ZERO;
                 report_at += Duration::from_secs(5);
             }
+            next_frame_at += duration;
         }
         anyhow::Ok(())
     }
     .await;
     let _ = child.kill();
     result
+}
+
+fn ffmpeg_buffer_size(bitrate: u32, fps: u16) -> u32 {
+    bitrate.div_ceil(u32::from(fps)).saturating_mul(4)
+}
+
+fn ffmpeg_gop_frames(fps: u16) -> u32 {
+    u32::from(fps).saturating_mul(2)
 }
 
 fn ffmpeg_video_filter(
@@ -630,7 +656,7 @@ async fn track_ssrc(track: &Arc<TrackLocalStaticSample>) -> anyhow::Result<u32> 
 
 #[cfg(test)]
 mod tests {
-    use super::{ffmpeg_video_filter, h264_vcl_nal};
+    use super::{ffmpeg_buffer_size, ffmpeg_gop_frames, ffmpeg_video_filter, h264_vcl_nal};
 
     #[test]
     fn only_h264_picture_slices_advance_time() {
@@ -673,5 +699,11 @@ mod tests {
             ffmpeg_video_filter("gdigrab", "h264_amf", 1920, 1200, 30),
             "scale=width=1920:height=1200:flags=fast_bilinear,format=nv12,setpts=N/(30*TB)"
         );
+    }
+
+    #[test]
+    fn ffmpeg_rate_control_has_a_stable_low_latency_window() {
+        assert_eq!(ffmpeg_buffer_size(20_000_000, 60), 1_333_336);
+        assert_eq!(ffmpeg_gop_frames(60), 120);
     }
 }
