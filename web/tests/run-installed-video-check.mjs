@@ -13,7 +13,10 @@ try {
   await context.addInitScript(() => {
     const NativePeer = window.RTCPeerConnection;
     window.RTCPeerConnection = class extends NativePeer {
-      constructor(configuration) { super(configuration); window.__videoCheck = this; }
+      addTransceiver(kind, init) {
+        if (kind === "video") window.__videoCheck = this;
+        return super.addTransceiver(kind, init);
+      }
     };
   });
   const page = await context.newPage();
@@ -31,7 +34,10 @@ try {
     const video = document.querySelector("video");
     return { time: performance.now(), frames: inbound.framesDecoded, width: video.videoWidth,
       height: video.videoHeight, codec: codec.mimeType, freezeCount: inbound.freezeCount ?? 0,
-      connection: window.__videoCheck.connectionState };
+      connection: window.__videoCheck.connectionState,
+      packetsLost: inbound.packetsLost ?? 0, framesDropped: inbound.framesDropped ?? 0,
+      bytesReceived: inbound.bytesReceived ?? 0,
+      totalDecodeTime: inbound.totalDecodeTime ?? 0 };
   });
   const first = await sample();
   await page.waitForTimeout(30_000);

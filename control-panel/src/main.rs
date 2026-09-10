@@ -6,6 +6,9 @@ fn main() {
 }
 
 #[cfg(windows)]
+mod privacy;
+
+#[cfg(windows)]
 mod windows_app {
     use std::{
         ffi::c_void,
@@ -196,6 +199,53 @@ mod windows_app {
     struct LocalInputHooks {
         keyboard: HHOOK,
         mouse: HHOOK,
+    }
+
+    // Windows dispatches low-level hooks synchronously to their installing
+    // thread. Never put this message pump behind panel I/O, DWM, or audio COM.
+    struct LocalInputThread {
+        thread_id: u32,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl LocalInputThread {
+        fn install(window: HWND, instance: HINSTANCE) -> Result<Self, String> {
+            let window = window.0 as isize;
+            let instance = instance.0 as isize;
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::Builder::new().name("privacy-input-hooks".into())
+                .spawn(move || {
+                    use windows::Win32::{System::Threading::{GetCurrentThread,
+                        GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_HIGHEST},
+                        UI::WindowsAndMessaging::{PeekMessageW, PM_NOREMOVE}};
+                    let mut message = MSG::default();
+                    unsafe { let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE); }
+                    let setup = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) }
+                        .map_err(|error| error.to_string())
+                        .and_then(|_| LocalInputHooks::install(HWND(window as *mut _), HINSTANCE(instance as *mut _)));
+                    let hooks = match setup {
+                        Ok(hooks) => hooks,
+                        Err(error) => { let _ = ready_tx.send(Err(error)); return; }
+                    };
+                    if ready_tx.send(Ok(unsafe { GetCurrentThreadId() })).is_err() { return; }
+                    while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
+                        unsafe { DispatchMessageW(&message); }
+                    }
+                    drop(hooks);
+                }).map_err(|error| error.to_string())?;
+            match ready_rx.recv().map_err(|error| error.to_string())? {
+                Ok(thread_id) => Ok(Self { thread_id, worker: Some(worker) }),
+                Err(error) => { let _ = worker.join(); Err(error) }
+            }
+        }
+    }
+
+    impl Drop for LocalInputThread {
+        fn drop(&mut self) {
+            use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+            unsafe { let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)); }
+            if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        }
     }
 
     impl LocalInputHooks {
@@ -840,7 +890,8 @@ mod windows_app {
             };
             unsafe { SetLayeredWindowAttributes(self.overlay, COLORREF(0), 255, LWA_ALPHA) }?;
             self.privacy_supported =
-                unsafe { SetWindowDisplayAffinity(self.overlay, WDA_EXCLUDEFROMCAPTURE) }.is_ok();
+                crate::privacy::protect_from_peek(self.overlay).is_ok()
+                    && unsafe { SetWindowDisplayAffinity(self.overlay, WDA_EXCLUDEFROMCAPTURE) }.is_ok();
             if !self.privacy_supported {
                 set_text(
                     self.policy_label,
@@ -1016,6 +1067,7 @@ mod windows_app {
                 self.privacy_visible = visible;
             }
             if visible {
+                crate::privacy::keep_above_popups(self.overlay);
                 set_text_if_changed(
                     self.action_label,
                     if self.client_connected {
@@ -1379,7 +1431,9 @@ mod windows_app {
                 .map_err(|error| error.to_string())?;
             app.create_overlay(instance)
                 .map_err(|error| error.to_string())?;
-            let _local_input_hooks = LocalInputHooks::install(app.window, instance)?;
+            let _local_input_hooks = LocalInputThread::install(app.window, instance)?;
+            let _privacy_hooks = crate::privacy::PrivacyHooks::install(app.overlay)
+                .map_err(|error| format!("无法安装隐私遮罩层级防护: {error}"))?;
             app.refresh();
             let _ = ShowWindow(app.window, SW_SHOWNORMAL);
             SetTimer(Some(app.window), 1, 500, None);
@@ -2249,6 +2303,16 @@ mod windows_app {
             let connected = next_privacy_latch(false, true, true, true);
             assert!(connected);
             assert!(next_privacy_latch(connected, false, true, true));
+        }
+
+        #[test]
+        fn input_hooks_have_an_independent_message_pump_and_stop_cleanly() {
+            let instance = HINSTANCE(unsafe { GetModuleHandleW(None) }.unwrap().0);
+            let hooks = LocalInputThread::install(HWND::default(), instance).unwrap();
+            assert_ne!(hooks.thread_id, unsafe {
+                windows::Win32::System::Threading::GetCurrentThreadId()
+            });
+            drop(hooks); // posts WM_QUIT and joins; no panel message pumping needed
         }
 
         #[test]

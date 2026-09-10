@@ -724,10 +724,17 @@ mod windows_launcher {
         height: u32,
     ) -> anyhow::Result<VideoPipeline> {
         let ffmpeg = root.join("ffmpeg.exe");
+        let mut failed_stage = "NVIDIA NVENC 编码自检未通过";
         require_verified_60fps(|| {
             check_shutdown(shutdown_marker)?;
-            let ready = probe_ffmpeg_encoder(&ffmpeg, "h264_nvenc", shutdown_marker)?
-                && probe_desktop_pipeline(&ffmpeg, shutdown_marker, width, height)?;
+            failed_stage = "NVIDIA NVENC 编码自检未通过";
+            let encoder_ready = probe_ffmpeg_encoder(&ffmpeg, "h264_nvenc", shutdown_marker)?;
+            let ready = if encoder_ready {
+                failed_stage = "NVENC 编码自检已通过，但 Desktop Duplication 桌面采集自检失败或超时；请确认宿主机屏幕已点亮且桌面未锁定，再重试";
+                probe_desktop_pipeline(&ffmpeg, shutdown_marker, width, height)?
+            } else {
+                false
+            };
             if !ready {
                 // A previous GPU process may still be releasing driver resources.
                 // Keep cancellation responsive while giving initialization time.
@@ -740,7 +747,7 @@ mod windows_launcher {
         })
         .with_context(|| {
             format!(
-                "无法启动 60 FPS 恒定画质采集，未降级到 30 FPS。请检查 {}",
+                "无法启动 60 FPS 恒定画质采集，未降级到 30 FPS。{failed_stage}。请检查 {}",
                 shutdown_marker
                     .parent()
                     .unwrap_or(root)
@@ -767,7 +774,7 @@ mod windows_launcher {
             }
         }
         bail!(
-            "NVENC / Desktop Duplication 连续三次初始化未通过；60 FPS 模式需要可用的 NVIDIA 编码器"
+            "60 FPS 视频管线连续三次自检未通过"
         )
     }
 
@@ -869,7 +876,10 @@ mod windows_launcher {
             &BTreeMap::new(),
         )?;
         let result = (|| {
-            let deadline = Instant::now() + Duration::from_secs(15);
+            // Desktop Duplication can take longer to produce its first frame
+            // after display wake or driver initialization. This is startup
+            // patience, not a reduction in the required capture frame rate.
+            let deadline = Instant::now() + Duration::from_secs(45);
             loop {
                 check_shutdown(shutdown_marker)?;
                 if let Some(status) = child.try_wait()? {

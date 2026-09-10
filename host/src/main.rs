@@ -5,6 +5,8 @@ mod clipboard;
 mod config;
 mod control;
 #[cfg(windows)]
+mod cursor;
+#[cfg(windows)]
 mod display_power;
 mod ffmpeg_options;
 mod input;
@@ -72,6 +74,8 @@ async fn main() -> anyhow::Result<()> {
                 sdp,
                 viewport_width,
                 viewport_height,
+                local_cursor,
+                input_sdp,
             } => {
                 // MVP is a single-controller desktop. A fresh connection replaces stale or
                 // background mobile tabs immediately so hardware encoders cannot accumulate.
@@ -85,7 +89,8 @@ async fn main() -> anyhow::Result<()> {
                     item.stop_media();
                     let _ = item.peer.close().await;
                 }
-                let session_config = config.for_viewport(viewport_width, viewport_height);
+                let mut session_config = config.for_viewport(viewport_width, viewport_height);
+                Arc::make_mut(&mut session_config).local_cursor = local_cursor && cfg!(windows) && config.h264_file.is_none();
                 control.preparing(session_id, &session_config);
                 match rtc::accept_offer(
                     session_config,
@@ -93,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
                     sdp,
                     outbound_tx.clone(),
                     control.clone(),
+                    input_sdp,
                 )
                 .await
                 {
@@ -108,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
                 sdp_mid,
                 sdp_mline_index,
                 username_fragment,
+                input,
             } => {
                 let (transport, candidate_kind, uses_mdns) = ice_candidate_diagnostics(&candidate);
                 info!(
@@ -122,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
                     .lock()
                     .await
                     .get(&session_id)
-                    .map(|item| item.peer.clone())
+                    .and_then(|item| if input { item.input_peer.clone() } else { Some(item.peer.clone()) })
                     && let Err(error) = peer
                         .add_ice_candidate(webrtc::peer_connection::RTCIceCandidateInit {
                             candidate,
@@ -143,6 +150,10 @@ async fn main() -> anyhow::Result<()> {
                     let _ = session.peer.close().await;
                 }
                 control.disconnected(session_id);
+            }
+            ServerSignal::InputPacket { session_id, data } => {
+                let sender = sessions.lock().await.get(&session_id).map(|session| session.input_control.clone());
+                if let Some(sender) = sender { let _ = sender.send(data).await; }
             }
             ServerSignal::Error { code, message } => warn!(%code, %message, "signaling error"),
             _ => {}

@@ -7,7 +7,7 @@ use remote_protocol::{
     signaling::{ClientSignal, ServerSignal},
 };
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::{
     auth::{Principal, Role},
@@ -19,7 +19,19 @@ pub async fn serve(socket: WebSocket, state: Arc<AppState>, principal: Principal
     let (tx, mut rx) = mpsc::channel::<ServerSignal>(64);
 
     let writer = tokio::spawn(async move {
-        while let Some(signal) = rx.recv().await {
+        // Keep the authenticated control socket active even when all user
+        // input travels over the independent RTC connection. WebSocket Ping
+        // is answered by browsers even when background JS timers are throttled.
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let signal = tokio::select! {
+                _ = heartbeat.tick() => {
+                    if ws_tx.send(Message::Ping(Vec::new().into())).await.is_err() { break; }
+                    continue;
+                }
+                signal = rx.recv() => match signal { Some(signal) => signal, None => break },
+            };
             let Ok(json) = serde_json::to_string(&signal) else {
                 continue;
             };
@@ -30,7 +42,18 @@ pub async fn serve(socket: WebSocket, state: Arc<AppState>, principal: Principal
     });
     let _ = tx.send(ServerSignal::Ready).await;
 
-    while let Some(Ok(message)) = ws_rx.next().await {
+    while let Some(result) = ws_rx.next().await {
+        let message = match result {
+            Ok(Message::Close(frame)) => {
+                info!(subject = %principal.subject, code = ?frame.as_ref().map(|frame| frame.code), "signaling websocket close received");
+                break;
+            }
+            Ok(message) => message,
+            Err(error) => {
+                warn!(subject = %principal.subject, %error, "signaling websocket receive failed");
+                break;
+            }
+        };
         let Message::Text(text) = message else {
             continue;
         };
@@ -64,7 +87,7 @@ pub async fn serve(socket: WebSocket, state: Arc<AppState>, principal: Principal
         }
     }
     writer.abort();
-    debug!(subject = %principal.subject, "websocket disconnected");
+    info!(subject = %principal.subject, "websocket disconnected");
 }
 
 async fn handle_signal(
@@ -100,6 +123,8 @@ async fn handle_signal(
             sdp,
             viewport_width,
             viewport_height,
+            local_cursor,
+            input_sdp,
         } if principal.role == Role::User => {
             if !state
                 .authorize_offer(session_id, &principal.subject, &session_token, tx.clone())
@@ -140,16 +165,79 @@ async fn handle_signal(
                         sdp,
                         viewport_width,
                         viewport_height,
+                        local_cursor,
+                        input_sdp: input_sdp.map(|sdp| strip_inline_ice_candidates(sdp).0),
                     },
                 )
                 .await
         }
-        ClientSignal::WebrtcAnswer { session_id, sdp } if principal.role == Role::Device => {
+        ClientSignal::WebrtcAnswer {
+            session_id,
+            sdp,
+            input_control,
+            local_cursor,
+            input_sdp,
+        } if principal.role == Role::Device => {
             state
                 .route_to_browser(
                     session_id,
                     &principal.subject,
-                    ServerSignal::WebrtcAnswer { session_id, sdp },
+                    ServerSignal::WebrtcAnswer {
+                        session_id,
+                        sdp,
+                        input_control,
+                        local_cursor,
+                        input_sdp,
+                    },
+                )
+                .await
+        }
+        ClientSignal::InputPacket { session_id, data } if principal.role == Role::User => {
+            if !valid_input_control_packet(&data) {
+                return false;
+            }
+            let bound = state
+                .sessions
+                .read()
+                .await
+                .get(&session_id)
+                .is_some_and(|session| {
+                    session.owner == principal.subject
+                        && session
+                            .browser_sender
+                            .as_ref()
+                            .is_some_and(|sender| sender.same_channel(tx))
+                });
+            if !bound {
+                return false;
+            }
+            state
+                .route_to_device(
+                    session_id,
+                    &principal.subject,
+                    ServerSignal::InputPacket { session_id, data },
+                )
+                .await
+        }
+        ClientSignal::InputAck { session_id, data } if principal.role == Role::Device => {
+            if !valid_input_control_packet(&data) {
+                return false;
+            }
+            let bound = state
+                .devices
+                .read()
+                .await
+                .get(&principal.subject)
+                .and_then(|device| device.sender.as_ref())
+                .is_some_and(|sender| sender.same_channel(tx));
+            if !bound {
+                return false;
+            }
+            state
+                .route_to_browser(
+                    session_id,
+                    &principal.subject,
+                    ServerSignal::InputAck { session_id, data },
                 )
                 .await
         }
@@ -159,6 +247,7 @@ async fn handle_signal(
             sdp_mid,
             sdp_mline_index,
             username_fragment,
+            input,
         } => {
             let (candidate, mdns_rewritten) = match principal.role {
                 Role::User => rewrite_mdns_candidate(candidate, peer_ip),
@@ -178,6 +267,7 @@ async fn handle_signal(
                 sdp_mid,
                 sdp_mline_index,
                 username_fragment,
+                input,
             };
             match principal.role {
                 Role::User => {
@@ -215,11 +305,15 @@ async fn handle_signal(
             routed
         }
         ClientSignal::Ping { nonce } => tx.send(ServerSignal::Pong { nonce }).await.is_ok(),
-        unauthorized => {
-            warn!(subject = %principal.subject, signal = ?unauthorized, "rejected websocket signal");
+        _ => {
+            warn!(subject = %principal.subject, "rejected websocket signal");
             false
         }
     }
+}
+
+fn valid_input_control_packet(data: &[u8]) -> bool {
+    data.len() <= 18 && remote_protocol::input::TimedInputEvent::decode(data).is_ok()
 }
 
 fn rewrite_mdns_candidate(candidate: String, peer_ip: IpAddr) -> (String, bool) {
@@ -273,6 +367,97 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{rewrite_mdns_candidate, strip_inline_ice_candidates};
+
+    #[tokio::test]
+    async fn control_input_requires_bound_live_session_and_correct_socket_and_role() {
+        use super::*;
+        use crate::auth::AuthConfig;
+        use remote_protocol::{
+            device::DeviceCapabilities,
+            input::{InputEvent, TimedInputEvent},
+        };
+        let state = Arc::new(AppState::new(AuthConfig::for_tests()));
+        let user = Principal {
+            subject: "user".into(),
+            role: Role::User,
+        };
+        let device = Principal {
+            subject: "host".into(),
+            role: Role::Device,
+        };
+        let (device_tx, mut device_rx) = mpsc::channel(16);
+        let (browser_tx, mut browser_rx) = mpsc::channel(16);
+        let (other_tx, _other_rx) = mpsc::channel(16);
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert!(
+            handle_signal(
+                &state,
+                &device,
+                &device_tx,
+                ip,
+                ClientSignal::DeviceRegister {
+                    device_id: "host".into(),
+                    name: "test".into(),
+                    capabilities: DeviceCapabilities::default()
+                }
+            )
+            .await
+        );
+        let session = state.create_session("user", "host").await.unwrap();
+        device_rx.recv().await.unwrap();
+        let data = TimedInputEvent {
+            flags: 1,
+            timestamp_us: 123,
+            event: InputEvent::MouseRelative { dx: 0, dy: 0 },
+        }
+        .encode();
+        let packet = ClientSignal::InputPacket {
+            session_id: session.session_id,
+            data: data.clone(),
+        };
+        assert!(!handle_signal(&state, &user, &browser_tx, ip, packet.clone()).await);
+        assert!(
+            state
+                .authorize_offer(
+                    session.session_id,
+                    "user",
+                    &session.session_token,
+                    browser_tx.clone()
+                )
+                .await
+        );
+        assert!(!handle_signal(&state, &user, &other_tx, ip, packet.clone()).await);
+        assert!(!handle_signal(&state, &device, &device_tx, ip, packet.clone()).await);
+        assert!(handle_signal(&state, &user, &browser_tx, ip, packet.clone()).await);
+        assert!(
+            matches!(device_rx.recv().await, Some(ServerSignal::InputPacket { data: received, .. }) if received == data)
+        );
+        let ack = ClientSignal::InputAck {
+            session_id: session.session_id,
+            data: data.clone(),
+        };
+        assert!(!handle_signal(&state, &user, &browser_tx, ip, ack.clone()).await);
+        assert!(!handle_signal(&state, &device, &other_tx, ip, ack.clone()).await);
+        assert!(handle_signal(&state, &device, &device_tx, ip, ack).await);
+        assert!(
+            matches!(browser_rx.recv().await, Some(ServerSignal::InputAck { data: received, .. }) if received == data)
+        );
+        assert!(
+            !handle_signal(
+                &state,
+                &user,
+                &browser_tx,
+                ip,
+                ClientSignal::InputPacket {
+                    session_id: session.session_id,
+                    data: vec![0; 19]
+                }
+            )
+            .await
+        );
+        state.sessions.write().await.remove(&session.session_id);
+        assert!(!handle_signal(&state, &user, &browser_tx, ip, packet).await);
+    }
 
     #[test]
     fn rewrites_chromium_mdns_host_candidate_to_authenticated_peer_ip() {

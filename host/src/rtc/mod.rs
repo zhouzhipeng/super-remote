@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 use ::rtc::{
@@ -54,10 +54,16 @@ struct Handler {
     retired: Arc<AtomicBool>,
     media_state: watch::Sender<MediaState>,
     control: Arc<ControlStatus>,
+    input_channels: Arc<AtomicU8>,
+    input_state: Arc<std::sync::Mutex<input::SessionInput>>,
+    local_cursor: bool,
+    control_only: bool,
 }
 
 pub struct AcceptedSession {
     pub peer: Arc<dyn PeerConnection>,
+    pub input_peer: Option<Arc<dyn PeerConnection>>,
+    pub input_control: mpsc::Sender<Vec<u8>>,
     media_active: Arc<AtomicBool>,
     retired: Arc<AtomicBool>,
     media_state: watch::Sender<MediaState>,
@@ -86,6 +92,11 @@ impl MediaState {
 
 impl AcceptedSession {
     pub fn stop_media(&self) {
+        if let Some(peer) = self.input_peer.clone() {
+            tokio::spawn(async move {
+                let _ = peer.close().await;
+            });
+        }
         // Retirement is permanent. A late Connected callback from a peer that
         // is being replaced must never reopen capture or the hardware encoder.
         self.retired.store(true, Ordering::Release);
@@ -129,11 +140,15 @@ impl PeerConnectionEventHandler for Handler {
                 sdp_mid: candidate.sdp_mid,
                 sdp_mline_index: candidate.sdp_mline_index,
                 username_fragment: candidate.username_fragment,
+                input: self.control_only,
             })
             .await;
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        if self.control_only {
+            return;
+        }
         info!(session_id = %self.session_id, %state, "peer connection state changed");
         match state {
             RTCPeerConnectionState::Connected => {
@@ -205,8 +220,17 @@ impl PeerConnectionEventHandler for Handler {
     async fn on_data_channel(&self, channel: Arc<dyn DataChannel>) {
         let runtime = self.runtime.clone();
         let stats = self.stats.clone();
+        let input_channels = self.input_channels.clone();
+        let retired = self.retired.clone();
+        let input_state = self.input_state.clone();
+        let local_cursor = self.local_cursor;
         runtime.spawn(Box::pin(async move {
             let label = channel.label().await.unwrap_or_default();
+            if label == "cursor" && local_cursor {
+                #[cfg(windows)]
+                crate::cursor::serve(channel, retired).await;
+                return;
+            }
             if label == "clipboard" {
                 debug!(%label, "clipboard data channel created");
                 serve_clipboard(channel).await;
@@ -218,29 +242,52 @@ impl PeerConnectionEventHandler for Handler {
                 return;
             }
             debug!(%label, "input data channel created");
-            while let Some(event) = channel.poll().await {
-                match event {
-                    DataChannelEvent::OnMessage(message) if !message.is_string => {
-                        match input::inject_packet(&message.data) {
-                            Ok(input) => {
-                                stats.input_ok();
-                                // Bit 0 requests a tiny post-injection echo. It lets the
-                                // browser report real input round-trip latency without
-                                // delaying this receive loop or every high-rate move.
-                                if input.flags & 1 != 0 {
-                                    let _ = channel.try_send(message.data.clone()).await;
+            let bit = if label == "input-fast" { 1 } else { 2 };
+            if input_channels.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+                let _ = channel.close().await;
+                return;
+            }
+            let worker_channel = channel.clone();
+            let worker = async move {
+                let channel = worker_channel;
+                while let Some(event) = channel.poll().await {
+                    if retired.load(Ordering::Acquire) {
+                        break;
+                    }
+                    match event {
+                        DataChannelEvent::OnMessage(message) if !message.is_string => {
+                            let result = input_state.lock().unwrap().inject(&message.data);
+                            match result {
+                                Ok(Some(input)) => {
+                                    stats.input_ok();
+                                    // Bit 0 requests a tiny post-injection echo. It lets the
+                                    // browser report real input round-trip latency without
+                                    // delaying this receive loop or every high-rate move.
+                                    if input.flags & 1 != 0 {
+                                        let _ = channel.try_send(message.data.clone()).await;
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    stats.input_invalid();
+                                    warn!(%error, %label, "rejected input packet");
                                 }
                             }
-                            Err(error) => {
-                                stats.input_invalid();
-                                warn!(%error, %label, "rejected input packet");
-                            }
                         }
+                        DataChannelEvent::OnMessage(_) => {
+                            warn!(%label, "text input message rejected")
+                        }
+                        DataChannelEvent::OnClose => break,
+                        _ => {}
                     }
-                    DataChannelEvent::OnMessage(_) => warn!(%label, "text input message rejected"),
-                    DataChannelEvent::OnClose => break,
-                    _ => {}
                 }
+                if bit == 2 {
+                    input_state.lock().unwrap().release_rtc();
+                }
+            };
+            if let Err(error) = input::spawn_priority(format!("remote-input-{bit}"), worker) {
+                warn!(%error, "could not start dedicated input receiver");
+                let _ = channel.close().await;
             }
         }));
     }
@@ -343,6 +390,7 @@ pub async fn accept_offer(
     sdp: String,
     outbound: mpsc::Sender<ClientSignal>,
     control: Arc<ControlStatus>,
+    input_sdp: Option<String>,
 ) -> anyhow::Result<AcceptedSession> {
     info!(
         %session_id,
@@ -363,7 +411,7 @@ pub async fn accept_offer(
     media_engine.register_codec(codec.clone(), RtpCodecKind::Video)?;
     media_engine.register_codec(audio_codec.clone(), RtpCodecKind::Audio)?;
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
-    let ice_servers = config
+    let ice_servers: Vec<RTCIceServer> = config
         .ice_servers
         .iter()
         .map(|server| RTCIceServer {
@@ -377,6 +425,7 @@ pub async fn accept_offer(
     let media_active = Arc::new(AtomicBool::new(false));
     let retired = Arc::new(AtomicBool::new(false));
     let (media_state, media_state_rx) = watch::channel(MediaState::WAITING);
+    let input_state = Arc::new(std::sync::Mutex::new(input::SessionInput::default()));
     let handler = Arc::new(Handler {
         session_id,
         outbound: outbound.clone(),
@@ -386,12 +435,16 @@ pub async fn accept_offer(
         retired: retired.clone(),
         media_state: media_state.clone(),
         control,
+        input_channels: Arc::new(AtomicU8::new(0)),
+        input_state: input_state.clone(),
+        local_cursor: config.local_cursor,
+        control_only: false,
     });
     let peer = Arc::new(
         PeerConnectionBuilder::new()
             .with_configuration(
                 RTCConfigurationBuilder::new()
-                    .with_ice_servers(ice_servers)
+                    .with_ice_servers(ice_servers.clone())
                     .build(),
             )
             // Chromium on macOS publishes its LAN address as an mDNS `.local`
@@ -402,8 +455,8 @@ pub async fn accept_offer(
             .with_setting_engine(host_setting_engine())
             .with_media_engine(media_engine)
             .with_interceptor_registry(registry)
-            .with_handler(handler)
-            .with_runtime(runtime)
+            .with_handler(handler.clone())
+            .with_runtime(runtime.clone())
             // Chrome uses the bundled TURN/TCP server when its direct WebRTC UDP
             // path is blocked. That relay runs on this Windows host; use ordinary
             // UDP datagrams so loopback never receives an unsegmented GSO aggregate.
@@ -456,10 +509,44 @@ pub async fn accept_offer(
         .local_description()
         .await
         .ok_or_else(|| anyhow::anyhow!("local answer is missing"))?;
+    let mut input_peer: Option<Arc<dyn PeerConnection>> = None;
+    let mut input_answer = None;
+    if let Some(sdp) = input_sdp {
+        let mut input_handler = (*handler).clone();
+        input_handler.control_only = true;
+        let control_peer = Arc::new(
+            PeerConnectionBuilder::new()
+                .with_configuration(
+                    RTCConfigurationBuilder::new()
+                        .with_ice_servers(ice_servers)
+                        .build(),
+                )
+                .with_setting_engine(host_setting_engine())
+                .with_handler(Arc::new(input_handler))
+                .with_runtime(runtime)
+                .with_udp_gso_enabled(false)
+                .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
+                .build()
+                .await?,
+        );
+        let offer: RTCSessionDescription =
+            serde_json::from_value(serde_json::json!({"type": "offer", "sdp": sdp}))?;
+        control_peer.set_remote_description(offer).await?;
+        let answer = control_peer.create_answer(None).await?;
+        control_peer.set_local_description(answer).await?;
+        input_answer = control_peer
+            .local_description()
+            .await
+            .map(|answer| answer.sdp);
+        input_peer = Some(control_peer);
+    }
     outbound
         .send(ClientSignal::WebrtcAnswer {
             session_id,
             sdp: answer.sdp,
+            input_control: true,
+            local_cursor: config.local_cursor,
+            input_sdp: input_answer,
         })
         .await?;
 
@@ -494,7 +581,33 @@ pub async fn accept_offer(
             warn!(%session_id, %error, "audio source supervisor stopped");
         }
     });
+    let (input_control, mut input_rx) = mpsc::channel::<Vec<u8>>(128);
+    let input_retired = retired.clone();
+    let input_active = media_active.clone();
+    input::spawn_priority("remote-input-control".into(), async move {
+        while let Some(data) = input_rx.recv().await {
+            if input_retired.load(Ordering::Acquire) {
+                break;
+            }
+            if !input_active.load(Ordering::Acquire) {
+                continue;
+            }
+            let result = input_state.lock().unwrap().inject_control(&data);
+            match result {
+                Ok(Some(event)) => {
+                    if event.flags & 1 != 0 {
+                        let _ = outbound.try_send(ClientSignal::InputAck { session_id, data });
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => warn!(%error, "rejected control input packet"),
+            }
+        }
+        input_state.lock().unwrap().release_all();
+    })?;
     Ok(AcceptedSession {
+        input_peer,
+        input_control,
         peer: peer as Arc<dyn PeerConnection>,
         media_active,
         retired,

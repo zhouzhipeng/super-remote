@@ -123,13 +123,58 @@ masked in the panel.
 The optional “Web 客户端连接后启用本机隐私黑屏” setting covers the complete Windows
 virtual desktop, including every enabled secondary display, while a client is connected.
 The overlay is excluded from Windows capture, so the remote picture and input continue
-normally. After the Web client disconnects, the overlay remains latched until a physical
+normally. The overlay opts out of DWM Peek fading and transitions. Window-show,
+foreground and z-order events repair its topmost position without stealing focus;
+the status timer also checks the order without repainting an unchanged overlay.
+This remains a desktop-window overlay, not a physical display-disconnect or
+secure-desktop security boundary: UAC, Ctrl+Alt+Delete, higher system window bands,
+driver failures and asynchronous window-event races are not guaranteed to be hidden.
+After the Web client disconnects, the overlay remains latched until a physical
 keyboard or mouse attached to the Host generates input; injected `SendInput` events cannot
 release it. “Web 客户端连接后静音主机声音”
 mutes the Host's default playback endpoint without silencing the WebRTC loopback stream;
 the endpoint remains muted after disconnect until the user explicitly unmutes it in Windows.
 Both preferences are stored in `C:\ProgramData\Super Remote\control-settings.json` in an
 installed build (or `.run/control-settings.json` in a developer checkout).
+
+Input receives dedicated `THREAD_PRIORITY_HIGHEST` receiver threads (one fast mouse
+channel and one reliable keyboard/button channel). Privacy keyboard/mouse hooks
+have their own high-priority message pump, isolated from panel file I/O, DWM and
+audio queries. Normal process priority is retained; no real-time scheduling is used.
+Mouse backpressure stores only the newest unsent position; buttons and keys remain
+ordered/reliable and do not wait for animation frames. Video requests the browser's
+minimum safe playout buffer instead of a fixed additional 80 ms. These are latency
+optimizations, not a zero-latency guarantee over a network or a slow target app.
+  New clients negotiate two independent WebRTC PeerConnections: one carries video
+  and audio, the other mouse/keyboard, clipboard and cursor metadata. ICE allocates
+  separate UDP sockets or TURN allocations; fixed public port numbers are not
+  required. Input uses an unordered, non-retransmitting movement channel and a
+  reliable channel for keys, buttons and wheel deltas. A shared Host injection
+  lock and position watermark reject moves older than an already applied click.
+  The authenticated WebSocket control path remains the fallback if the input peer
+  cannot connect or closes. Fallback is permanent for that session, releases held
+  inputs, and rejects late RTC packets. Every control packet is bound to the exact
+  authorized browser socket and session. Shared WAN/FRP congestion still affects
+  both connections; separate transports do not provide bandwidth QoS.
+
+  Local cursor rendering is negotiated explicitly. WGC, Desktop Duplication and
+  GDI capture omit the cursor only for clients that request it; legacy clients
+  retain the captured cursor. The browser renders a native cursor immediately,
+  with Host shape/visibility updates at up to 31 Hz. Custom cursors include a PNG
+  and hotspot (up to 128 px); unsupported shapes fall back to the arrow. Animated
+  custom cursors use a static frame, and desktop-dependent XOR effects cannot be
+  reproduced exactly in a PNG. Browser security prevents warping the user's OS
+  pointer, so remote SetCursorPos operations do not relocate the local pointer.
+  This is absolute-position desktop control, not a Pointer Lock gaming mode.
+  Deploy Host, signaling and Web together to enable all new features.
+
+  `web/tests/run-native-input-e2e.mjs` uses an isolated native Host and generated
+  H.264 test pattern to verify separate ports, post-injection ACKs and WebSocket
+  fallback while video stays connected. It injects only zero-distance relative
+  moves. Set `PLAYWRIGHT_PACKAGE`, `CHROME_EXECUTABLE` and `FFMPEG_EXECUTABLE`;
+  build `remote-host`, Web and then `remote-signaling` first. The FRP integration
+  test also verifies two separate authenticated TCP relay allocations and local
+  cursor metadata. Neither test replaces an installed service.
 
 ```powershell
 npm --prefix web install

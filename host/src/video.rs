@@ -167,8 +167,8 @@ async fn stream_ffmpeg(
             "lavfi".to_owned(),
             "-i".to_owned(),
             format!(
-                "ddagrab=output_idx={}:draw_mouse=1:framerate={}:dup_frames=1",
-                config.monitor_index, desktop_duplication_fps
+                "ddagrab=output_idx={}:draw_mouse={}:framerate={}:dup_frames=1",
+                config.monitor_index, u8::from(!config.local_cursor), desktop_duplication_fps
             ),
         ]);
     } else {
@@ -184,7 +184,7 @@ async fn stream_ffmpeg(
             "-f".to_owned(),
             "gdigrab".to_owned(),
             "-draw_mouse".to_owned(),
-            "1".to_owned(),
+            u8::from(!config.local_cursor).to_string(),
             "-framerate".to_owned(),
             fps.clone(),
         ]);
@@ -480,7 +480,7 @@ async fn stream_windows_hardware(
         let (capture_session, frame_rx) = capture::start(
             CaptureConfig {
                 target: CaptureTarget::Monitor(capture_config.monitor_index),
-                capture_cursor: true,
+                capture_cursor: !capture_config.local_cursor,
             },
             1,
         )?;

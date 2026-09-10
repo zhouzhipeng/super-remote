@@ -8,6 +8,7 @@ import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { createRequire } from "node:module";
 import net from "node:net";
+import dgram from "node:dgram";
 import { networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -102,11 +103,18 @@ async function checkUnauthenticatedTurn(port) {
 
 try {
   const webPort = await freePort();
+  // Windows reserves different dynamic ranges for TCP and UDP (Hyper-V/VPN).
+  // Ask UDP for a usable TURN port instead of recycling a TCP-only probe.
+  const udpProbe = dgram.createSocket("udp4");
+  udpProbe.bind(0, "0.0.0.0");
+  await once(udpProbe, "listening");
+  const turnUdpPort = udpProbe.address().port;
+  udpProbe.close();
   const turnPort = await freePort();
   const deviceToken = randomBytes(24).toString("hex");
   const password = randomBytes(24).toString("hex");
   const secret = randomBytes(32).toString("hex");
-  start(turnExe, ["--public-ip", lanIp, "--tcp-port", String(turnPort), "--udp-port", String(turnPort),
+  start(turnExe, ["--public-ip", lanIp, "--tcp-port", String(turnPort), "--udp-port", String(turnUdpPort),
     "--min-port", "53000", "--max-port", "53100"], { REMOTE_TURN_SECRET: secret });
   start(signalingExe, [], {
     REMOTE_BIND: `127.0.0.1:${webPort}`, REMOTE_ADMIN_USER: "frp-test", REMOTE_ADMIN_PASSWORD: password,
@@ -161,6 +169,7 @@ try {
     const socket = new WebSocket(`ws://${location.host}/api/ws?ticket=${ticket}`);
     const send = (message) => socket.send(JSON.stringify(message));
     let peer;
+    let inputPeer;
     let stream;
     let drawTimer;
     let queue = Promise.resolve();
@@ -189,6 +198,20 @@ try {
               window.__host.channels.push(channel);
               if (channel.label === "frp-proof") channel.onmessage = ({ data }) => channel.send(data);
             };
+            inputPeer = new RTCPeerConnection({ iceServers: [], bundlePolicy: "max-bundle" });
+            inputPeer.onicecandidate = ({ candidate }) => {
+              if (candidate) send({ type: "webrtc_ice", session_id: signal.session_id, input: true,
+                candidate: candidate.candidate.replace(/\S+\.local\b/, lanIp),
+                sdp_mid: null, sdp_mline_index: null, username_fragment: null });
+            };
+            inputPeer.ondatachannel = ({ channel }) => {
+              window.__host.channels.push(channel);
+              if (["frp-proof", "input-fast", "input-reliable"].includes(channel.label)) channel.onmessage = ({ data }) => channel.send(data);
+              if (channel.label === "cursor") channel.onopen = () => channel.send(JSON.stringify({visible: true, shape: "text"}));
+            };
+            await inputPeer.setRemoteDescription({ type: "offer", sdp: signal.input_sdp });
+            const inputAnswer = await inputPeer.createAnswer();
+            await inputPeer.setLocalDescription(inputAnswer);
             const canvas = document.createElement("canvas");
             canvas.width = 1280; canvas.height = 720;
             const ctx = canvas.getContext("2d");
@@ -211,11 +234,14 @@ try {
             parameters.degradationPreference = "maintain-resolution";
             for (const encoding of parameters.encodings) encoding.maxBitrate = 5_000_000;
             await sender.setParameters(parameters);
-            send({ type: "webrtc_answer", session_id: signal.session_id, sdp: answer.sdp });
+            send({ type: "webrtc_answer", session_id: signal.session_id, sdp: answer.sdp,
+              input_sdp: inputAnswer.sdp, input_control: true, local_cursor: true });
           } else if (signal.type === "webrtc_ice") {
-            await peer.addIceCandidate({ candidate: signal.candidate, sdpMid: signal.sdp_mid ?? "0", sdpMLineIndex: signal.sdp_mline_index ?? 0 });
+            await (signal.input ? inputPeer : peer).addIceCandidate({ candidate: signal.candidate, sdpMid: signal.sdp_mid ?? "0", sdpMLineIndex: signal.sdp_mline_index ?? 0 });
+          } else if (signal.type === "input_packet") {
+            send({ type: "input_ack", session_id: signal.session_id, data: signal.data });
           } else if (signal.type === "session_closed") {
-            peer?.close(); stream?.getTracks().forEach((track) => track.stop()); clearInterval(drawTimer);
+            peer?.close(); inputPeer?.close(); stream?.getTracks().forEach((track) => track.stop()); clearInterval(drawTimer);
           } else if (signal.type === "error") throw new Error(signal.message);
         }).catch((error) => { window.__host.errors.push(error.message); reject(error); });
       };
@@ -228,9 +254,10 @@ try {
   page.on("pageerror", (error) => errors.push(`Client: ${error.message}`));
   await page.addInitScript(({ muxUrl }) => {
     const NativePeer = window.RTCPeerConnection;
-    window.__frpTest = { errors: [], proof: "" };
+    window.__frpTest = { errors: [], proof: "", peers: [], channels: {} };
     window.RTCPeerConnection = class extends NativePeer {
       addTransceiver(trackOrKind, init) {
+        window.__frpTest.client = this;
         const transceiver = super.addTransceiver(trackOrKind, init);
         if (trackOrKind === "video") {
           // Restrict this synthetic call to the native Host's H.264 codec.
@@ -239,6 +266,12 @@ try {
             .filter((codec) => codec.mimeType === "video/H264"));
         }
         return transceiver;
+      }
+      createDataChannel(label, options) {
+        const channel = super.createDataChannel(label, options);
+        window.__frpTest.channels[label] = channel;
+        if (label === "input-fast") window.__frpTest.input = this;
+        return channel;
       }
       async setRemoteDescription(description) {
         try { return await super.setRemoteDescription(description); }
@@ -250,7 +283,7 @@ try {
         const servers = configuration.iceServers.filter((server) => server.urls === muxUrl);
         if (servers.length !== 1) throw new Error("production Web client did not derive the FRP origin");
         super({ ...configuration, iceServers: servers, iceTransportPolicy: "relay" });
-        window.__frpTest.client = this;
+        window.__frpTest.peers.push(this);
         this.addEventListener("icecandidateerror", (event) => window.__frpTest.errors.push(`${event.errorCode}:${event.errorText}`));
         const proof = this.createDataChannel("frp-proof");
         proof.onopen = () => proof.send("authenticated TCP relay data channel");
@@ -265,7 +298,8 @@ try {
   await page.locator('[data-device="synthetic-frp-host"]').click();
   await page.waitForFunction(() => {
     const video = document.querySelector("video");
-    return video?.currentTime > 2 && window.__frpTest.proof && document.querySelector(".connection-overlay").hidden;
+    return video?.currentTime > 2 && window.__frpTest.proof && video.dataset.inputTransport === "webrtc-input"
+      && video.style.cursor === "text" && document.querySelector(".connection-overlay").hidden;
   }, null, { timeout: 30_000 });
   const result = await page.evaluate(async () => {
     const peer = window.__frpTest.client;
@@ -278,10 +312,18 @@ try {
       && item.port === local.port && item.url === local.url && item.relayProtocol === "tcp");
     const inbound = reports.find((item) => item.type === "inbound-rtp" && item.kind === "video");
     const codec = stats.get(inbound.codecId);
+    const inputStats = await window.__frpTest.input.getStats();
+    const inputTransport = [...inputStats.values()].find(item => item.type === "transport" && item.selectedCandidatePairId);
+    const inputPair = inputStats.get(inputTransport.selectedCandidatePairId);
+    const inputLocal = inputStats.get(inputPair.localCandidateId);
     return { origin: location.origin, connection: peer.connectionState, ice: peer.iceConnectionState,
       candidateType: local.candidateType, relayProtocol: local.relayProtocol, turnUrl: local.url,
       usesTcpAllocation: Boolean(allocation), policy: peer.getConfiguration().iceTransportPolicy,
       codec: codec.mimeType, framesDecoded: inbound.framesDecoded, videoBytes: inbound.bytesReceived,
+      inputPort: inputLocal.port, videoPort: local.port, inputRelayProtocol: inputLocal.relayProtocol,
+      separatePeers: window.__frpTest.client !== window.__frpTest.input,
+      inputTransport: document.querySelector("video").dataset.inputTransport,
+      cursor: document.querySelector("video").style.cursor,
       dataChannel: window.__frpTest.proof, errors: window.__frpTest.errors };
   });
   assert.equal(result.connection, "connected");
@@ -293,11 +335,19 @@ try {
   assert.equal(result.relayProtocol, "tcp");
   assert.equal(result.turnUrl, muxUrl);
   assert.equal(result.codec, "video/H264");
+  assert.equal(result.separatePeers, true);
+  assert.notEqual(result.inputPort, result.videoPort);
+  assert.equal(result.inputRelayProtocol, "tcp");
+  assert.equal(result.inputTransport, "webrtc-input");
+  assert.equal(result.cursor, "text");
   assert.ok(result.framesDecoded >= 30);
   assert.ok(result.videoBytes > 0 && turnBytes > result.videoBytes);
   assert.ok(turnConnections >= 2, "both authentication and video must traverse the TCP mapping");
   assert.deepEqual(errors, []);
   assert.deepEqual(await host.evaluate(() => window.__host.errors), []);
+  await page.evaluate(() => window.__frpTest.input.close());
+  await page.waitForFunction(() => document.querySelector("video")?.dataset.inputTransport === "websocket-control");
+  assert.equal(await page.evaluate(() => window.__frpTest.client.connectionState), "connected");
   console.log(JSON.stringify({ ...result, webPort, publicPort, turnConnections, turnBytes, unauthenticatedTurn: "401 rejected" }, null, 2));
 } catch (error) {
   console.error("Signaling trace", signalTrace);

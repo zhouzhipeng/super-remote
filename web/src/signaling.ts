@@ -3,6 +3,8 @@ import type { ClientSignal, ServerSignal } from "./types.ts";
 
 export class SignalingSocket extends EventTarget {
   #socket: WebSocket | null = null;
+  get bufferedAmount(): number { return this.#socket?.bufferedAmount ?? 0; }
+  get readyState(): string { return this.#socket?.readyState === WebSocket.OPEN ? "open" : "closed"; }
 
   async connect(): Promise<void> {
     const ticket = await websocketTicket();
@@ -21,8 +23,8 @@ export class SignalingSocket extends EventTarget {
       let opened = false;
       socket.onopen = () => { opened = true; resolve(); };
       socket.onerror = () => reject(new Error("signaling websocket failed"));
-      socket.onclose = () => {
-        this.dispatchEvent(new Event("close"));
+      socket.onclose = (event) => {
+        this.dispatchEvent(new CustomEvent("close", { detail: { code: event.code, wasClean: event.wasClean } }));
         if (!opened) reject(new Error("signaling websocket closed before connecting"));
       };
     });

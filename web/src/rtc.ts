@@ -2,6 +2,9 @@ import { createSession, iceServers, localClipboardTextDuringGesture, reportClien
 import type { ConnectionPhase } from "./connection-progress.ts";
 import { chromiumCompatibleIceServers, remoteIceCandidate, shouldUseChromiumLanCompatibility } from "./ice.ts";
 import { InputController } from "./input.ts";
+import { ControlInputChannel } from "./control-input.ts";
+import { LocalCursor } from "./local-cursor.ts";
+import { requestInteractivePlayback } from "./input-latency.ts";
 import { disconnectMessage } from "./session-close.ts";
 import { SignalingSocket } from "./signaling.ts";
 import { StatsMonitor } from "./stats.ts";
@@ -18,6 +21,7 @@ type ClipboardResponse =
   | { type: "error"; id: number; message: string };
 
 type LocalIceSignal = {
+  input?: boolean;
   type: "webrtc_ice";
   session_id: string;
   candidate: string;
@@ -31,6 +35,11 @@ const MAX_CLIPBOARD_TEXT_BYTES = 12 * 1024;
 export class RemoteSession extends EventTarget {
   state: SessionState = "idle";
   #peer: RTCPeerConnection | null = null;
+  #inputPeer: RTCPeerConnection | null = null;
+  #pendingInputIce: RTCIceCandidateInit[] = [];
+  #fastInput: RTCDataChannel | null = null;
+  #reliableInput: RTCDataChannel | null = null;
+  #cursor: LocalCursor | null = null;
   #signaling = new SignalingSocket();
   #sessionId = "";
   #sessionToken = "";
@@ -40,6 +49,7 @@ export class RemoteSession extends EventTarget {
   #localCandidateCount = 0;
   #remoteCandidateCount = 0;
   #input: InputController | null = null;
+  #controlInput: ControlInputChannel | null = null;
   #stats: StatsMonitor | null = null;
   #reportTimers: number[] = [];
   #remoteStream = new MediaStream();
@@ -74,6 +84,15 @@ export class RemoteSession extends EventTarget {
       bundlePolicy: "max-bundle",
     });
     this.#peer = peer;
+    const inputPeer = new RTCPeerConnection({ iceServers: peerIceServers, iceTransportPolicy: "all", bundlePolicy: "max-bundle" });
+    this.#inputPeer = inputPeer;
+    inputPeer.onicecandidate = ({ candidate }) => {
+      if (!candidate) return;
+      const signal: LocalIceSignal = { type: "webrtc_ice", session_id: this.#sessionId, input: true,
+        candidate: candidate.candidate, sdp_mid: candidate.sdpMid, sdp_mline_index: candidate.sdpMLineIndex,
+        username_fragment: candidate.usernameFragment };
+      if (this.#offerSent) this.#signaling.send(signal); else this.#pendingLocalIce.push(signal);
+    };
     let resolveFirstCandidate!: () => void;
     let rejectFirstCandidate!: (error: Error) => void;
     let firstCandidateSettled = false;
@@ -93,28 +112,27 @@ export class RemoteSession extends EventTarget {
     };
     peer.addTransceiver("video", { direction: "recvonly" });
     peer.addTransceiver("audio", { direction: "recvonly" });
-    const fast = peer.createDataChannel("input-fast", { ordered: false, maxRetransmits: 0 });
-    const reliable = peer.createDataChannel("input-reliable", { ordered: true });
-    const clipboard = peer.createDataChannel("clipboard", { ordered: true });
+    const fast = inputPeer.createDataChannel("input-fast", { ordered: false, maxRetransmits: 0 });
+    const reliable = inputPeer.createDataChannel("input-reliable", { ordered: true });
+    this.#fastInput = fast; this.#reliableInput = reliable;
+    this.#cursor = new LocalCursor(this.video, inputPeer.createDataChannel("cursor", { ordered: true }));
+    const clipboard = inputPeer.createDataChannel("clipboard", { ordered: true });
     this.#clipboard = clipboard;
     fast.binaryType = reliable.binaryType = "arraybuffer";
     clipboard.addEventListener("message", this.#onClipboardMessage);
     clipboard.addEventListener("open", () => this.dispatchEvent(new Event("clipboardready")));
-    reliable.addEventListener("open", () => {
-      this.#input = new InputController(
-        this.video,
-        fast,
-        reliable,
-        (latency) => this.#stats?.setInputLatency(latency),
-        (text) => {
-          void this.writeClipboard(text, true).catch((error) => this.#clipboardError(error));
-        },
-        () => {
-          void this.pasteHostClipboard().catch((error) => this.#clipboardError(error));
-        },
-        () => localClipboardTextDuringGesture(),
-      );
-    });
+    fast.addEventListener("open", () => this.#startInput(false));
+    reliable.addEventListener("open", () => this.#startInput(false));
+    const fallbackInput = () => {
+      if (this.#closing || this.video.dataset.inputTransport !== "webrtc-input") return;
+      this.#input?.destroy(); this.#input = null;
+      this.#startInput(true);
+    };
+    reliable.addEventListener("close", fallbackInput);
+    fast.addEventListener("close", fallbackInput);
+    inputPeer.onconnectionstatechange = () => {
+      if (inputPeer.connectionState === "failed") { inputPeer.close(); fallbackInput(); }
+    };
     this.video.muted = true;
     this.video.playsInline = true;
     for (const name of ["loadedmetadata", "canplay", "playing", "waiting", "stalled", "error"] as const) {
@@ -167,6 +185,8 @@ export class RemoteSession extends EventTarget {
         this.#progress("video");
         this.#stats = new StatsMonitor(peer, this.statsOutput);
         this.#stats.start();
+        this.#startInput(false);
+        this.#reportTimers.push(window.setTimeout(() => this.#startInput(true), 1500));
         for (const delay of [0, 2000, 5000, 15000]) {
           this.#reportTimers.push(window.setTimeout(() => { void this.#report(`connected:${delay}`); }, delay));
         }
@@ -203,6 +223,8 @@ export class RemoteSession extends EventTarget {
       }
     };
     const offer = await peer.createOffer();
+    const inputOffer = await inputPeer.createOffer();
+    await inputPeer.setLocalDescription(inputOffer);
     this.#progress("candidates", "正在收集新连接的网络候选；生成候选后再接管旧连接");
     await peer.setLocalDescription(offer);
     const candidateTimeout = window.setTimeout(() => {
@@ -234,6 +256,7 @@ export class RemoteSession extends EventTarget {
     const viewport = this.#physicalVideoArea();
     this.#signaling.send({
       type: "webrtc_offer", session_id: this.#sessionId, session_token: this.#sessionToken,
+      local_cursor: true, input_sdp: inputOffer.sdp,
       // Send the candidate-free SDP returned by createOffer(), then trickle the
       // queued candidates below. Chrome's localDescription already contains
       // its original `.local` candidate at this point. Embedding that candidate
@@ -287,10 +310,14 @@ export class RemoteSession extends EventTarget {
   close(): void {
     if (this.state === "closed" || this.#closing) return;
     this.#closing = true;
+    this.#input?.destroy(); // release keys before revoking the session
+    this.#cursor?.destroy(); this.#cursor = null;
+    this.#inputPeer?.close(); this.#inputPeer = null;
+    this.#pendingInputIce.length = 0;
+    this.#controlInput?.close();
     if (this.#sessionId) {
       try { this.#signaling.send({ type: "session_close", session_id: this.#sessionId }); } catch { /* already disconnected */ }
     }
-    this.#input?.destroy();
     window.clearTimeout(this.#clipboardPullTimer);
     this.#clipboard?.removeEventListener("message", this.#onClipboardMessage);
     this.#clipboard = null;
@@ -320,7 +347,9 @@ export class RemoteSession extends EventTarget {
     });
   };
 
-  #onSignalingClose = (): void => {
+  #onSignalingClose = (event: Event): void => {
+    const detail = (event as CustomEvent<{ code: number; wasClean: boolean }>).detail;
+    void this.#report(`signaling-close:${detail?.code ?? "unknown"}:clean=${detail?.wasClean ?? false}`);
     this.#progress("failed", "实时信令通道已关闭");
     this.#disconnect("Web 连接已断开，请检查网络后重新连接。");
   };
@@ -387,7 +416,15 @@ export class RemoteSession extends EventTarget {
   async #handleSignal(signal: ServerSignal): Promise<void> {
     if ("session_id" in signal && signal.session_id !== this.#sessionId) return;
     if (signal.type === "webrtc_answer") {
+      this.#cursor?.enable(signal.local_cursor === true);
+      if (signal.input_control && !this.#controlInput) {
+        this.#controlInput = new ControlInputChannel(this.#signaling, this.#sessionId!);
+      }
       await this.#peer?.setRemoteDescription({ type: "answer", sdp: signal.sdp });
+      if (signal.input_sdp) {
+        await this.#inputPeer?.setRemoteDescription({ type: "answer", sdp: signal.input_sdp });
+        for (const candidate of this.#pendingInputIce.splice(0)) await this.#addRemoteIce(candidate, true);
+      }
       this.#progress("candidates", "主机已应答，正在验证双方网络路径");
       this.#requestLowLatencyPlayback();
       for (const candidate of this.#pendingIce.splice(0)) await this.#addRemoteIce(candidate);
@@ -395,6 +432,11 @@ export class RemoteSession extends EventTarget {
     if (signal.type === "webrtc_ice") {
       this.#remoteCandidateCount += 1;
       const candidate = remoteIceCandidate(signal);
+      if (signal.input) {
+        if (this.#inputPeer?.remoteDescription) await this.#addRemoteIce(candidate, true);
+        else this.#pendingInputIce.push(candidate);
+        return;
+      }
       this.#progress("candidates", `已收到 ${this.#remoteCandidateCount} 条主机路径，正在逐一验证`);
       if (this.#peer?.remoteDescription) await this.#addRemoteIce(candidate);
       else this.#pendingIce.push(candidate);
@@ -416,9 +458,9 @@ export class RemoteSession extends EventTarget {
     }));
   }
 
-  async #addRemoteIce(candidate: RTCIceCandidateInit): Promise<void> {
+  async #addRemoteIce(candidate: RTCIceCandidateInit, input = false): Promise<void> {
     try {
-      await this.#peer?.addIceCandidate(candidate);
+      await (input ? this.#inputPeer : this.#peer)?.addIceCandidate(candidate);
     } catch (error) {
       // A stale or interface-specific candidate must not prevent Chrome from
       // trying every remaining candidate in this BUNDLE transport.
@@ -428,20 +470,22 @@ export class RemoteSession extends EventTarget {
   }
 
   #requestLowLatencyPlayback(): void {
-    // Stability is preferred over shaving the final few milliseconds. Around
-    // five 60 Hz frames absorb capture, encoder and Safari compositor variance.
-    const jitterBufferMs = 80;
-    const playoutDelaySeconds = jitterBufferMs / 1000;
-    type LowLatencyReceiver = RTCRtpReceiver & {
-      jitterBufferTarget?: number;
-      playoutDelayHint?: number;
-    };
     for (const receiver of this.#peer?.getReceivers() ?? []) {
-      if (receiver.track?.kind !== "video") continue;
-      const lowLatency = receiver as LowLatencyReceiver;
-      try { lowLatency.jitterBufferTarget = jitterBufferMs; } catch { /* browser-controlled fallback */ }
-      try { lowLatency.playoutDelayHint = playoutDelaySeconds; } catch { /* older browser fallback */ }
+      requestInteractivePlayback(receiver);
     }
+  }
+
+  #startInput(allowFallback: boolean): void {
+    if (this.#input || this.#closing || this.#peer?.connectionState !== "connected") return;
+    const direct = this.#fastInput?.readyState === "open" && this.#reliableInput?.readyState === "open";
+    if (!direct && (!allowFallback || !this.#controlInput)) return;
+    this.#input = new InputController(this.video, direct ? this.#fastInput! : this.#controlInput!,
+      direct ? this.#reliableInput! : this.#controlInput!,
+      latency => this.#stats?.setInputLatency(latency),
+      text => { void this.writeClipboard(text, true).catch(error => this.#clipboardError(error)); },
+      () => { void this.pasteHostClipboard().catch(error => this.#clipboardError(error)); },
+      () => localClipboardTextDuringGesture());
+    this.video.dataset.inputTransport = direct ? "webrtc-input" : "websocket-control";
   }
 
   #physicalVideoArea(): { width: number; height: number } {

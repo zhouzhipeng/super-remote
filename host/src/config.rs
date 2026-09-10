@@ -10,6 +10,9 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HostConfig {
+    /// Negotiated per session; never enabled by a configuration file alone.
+    #[serde(skip)]
+    pub local_cursor: bool,
     pub server_url: String,
     pub device_id: String,
     pub device_name: String,
@@ -211,6 +214,7 @@ mod tests {
 
     fn config() -> Arc<HostConfig> {
         Arc::new(HostConfig {
+            local_cursor: false,
             server_url: String::new(),
             device_id: "device".into(),
             device_name: "desktop".into(),

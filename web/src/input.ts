@@ -1,11 +1,20 @@
 import { browserKeyboardProfile, remoteScanCode, type KeyboardProfile } from "./keymap.ts";
 import { ClipboardShortcutRouter } from "./clipboard-shortcuts.ts";
+import { LatestPointer } from "./input-latency.ts";
+
+export interface InputTransport extends EventTarget {
+  readonly readyState: string;
+  readonly bufferedAmount: number;
+  bufferedAmountLowThreshold: number;
+  send(data: ArrayBufferView<ArrayBuffer>): void;
+}
 
 const HEADER_LENGTH = 12;
 const ACK_REQUESTED = 0x01;
 // At most one tiny input message may wait in SCTP. Larger limits make the
 // remote pointer replay stale positions after a transient network stall.
 const FAST_BUFFER_LIMIT = 16;
+let lastTimestamp = 0;
 
 enum InputType {
   MouseMove = 0x01,
@@ -20,7 +29,8 @@ function packet(type: InputType, payloadLength: number, flags = 0): DataView {
   view.setUint8(0, type);
   view.setUint8(1, flags);
   view.setUint16(2, payloadLength, true);
-  view.setBigUint64(4, BigInt(Math.round(performance.timeOrigin * 1000 + performance.now() * 1000)), true);
+  lastTimestamp = Math.max(lastTimestamp + 1, Math.round(performance.timeOrigin * 1000 + performance.now() * 1000));
+  view.setBigUint64(4, BigInt(lastTimestamp), true);
   return view;
 }
 
@@ -30,10 +40,10 @@ function clamp16(value: number): number {
 
 export class InputController {
   #video: HTMLVideoElement;
-  #fast: RTCDataChannel;
-  #reliable: RTCDataChannel;
-  #pendingMove: { x: number; y: number } | null = null;
-  #lastRawUpdate = -Infinity;
+  #fast: InputTransport;
+  #reliable: InputTransport;
+  #pendingMove = new LatestPointer();
+  #lastRawPoint: { x: number; y: number; id: number } | null = null;
   #moveSequence = 0;
   #pressed = new Set<string>();
   #clipboardShortcuts = new ClipboardShortcutRouter();
@@ -45,8 +55,8 @@ export class InputController {
 
   constructor(
     video: HTMLVideoElement,
-    fast: RTCDataChannel,
-    reliable: RTCDataChannel,
+    fast: InputTransport,
+    reliable: InputTransport,
     private readonly onLatency: (milliseconds: number) => void,
     private readonly onPasteText: (text: string) => void,
     private readonly onPasteHostClipboard: () => void,
@@ -108,13 +118,17 @@ export class InputController {
   #prevent = (event: Event): void => event.preventDefault();
 
   #pointerMove = (event: PointerEvent): void => {
-    if (performance.now() - this.#lastRawUpdate < 32) return;
+    const raw = this.#lastRawPoint;
+    this.#lastRawPoint = null;
+    if (raw && raw.x === event.clientX && raw.y === event.clientY && raw.id === event.pointerId) return;
     this.#sendPointerEvent(event);
   };
 
   #pointerRawUpdate = (event: PointerEvent): void => {
-    this.#lastRawUpdate = performance.now();
-    this.#video.dataset.inputMode = "pointerrawupdate";
+    this.#lastRawPoint = { x: event.clientX, y: event.clientY, id: event.pointerId };
+    if (this.#video.dataset.inputMode !== "pointerrawupdate") {
+      this.#video.dataset.inputMode = "pointerrawupdate";
+    }
     this.#sendPointerEvent(event);
   };
 
@@ -127,17 +141,13 @@ export class InputController {
   }
 
   #flushPendingMove = (): void => {
-    const move = this.#pendingMove;
-    this.#pendingMove = null;
+    const move = this.#pendingMove.take();
     if (move) this.#sendFastMove(move);
   };
 
   #sendFastMove(move: { x: number; y: number }): void {
     if (this.#fast.readyState !== "open") return;
-    if (this.#fast.bufferedAmount >= FAST_BUFFER_LIMIT) {
-      this.#pendingMove = move;
-      return;
-    }
+    if (!this.#pendingMove.offer(move, this.#fast.bufferedAmount < FAST_BUFFER_LIMIT)) return;
     this.#moveSequence += 1;
     const flags = this.#moveSequence % 16 === 0 ? ACK_REQUESTED : 0;
     const view = packet(InputType.MouseMove, 4, flags);
@@ -147,6 +157,7 @@ export class InputController {
   }
 
   #pointerButton = (event: PointerEvent): void => {
+    this.#pendingMove.take(); // click packet carries its own authoritative position
     event.preventDefault();
     this.#video.focus();
     const point = this.#normalizedPoint(event.clientX, event.clientY);
@@ -165,7 +176,7 @@ export class InputController {
     const view = packet(InputType.MouseWheel, 4);
     view.setInt16(12, clamp16Signed(-event.deltaX), true);
     view.setInt16(14, clamp16Signed(-event.deltaY), true);
-    if (this.#fast.readyState === "open" && this.#fast.bufferedAmount <= FAST_BUFFER_LIMIT) this.#fast.send(bytes(view));
+    this.#sendReliable(bytes(view));
   };
 
   #keyboard = (event: KeyboardEvent): void => {
@@ -300,7 +311,8 @@ export class InputController {
     if (this.#reliable.readyState === "open") this.#reliable.send(data);
   }
 
-  #inputAck = (event: MessageEvent<ArrayBuffer>): void => {
+  #inputAck = (raw: Event): void => {
+    const event = raw as MessageEvent<ArrayBuffer>;
     if (!(event.data instanceof ArrayBuffer) || event.data.byteLength < HEADER_LENGTH) return;
     const view = new DataView(event.data);
     if ((view.getUint8(1) & ACK_REQUESTED) === 0) return;
