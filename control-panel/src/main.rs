@@ -22,13 +22,14 @@ mod windows_app {
 
     use serde::{Deserialize, Serialize};
     use windows::{
+        core::BOOL,
         Win32::{
             Foundation::{
                 COLORREF, CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM,
                 LRESULT, RECT, WAIT_TIMEOUT, WPARAM,
             },
             Graphics::Gdi::{
-                BLACK_BRUSH, BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET,
+                BLACK_BRUSH, BeginPaint, CreateFontW, CreateFontIndirectW, GetObjectW, LOGFONTW, InvalidateRect, MapWindowPoints, CreatePen, CreateSolidBrush, DEFAULT_CHARSET,
                 DEFAULT_PITCH, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW,
                 EndPaint, FF_DONTCARE, FW_NORMAL, FillRect, GetStockObject, HBRUSH, HDC, HGDIOBJ,
                 PAINTSTRUCT, PROOF_QUALITY, PS_SOLID, RoundRect, SelectObject, SetBkColor,
@@ -61,7 +62,7 @@ mod windows_app {
                     BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_OWNERDRAW,
                     CREATESTRUCTW, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
                     DispatchMessageW, ES_AUTOHSCROLL, ES_PASSWORD, FindWindowW, GWLP_USERDATA,
-                    GetClientRect, GetMessageW, GetSystemMetrics, GetWindowLongPtrW,
+                    EnumChildWindows, GetWindowRect, GetClientRect, GetMessageW, GetSystemMetrics, GetWindowLongPtrW,
                     GetWindowTextLengthW, GetWindowTextW, HHOOK, HMENU, HTTRANSPARENT,
                     HWND_TOPMOST, IDC_ARROW, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
                     LLKHF_LOWER_IL_INJECTED, LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED, LWA_ALPHA,
@@ -75,7 +76,7 @@ mod windows_app {
                     UnhookWindowsHookEx, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WH_MOUSE_LL,
                     WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE,
                     WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM,
-                    WM_GETFONT, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_SETFONT, WM_TIMER,
+                    WM_DPICHANGED, WM_GETFONT, WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_SETFONT, WM_TIMER,
                     WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
                     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW,
                     WS_POPUP, WS_TABSTOP, WS_VISIBLE,
@@ -284,6 +285,7 @@ mod windows_app {
         root: PathBuf,
         run_dir: PathBuf,
         window: HWND,
+        layout_dpi: i32,
         title_label: HWND,
         subtitle_label: HWND,
         service_label: HWND,
@@ -334,6 +336,7 @@ mod windows_app {
                 root,
                 run_dir,
                 window: HWND::default(),
+                layout_dpi: 0,
                 title_label: HWND::default(),
                 subtitle_label: HWND::default(),
                 service_label: HWND::default(),
@@ -373,6 +376,7 @@ mod windows_app {
 
         unsafe fn create_controls(&mut self, instance: HINSTANCE) -> windows::core::Result<()> {
             let dpi = unsafe { GetDpiForWindow(self.window) } as i32;
+            self.layout_dpi = dpi;
             let scale = |value: i32| value * dpi / 96;
             let base_font = unsafe {
                 CreateFontW(
@@ -1631,6 +1635,47 @@ mod windows_app {
         Ok(())
     }
 
+    fn dpi_value(value: i32, from: i32, to: i32) -> i32 {
+        (f64::from(value) * f64::from(to) / f64::from(from.max(1))).round() as i32
+    }
+
+    unsafe fn rescale_controls(window: HWND, from: i32, to: i32) {
+        if from == to { return; }
+        unsafe extern "system" fn collect(child: HWND, data: LPARAM) -> BOOL {
+            unsafe { (&mut *(data.0 as *mut Vec<HWND>)).push(child); }
+            BOOL(1)
+        }
+        let mut children = Vec::<HWND>::new();
+        unsafe { let _ = EnumChildWindows(Some(window), Some(collect), LPARAM((&mut children as *mut Vec<HWND>) as isize)); }
+        let mut fonts = std::collections::HashMap::<isize, HGDIOBJ>::new();
+        for child in children {
+            let mut rect = RECT::default();
+            unsafe {
+                if GetWindowRect(child, &mut rect).is_ok() {
+                    let points = std::slice::from_raw_parts_mut((&mut rect as *mut RECT).cast(), 2);
+                    MapWindowPoints(None, Some(window), points);
+                    let _ = SetWindowPos(child, None, dpi_value(rect.left, from, to), dpi_value(rect.top, from, to),
+                        dpi_value(rect.right - rect.left, from, to), dpi_value(rect.bottom - rect.top, from, to),
+                        SWP_NOACTIVATE | SWP_NOZORDER);
+                }
+                let old = SendMessageW(child, WM_GETFONT, None, None).0;
+                if old == 0 { continue; }
+                let new_font = fonts.entry(old).or_insert_with(|| {
+                    let mut description = LOGFONTW::default();
+                    if GetObjectW(HGDIOBJ(old as *mut c_void), std::mem::size_of::<LOGFONTW>() as i32,
+                        Some((&mut description as *mut LOGFONTW).cast())) == 0 { return HGDIOBJ::default(); }
+                    description.lfHeight = dpi_value(description.lfHeight, from, to);
+                    description.lfWidth = dpi_value(description.lfWidth, from, to);
+                    CreateFontIndirectW(&description).into()
+                });
+                if !new_font.is_invalid() { set_font(child, *new_font); }
+            }
+        }
+        for (old, replacement) in fonts {
+            if !replacement.is_invalid() { unsafe { let _ = DeleteObject(HGDIOBJ(old as *mut c_void)); } }
+        }
+    }
+
     unsafe fn paint_panel(window: HWND, app: &App) {
         let mut paint = PAINTSTRUCT::default();
         let hdc = unsafe { BeginPaint(window, &mut paint) };
@@ -1639,7 +1684,7 @@ mod windows_app {
             unsafe {
                 FillRect(hdc, &client, app.background_brush);
             }
-            let dpi = unsafe { GetDpiForWindow(window) } as i32;
+            let dpi = app.layout_dpi.max(96);
             let scale = |value: i32| value * dpi / 96;
             let header = RECT {
                 left: 0,
@@ -1817,6 +1862,21 @@ mod windows_app {
         let app_ptr = unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) as *mut App };
         match message {
             WM_CREATE => LRESULT(0),
+            WM_DPICHANGED if !app_ptr.is_null() => {
+                let app = unsafe { &mut *app_ptr };
+                let dpi = (wparam.0 & 0xffff) as i32;
+                if dpi > 0 && app.layout_dpi > 0 {
+                    unsafe { rescale_controls(window, app.layout_dpi, dpi) };
+                }
+                app.layout_dpi = dpi;
+                let rect = unsafe { &*(lparam.0 as *const RECT) };
+                unsafe {
+                    let _ = SetWindowPos(window, None, rect.left, rect.top, rect.right - rect.left,
+                        rect.bottom - rect.top, SWP_NOACTIVATE | SWP_NOZORDER);
+                    let _ = InvalidateRect(Some(window), None, true);
+                }
+                LRESULT(0)
+            }
             WM_PAINT if !app_ptr.is_null() => {
                 unsafe { paint_panel(window, &*app_ptr) };
                 LRESULT(0)
@@ -2095,6 +2155,34 @@ mod windows_app {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn dpi_transition_resizes_fonts_and_controls_without_losing_edits() {
+            let mut panel = HiddenPanel::new();
+            let instance = HINSTANCE(unsafe { GetModuleHandleW(None) }.unwrap().0);
+            unsafe { panel.app.create_controls(instance).unwrap(); }
+            let original = panel.app.layout_dpi;
+            let font_height = |control| unsafe {
+                let font = SendMessageW(control, WM_GETFONT, None, None);
+                let mut info = LOGFONTW::default();
+                assert_ne!(GetObjectW(HGDIOBJ(font.0 as *mut c_void), std::mem::size_of::<LOGFONTW>() as i32,
+                    Some((&mut info as *mut LOGFONTW).cast())), 0);
+                info.lfHeight
+            };
+            let mut initial = RECT::default();
+            unsafe { GetWindowRect(panel.app.service_label, &mut initial).unwrap(); set_text(panel.app.username_edit, "unsaved-draft"); }
+            let height = font_height(panel.app.service_label);
+            for target in [original * 2, original, original * 3, original] {
+                let rect = RECT { left: 0, top: 0, right: dpi_value(700, 96, target), bottom: dpi_value(720, 96, target) };
+                unsafe { SendMessageW(panel.app.window, WM_DPICHANGED, Some(WPARAM((target as usize) | ((target as usize) << 16))),
+                    Some(LPARAM((&rect as *const RECT) as isize))); }
+                assert_eq!(panel.app.layout_dpi, target);
+                assert_eq!(font_height(panel.app.service_label), dpi_value(height, original, target));
+                let mut current = RECT::default();
+                unsafe { GetWindowRect(panel.app.service_label, &mut current).unwrap(); }
+                assert_eq!(current.right - current.left, dpi_value(initial.right - initial.left, original, target));
+                assert_eq!(window_text(panel.app.username_edit), "unsaved-draft");
+            }
+        }
         use std::os::windows::process::CommandExt;
         use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 

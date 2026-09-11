@@ -643,14 +643,23 @@ async fn supervise_video(
     mut state: watch::Receiver<MediaState>,
 ) -> anyhow::Result<()> {
     while wait_until_running(&mut state).await? {
-        video::stream(
+        let result = video::stream(
             config.clone(),
             track.clone(),
             payload_type,
             stats.clone(),
             active.clone(),
         )
-        .await?;
+        .await;
+        if let Err(error) = result {
+            // RDP/display changes temporarily invalidate Desktop Duplication.
+            // Keep the negotiated peer alive and recreate capture after a delay.
+            warn!(%error, "video capture interrupted; retrying in one second");
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
+            result = state.changed() => { result?; },
+        }
     }
     Ok(())
 }

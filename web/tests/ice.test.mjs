@@ -45,10 +45,11 @@ test("does not guess raw TURN or TURN/TLS support from an HTTPS reverse proxy", 
   assert.ok(!JSON.stringify(servers).includes("remote.example"));
 });
 
-test("preserves Safari's existing ICE routes and credentials", () => {
+test("Safari receives the same-origin FRP fallback alongside existing ICE routes", () => {
   assert.deepEqual(browserIceServers(safariAgent, "http://remote.example:45678/", credentials), [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: credentials.urls, username: credentials.username, credential: credentials.credential },
+    { urls: "turn:remote.example:45678?transport=tcp", username: credentials.username, credential: credentials.credential },
   ]);
 });
 

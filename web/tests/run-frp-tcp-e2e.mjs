@@ -145,7 +145,10 @@ try {
   await checkUnauthenticatedTurn(publicPort);
 
   browser = await chromium.launch({ executablePath: process.env.CHROME_EXECUTABLE, headless: true });
-  const context = await browser.newContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2 });
+  // Override only routing detection to exercise Safari's formerly missing
+  // same-origin TURN fallback; the transport engine remains Chromium.
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2,
+    ...(process.env.TEST_SAFARI_ROUTING === "1" ? { userAgent: "Mozilla/5.0 Version/18.5 Safari/605.1.15" } : {}) });
   const errors = [];
   const host = await context.newPage();
   hostPage = host;

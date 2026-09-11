@@ -701,7 +701,7 @@ mod windows_launcher {
         let quoted =
             |value: &str| serde_json::to_string(value).expect("JSON strings are TOML-compatible");
         let config = format!(
-            "server_url = {}\ndevice_id = {}\ndevice_name = {}\ndevice_token = {}\nwidth = {stream_width}\nheight = {stream_height}\nfps = {}\nbitrate = {}\nmonitor_index = 0\nffmpeg_path = {}\nffmpeg_encoder = {}\nffmpeg_capture_mode = {}\nffmpeg_capture_x = 0\nffmpeg_capture_y = 0\nffmpeg_capture_width = {capture_width}\nffmpeg_capture_height = {capture_height}\ncontrol_status_path = {}\n\n[[ice_servers]]\nurls = [\"stun:stun.l.google.com:19302\"]\n",
+            "server_url = {}\ndevice_id = {}\ndevice_name = {}\ndevice_token = {}\nwidth = {stream_width}\nheight = {stream_height}\nfps = {}\nbitrate = {}\nmonitor_index = 0\nffmpeg_path = {}\nffmpeg_encoder = {}\nffmpeg_capture_mode = {}\nffmpeg_capture_x = 0\nffmpeg_capture_y = 0\nffmpeg_capture_width = {capture_width}\nffmpeg_capture_height = {capture_height}\nfollow_primary_display = true\ncontrol_status_path = {}\n\n[[ice_servers]]\nurls = [\"stun:stun.l.google.com:19302\"]\n",
             quoted(base_url),
             quoted(DEVICE_ID),
             quoted("这台 Windows 电脑"),

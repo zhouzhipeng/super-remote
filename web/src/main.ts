@@ -31,6 +31,17 @@ async function sessionView(deviceId: string): Promise<void> {
   const remote = app.querySelector<HTMLElement>(".remote")!;
   const video = app.querySelector<HTMLVideoElement>("#remote")!;
   const toolbar = app.querySelector<HTMLElement>(".toolbar")!;
+  const scrollButton = document.createElement("button");
+  scrollButton.className = "secondary";
+  scrollButton.id = "smooth-scroll";
+  let smoothScroll = localStorage.getItem("remote-smooth-scroll") !== "false";
+  const updateScrollButton = (): void => {
+    scrollButton.textContent = `平滑滚动：${smoothScroll ? "开" : "关"}`;
+    scrollButton.setAttribute("aria-pressed", String(smoothScroll));
+    scrollButton.title = "用最近画面短暂预测滚动；关闭可对比主机原始画面";
+  };
+  updateScrollButton();
+  toolbar.append(scrollButton);
   const pinButton = app.querySelector<HTMLButtonElement>("#toolbar-pin")!;
   const fullscreenButton = app.querySelector<HTMLButtonElement>("#fullscreen")!;
   const state = app.querySelector<HTMLSpanElement>("#state")!;
@@ -105,6 +116,7 @@ async function sessionView(deviceId: string): Promise<void> {
   };
   const createRemoteSession = (): RemoteSession => {
     const next = new RemoteSession(video, stats);
+    next.setScrollPreview(smoothScroll);
     next.addEventListener("progress", (event) => {
       renderConnectionProgress((event as CustomEvent<ConnectionProgressDetail>).detail);
     });
@@ -135,6 +147,12 @@ async function sessionView(deviceId: string): Promise<void> {
     return next;
   };
   let session = createRemoteSession();
+  scrollButton.addEventListener("click", () => {
+    smoothScroll = !smoothScroll;
+    localStorage.setItem("remote-smooth-scroll", String(smoothScroll));
+    session.setScrollPreview(smoothScroll);
+    updateScrollButton();
+  });
   let connectedArea = physicalVideoArea(video);
   // Browser chrome, rotation and fullscreen can all change the number of physical
   // pixels available to the video. Debounce a reconnect so the Host restarts the

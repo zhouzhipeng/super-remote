@@ -89,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
                     item.stop_media();
                     let _ = item.peer.close().await;
                 }
-                let mut session_config = config.for_viewport(viewport_width, viewport_height);
+                let mut session_config = config.refresh_display().for_viewport(viewport_width, viewport_height);
                 Arc::make_mut(&mut session_config).local_cursor = local_cursor && cfg!(windows) && config.h264_file.is_none();
                 control.preparing(session_id, &session_config);
                 match rtc::accept_offer(

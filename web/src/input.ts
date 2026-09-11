@@ -1,6 +1,7 @@
 import { browserKeyboardProfile, remoteScanCode, type KeyboardProfile } from "./keymap.ts";
 import { ClipboardShortcutRouter } from "./clipboard-shortcuts.ts";
 import { LatestPointer } from "./input-latency.ts";
+import { WheelDelta } from "./wheel.ts";
 
 export interface InputTransport extends EventTarget {
   readonly readyState: string;
@@ -45,6 +46,7 @@ export class InputController {
   #pendingMove = new LatestPointer();
   #lastRawPoint: { x: number; y: number; id: number } | null = null;
   #moveSequence = 0;
+  #wheelDelta = new WheelDelta();
   #pressed = new Set<string>();
   #clipboardShortcuts = new ClipboardShortcutRouter();
   #pasteSink: HTMLTextAreaElement;
@@ -173,9 +175,12 @@ export class InputController {
 
   #wheel = (event: WheelEvent): void => {
     event.preventDefault();
-    const view = packet(InputType.MouseWheel, 4);
-    view.setInt16(12, clamp16Signed(-event.deltaX), true);
-    view.setInt16(14, clamp16Signed(-event.deltaY), true);
+    if (this.#reliable.readyState !== "open") return;
+    const delta = this.#wheelDelta.convert(event.deltaX, event.deltaY, event.deltaMode);
+    if (delta.x === 0 && delta.y === 0) return;
+    const view = packet(InputType.MouseWheel, 4, ACK_REQUESTED);
+    view.setInt16(12, delta.x, true);
+    view.setInt16(14, delta.y, true);
     this.#sendReliable(bytes(view));
   };
 
@@ -320,6 +325,7 @@ export class InputController {
     const nowUs = performance.timeOrigin * 1000 + performance.now() * 1000;
     const latency = Math.max(0, (nowUs - sentUs) / 1000);
     this.#video.dataset.inputRttMs = latency.toFixed(3);
+    if (view.getUint8(0) === InputType.MouseWheel) this.#video.dataset.wheelRttMs = latency.toFixed(3);
     this.#video.dataset.inputAckCount = String(Number(this.#video.dataset.inputAckCount ?? "0") + 1);
     this.onLatency(latency);
   };

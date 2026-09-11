@@ -237,10 +237,10 @@ async fn stream_ffmpeg(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("FFmpeg stdout was not piped"))?;
-    // Keep a short, bounded runway so bursty Desktop Duplication delivery can be
-    // emitted at an even cadence. Blocking the producer preserves every H.264
+    // Keep only one pending frame so scroll input cannot queue four frames of
+    // old desktop pixels. Blocking the producer preserves every H.264
     // reference frame and pushes back into FFmpeg instead of growing latency.
-    let (frame_tx, mut frame_rx) = mpsc::channel::<Bytes>(4);
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Bytes>(1);
     let (initial_frame_tx, initial_frame_rx) = oneshot::channel();
     let reader_active = active.clone();
     std::thread::Builder::new()

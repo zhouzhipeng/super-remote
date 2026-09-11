@@ -9,20 +9,32 @@ const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_PACKAGE || "playwright");
 const browser = await chromium.launch({ executablePath: process.env.CHROME_EXECUTABLE, headless: true });
 try {
-  const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, deviceScaleFactor: 2 });
-  await context.addInitScript(() => {
+  const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, deviceScaleFactor: 2,
+    ...(process.env.TEST_SAFARI_ROUTING === "1" ? { userAgent: "Mozilla/5.0 Version/18.5 Safari/605.1.15" } : {}) });
+  await context.addInitScript((forceRelay) => {
     const NativePeer = window.RTCPeerConnection;
     window.RTCPeerConnection = class extends NativePeer {
+      constructor(config) {
+        if (forceRelay) config = { ...config, iceTransportPolicy: "relay",
+          iceServers: config.iceServers.map(server => ({ ...server,
+            urls: [server.urls].flat().filter(url => url === `turn:${location.host}?transport=tcp`),
+          })).filter(server => server.urls.length) };
+        super(config);
+      }
       addTransceiver(kind, init) {
         if (kind === "video") window.__videoCheck = this;
         return super.addTransceiver(kind, init);
       }
     };
-  });
+  }, process.env.REMOTE_FORCE_TCP_RELAY === "1");
   const page = await context.newPage();
   const url = new URL(status.direct_url);
+  if (process.env.REMOTE_ACCESS_ORIGIN) {
+    const origin = new URL(process.env.REMOTE_ACCESS_ORIGIN);
+    url.protocol = origin.protocol; url.host = origin.host;
+  }
   // The token stays local and is never printed or saved by the test.
-  await page.goto(url.href);
+  await page.goto(url.href).catch(() => { throw new Error("Live endpoint unavailable (authenticated URL omitted)"); });
   await page.waitForFunction(() => {
     const video = document.querySelector("video");
     return window.__videoCheck?.connectionState === "connected" && video?.currentTime > 2;

@@ -4,6 +4,7 @@ import { chromiumCompatibleIceServers, remoteIceCandidate, shouldUseChromiumLanC
 import { InputController } from "./input.ts";
 import { ControlInputChannel } from "./control-input.ts";
 import { LocalCursor } from "./local-cursor.ts";
+import { ScrollPreview } from "./scroll-preview.ts";
 import { requestInteractivePlayback } from "./input-latency.ts";
 import { disconnectMessage } from "./session-close.ts";
 import { SignalingSocket } from "./signaling.ts";
@@ -40,6 +41,13 @@ export class RemoteSession extends EventTarget {
   #fastInput: RTCDataChannel | null = null;
   #reliableInput: RTCDataChannel | null = null;
   #cursor: LocalCursor | null = null;
+  #scrollPreview: ScrollPreview | null = null;
+  scrollPreviewEnabled = true;
+
+  setScrollPreview(enabled: boolean): void {
+    this.scrollPreviewEnabled = enabled;
+    if (this.#scrollPreview) this.#scrollPreview.enabled = enabled;
+  }
   #signaling = new SignalingSocket();
   #sessionId = "";
   #sessionToken = "";
@@ -63,6 +71,8 @@ export class RemoteSession extends EventTarget {
   constructor(private readonly video: HTMLVideoElement, private readonly statsOutput: HTMLElement) { super(); }
 
   async connect(deviceId: string): Promise<void> {
+    this.#scrollPreview = new ScrollPreview(this.video);
+    this.#scrollPreview.enabled = this.scrollPreviewEnabled;
     this.#progress("signaling");
     this.#setState("creating_session");
     this.#signaling.addEventListener("close", this.#onSignalingClose);
@@ -311,6 +321,7 @@ export class RemoteSession extends EventTarget {
     if (this.state === "closed" || this.#closing) return;
     this.#closing = true;
     this.#input?.destroy(); // release keys before revoking the session
+    this.#scrollPreview?.destroy(); this.#scrollPreview = null;
     this.#cursor?.destroy(); this.#cursor = null;
     this.#inputPeer?.close(); this.#inputPeer = null;
     this.#pendingInputIce.length = 0;

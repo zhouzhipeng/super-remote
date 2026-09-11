@@ -168,6 +168,20 @@ optimizations, not a zero-latency guarantee over a network or a slow target app.
   This is absolute-position desktop control, not a Pointer Lock gaming mode.
   Deploy Host, signaling and Web together to enable all new features.
 
+  The Web toolbar's "平滑滚动" switch enables experimental local scroll preview.
+  It keeps two recent received frames in memory (capped at 1920x1080 each) and
+  estimates vertical translation from 160x96 thumbnails at up to 30 Hz while
+  scrolling. Two consistent matches and a pointer inside the inferred region
+  are required. The bounded preview extrapolates only already-seen pixels for
+  up to 60 ms of motion, expires within 140 ms, and yields to new video frames.
+  Unknown exposed strips continue to show the real video; offscreen content is
+  not prefetched and no future text or images are generated. Direction changes,
+  clicks, keyboard input, resize, focus loss and ambiguous motion clear the
+  preview. Slow readbacks trigger a cooldown. This cannot mask sustained network
+  stalls or guarantee correct region inference in every third-party application;
+  use the switch to compare or disable it. `run-scroll-preview-e2e.mjs` validates
+  the browser compositor with synthetic video without opening a remote session.
+
   `web/tests/run-native-input-e2e.mjs` uses an isolated native Host and generated
   H.264 test pattern to verify separate ports, post-injection ACKs and WebSocket
   fallback while video stays connected. It injects only zero-distance relative

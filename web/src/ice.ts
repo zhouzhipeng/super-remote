@@ -16,7 +16,7 @@ export function browserIceServers(userAgent: string, pageUrl: string, turn?: Bro
   if (chromium) servers.push({ urls: "stun:stun.cloudflare.com:3478" });
   if (!turn) return servers;
   servers.push({ urls: turn.urls, username: turn.username, credential: turn.credential });
-  if (chromium && turn.tcp_mux === true) {
+  if (turn.tcp_mux === true) {
     const page = new URL(pageUrl);
     // A raw FRP TCP mapping carries TURN/TCP on the very same Web port. Derive
     // it from the address the browser actually opened, never a configured LAN

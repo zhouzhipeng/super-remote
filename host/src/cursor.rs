@@ -18,7 +18,16 @@ mod tests {
         unsafe {
             let cursor = LoadCursorW(None, IDC_ARROW).unwrap();
             assert_eq!(standard_shape(cursor), Some("default"));
-            let image = cursor_image(cursor).unwrap();
+            // The active desktop may replace IDC_ARROW with a transparent
+            // cursor (remote sessions/accessibility). Test pixels with an
+            // owned deterministic cursor without changing the system cursor.
+            let mut mask = [255u8; 128];
+            let mut color = [0u8; 128];
+            for row in 8..24 { mask[row * 4 + 1] = 0; color[row * 4 + 1] = 255; }
+            let fixture = CreateCursor(None, 0, 0, 32, 32, mask.as_ptr().cast(), color.as_ptr().cast()).unwrap();
+            let encoded = cursor_image(fixture);
+            DestroyCursor(fixture).unwrap();
+            let image = encoded.unwrap();
             let png = base64::engine::general_purpose::STANDARD
                 .decode(image.png)
                 .unwrap();

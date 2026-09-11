@@ -13,6 +13,8 @@ pub struct HostConfig {
     /// Negotiated per session; never enabled by a configuration file alone.
     #[serde(skip)]
     pub local_cursor: bool,
+    #[serde(default)]
+    pub follow_primary_display: bool,
     pub server_url: String,
     pub device_id: String,
     pub device_name: String,
@@ -60,6 +62,30 @@ pub struct IceServerConfig {
 }
 
 impl HostConfig {
+    pub fn refresh_display(self: &Arc<Self>) -> Arc<Self> {
+        #[cfg(windows)]
+        if self.follow_primary_display && self.h264_file.is_none() {
+            use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
+            let mut mode = DEVMODEW::default();
+            mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+            if unsafe { EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut mode) }.as_bool() {
+                return self.with_display_size(mode.dmPelsWidth, mode.dmPelsHeight);
+            }
+            tracing::warn!("could not refresh primary display dimensions; retaining previous dimensions");
+        }
+        self.clone()
+    }
+
+    fn with_display_size(self: &Arc<Self>, width: u32, height: u32) -> Arc<Self> {
+        if width < 2 || height < 2 { return self.clone(); }
+        let mut config = self.as_ref().clone();
+        config.width = width & !1;
+        config.height = height & !1;
+        config.ffmpeg_capture_width = width;
+        config.ffmpeg_capture_height = height;
+        Arc::new(config)
+    }
+
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let mut config: Self = toml::from_str(&fs::read_to_string(path)?)?;
         if config.device_id.is_empty() || config.device_name.is_empty() {
@@ -215,6 +241,7 @@ mod tests {
     fn config() -> Arc<HostConfig> {
         Arc::new(HostConfig {
             local_cursor: false,
+            follow_primary_display: false,
             server_url: String::new(),
             device_id: "device".into(),
             device_name: "desktop".into(),
@@ -235,6 +262,15 @@ mod tests {
             ice_servers: Vec::new(),
             control_status_path: None,
         })
+    }
+
+    #[test]
+    fn refresh_restores_hidpi_after_rdp_resolution_change() {
+        let small = config().with_display_size(1512, 950);
+        let restored = small.with_display_size(2560, 1600).for_viewport(Some(3024), Some(1900));
+        assert_eq!((restored.width, restored.height), (2560, 1600));
+        assert_eq!((restored.ffmpeg_capture_width, restored.ffmpeg_capture_height), (2560, 1600));
+        assert_eq!(restored.h264_level(), ("5.1", "33"));
     }
 
     #[test]
