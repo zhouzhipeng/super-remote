@@ -30,11 +30,21 @@ pub async fn stream(
     active: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(2);
+    // A dropped sender future must also retire its capture worker, even if
+    // the peer is still active (for example while recovering an endpoint).
+    struct CaptureLease(Arc<AtomicBool>);
+    impl Drop for CaptureLease {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let capture_alive = Arc::new(AtomicBool::new(true));
+    let _lease = CaptureLease(capture_alive.clone());
     let capture_active = active.clone();
     std::thread::Builder::new()
         .name("desktop-audio-loopback".into())
         .spawn(move || {
-            if let Err(error) = capture_loop(packet_tx, capture_active) {
+            if let Err(error) = capture_loop(packet_tx, capture_active, capture_alive) {
                 tracing::warn!(%error, "WASAPI loopback audio stopped");
             }
         })?;
@@ -71,11 +81,23 @@ pub async fn stream(
     Ok(())
 }
 
-fn capture_loop(packet_tx: mpsc::Sender<Vec<u8>>, active: Arc<AtomicBool>) -> anyhow::Result<()> {
+fn capture_loop(
+    packet_tx: mpsc::Sender<Vec<u8>>,
+    active: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     initialize_mta().ok()?;
+    struct ComLease;
+    impl Drop for ComLease {
+        fn drop(&mut self) {
+            wasapi::deinitialize();
+        }
+    }
+    let _com = ComLease;
     let enumerator = DeviceEnumerator::new()?;
     let device = enumerator.get_default_device(&Direction::Render)?;
     let device_name = device.get_friendlyname()?;
+    let device_id = device.get_id()?;
     let mut audio_client = device.get_iaudioclient()?;
     let desired_format = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE, CHANNELS, None);
     let (default_period, _) = audio_client.get_device_period()?;
@@ -98,7 +120,19 @@ fn capture_loop(packet_tx: mpsc::Sender<Vec<u8>>, active: Arc<AtomicBool>) -> an
 
     audio_client.start_stream()?;
     info!(device = %device_name, "WASAPI system loopback audio started");
-    while active.load(Ordering::Acquire) {
+    let mut endpoint_check = std::time::Instant::now();
+    while active.load(Ordering::Acquire) && alive.load(Ordering::Acquire) && !packet_tx.is_closed()
+    {
+        if endpoint_check.elapsed() >= Duration::from_millis(500) {
+            endpoint_check = std::time::Instant::now();
+            let current = enumerator
+                .get_default_device(&Direction::Render)?
+                .get_id()?;
+            if current != device_id {
+                let _ = audio_client.stop_stream();
+                anyhow::bail!("default playback device changed; reopening loopback");
+            }
+        }
         match event.wait_for_event(100) {
             Ok(()) => {}
             Err(WasapiError::EventTimeout) => continue,

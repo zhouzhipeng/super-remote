@@ -194,7 +194,7 @@ mod windows_app {
     }
 
     struct AudioMuteLease {
-        endpoint: IAudioEndpointVolume,
+        _endpoint: IAudioEndpointVolume,
     }
 
     struct LocalInputHooks {
@@ -1176,16 +1176,15 @@ mod windows_app {
 
         fn set_host_audio_muted(&mut self, muted: bool) {
             if muted {
-                if let Some(lease) = &self.audio_mute {
-                    let _ = unsafe { lease.endpoint.SetMute(true, std::ptr::null()) };
-                    return;
-                }
+                // Resolve the current default on every policy refresh. Windows
+                // can replace it after RDP/Steam/device changes while connected.
                 match default_audio_endpoint_volume() {
                     Ok(endpoint) => match unsafe { endpoint.SetMute(true, std::ptr::null()) } {
                         Ok(()) => {
-                            self.audio_mute = Some(AudioMuteLease { endpoint });
+                            self.audio_mute = Some(AudioMuteLease { _endpoint: endpoint });
                         }
                         Err(error) => {
+                            self.audio_mute.take();
                             set_text(self.action_label, &format!("无法静音主机声音：{error}"))
                         }
                     },

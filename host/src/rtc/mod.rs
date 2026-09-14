@@ -710,7 +710,17 @@ async fn supervise_audio(
     mut state: watch::Receiver<MediaState>,
 ) -> anyhow::Result<()> {
     while wait_until_running(&mut state).await? {
-        audio::stream(track.clone(), payload_type, active.clone()).await?;
+        let result = tokio::select! {
+            result = audio::stream(track.clone(), payload_type, active.clone()) => result,
+            result = state.changed() => { result?; continue; },
+        };
+        if let Err(error) = result {
+            warn!(%error, "audio capture interrupted; reopening the current playback device");
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {},
+            result = state.changed() => { result?; },
+        }
     }
     Ok(())
 }

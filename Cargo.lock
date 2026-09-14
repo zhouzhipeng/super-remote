@@ -2112,7 +2112,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remote-control-panel"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "serde",
  "serde_json",
@@ -2121,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "remote-host"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2151,7 +2151,7 @@ dependencies = [
 
 [[package]]
 name = "remote-protocol"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "postcard",
  "serde",
@@ -2162,7 +2162,7 @@ dependencies = [
 
 [[package]]
 name = "remote-signaling"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "anyhow",
  "axum",
@@ -2960,7 +2960,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "super-remote-launcher"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
