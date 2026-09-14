@@ -228,3 +228,13 @@ mod tests {
         assert_eq!(actual, expected);
     }
 }
+
+pub fn paste_clipboard() -> anyhow::Result<()> {
+    paste_text("")?;
+    send(&[
+        keyboard(0x1d, true, false),
+        keyboard(0x2f, true, false),
+        keyboard(0x2f, false, false),
+        keyboard(0x1d, false, false),
+    ])
+}

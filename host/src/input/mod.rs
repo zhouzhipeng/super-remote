@@ -291,3 +291,14 @@ pub fn paste_text(text: &str) -> anyhow::Result<()> {
     #[cfg(not(windows))]
     anyhow::bail!("input injection is only supported on Windows")
 }
+
+pub fn paste_clipboard() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        windows_input::paste_clipboard()
+    }
+    #[cfg(not(windows))]
+    {
+        anyhow::bail!("Windows required")
+    }
+}

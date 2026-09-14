@@ -26,6 +26,8 @@ uuid.workspace = true
 webrtc = "0.20.0"
 
 [target.'cfg(windows)'.dependencies]
+arboard = "3.6.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
 png = "0.17"
 audiopus = "0.2"
 media_pipeline = { package = "win-native-media", version = "0.1.1" }

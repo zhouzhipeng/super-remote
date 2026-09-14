@@ -67,7 +67,7 @@ export async function reportClient(report: Record<string, unknown>): Promise<voi
  * Async clipboard writes lose their trusted user gesture on plain HTTP LAN
  * origins, so this intentionally uses the browser's synchronous XHR primitive.
  */
-export function localClipboardTextDuringGesture(): string {
+export function localClipboardTextDuringGesture(): { text: string; image?: string } {
   const token = accessToken();
   if (!token) throw new Error("登录已失效");
   const request = new XMLHttpRequest();
@@ -77,7 +77,7 @@ export function localClipboardTextDuringGesture(): string {
   if (request.status < 200 || request.status >= 300) {
     throw new Error(`读取主机剪贴板失败（HTTP ${request.status}）`);
   }
-  const response = JSON.parse(request.responseText) as { text?: unknown };
+  const response = JSON.parse(request.responseText) as { text?: unknown; image?: unknown };
   if (typeof response.text !== "string") throw new Error("主机剪贴板响应无效");
-  return response.text;
+  return { text: response.text, image: typeof response.image === "string" ? response.image : undefined };
 }

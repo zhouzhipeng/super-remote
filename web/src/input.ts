@@ -62,7 +62,8 @@ export class InputController {
     private readonly onLatency: (milliseconds: number) => void,
     private readonly onPasteText: (text: string) => void,
     private readonly onPasteHostClipboard: () => void,
-    private readonly onCopyShortcut: () => string,
+    private readonly onCopyShortcut: () => { text: string; image?: string },
+    private readonly onPasteImage: (image: Blob) => void,
   ) {
     this.#video = video;
     this.#fast = fast;
@@ -219,7 +220,9 @@ export class InputController {
     if (down && !event.repeat && clipboardModifier && (event.code === "KeyC" || event.code === "KeyX")) {
       this.#clipboardShortcuts.markRemoteCopy();
       try {
-        this.#copyHostTextToBrowser(this.onCopyShortcut());
+        const content = this.onCopyShortcut();
+        if (content.image) this.#copyHostImageToBrowser(content.image);
+        else this.#copyHostTextToBrowser(content.text);
       } catch (error) {
         this.#video.dataset.clipboardCopy = "failed";
         this.#video.dataset.clipboardCopyError = error instanceof Error ? error.message : String(error);
@@ -230,6 +233,14 @@ export class InputController {
   #paste = (event: ClipboardEvent): void => {
     if (isLocalUiTarget(event.target)) return;
     if (!event.clipboardData) return;
+    const image = Array.from(event.clipboardData.items).find(item => item.type.startsWith("image/"))?.getAsFile();
+    if (image) {
+      event.preventDefault();
+      event.stopPropagation();
+      const attempt = this.#clipboardShortcuts.pasteActive ? this.#pasteAttempt : ++this.#pasteAttempt;
+      this.#deliverBrowserImage(image, attempt);
+      return;
+    }
     const text = event.clipboardData.getData("text/plain");
     if (!text && document.activeElement === this.#pasteSink) {
       // Safari can expose an empty ClipboardEvent while still inserting the
@@ -259,7 +270,16 @@ export class InputController {
     this.#pasteFocusTimer = window.setTimeout(() => {
       if (document.activeElement === this.#pasteSink) this.#video.focus({ preventScroll: true });
     }, 300);
-    if (navigator.clipboard?.readText) {
+    if (navigator.clipboard?.read) {
+      void navigator.clipboard.read().then(async items => {
+        for (const item of items) {
+          const type = item.types.find(type => type.startsWith("image/"));
+          if (type) { this.#deliverBrowserImage(await item.getType(type), attempt); return; }
+        }
+        const item = items.find(item => item.types.includes("text/plain"));
+        if (item) this.#deliverBrowserPaste(await (await item.getType("text/plain")).text(), "api", attempt);
+      }).catch(() => undefined);
+    } else if (navigator.clipboard?.readText) {
       void navigator.clipboard.readText().then((text) => {
         if (this.#pasteHandled < attempt) this.#deliverBrowserPaste(text, "api", attempt);
       }).catch(() => undefined);
@@ -274,6 +294,39 @@ export class InputController {
     this.#video.dataset.clipboardPasteSource = source;
     this.onPasteText(text);
     this.#video.focus({ preventScroll: true });
+  }
+
+  #deliverBrowserImage(image: Blob, attempt: number): void {
+    if (attempt > 0 && this.#pasteHandled >= attempt) return;
+    this.#pasteHandled = Math.max(this.#pasteHandled, attempt);
+    window.clearTimeout(this.#pasteFocusTimer);
+    this.onPasteImage(image);
+    this.#video.focus({ preventScroll: true });
+  }
+
+  #copyHostImageToBrowser(base64: string): void {
+    const bytes = Uint8Array.from(atob(base64), char => char.charCodeAt(0));
+    if (navigator.clipboard?.write && typeof ClipboardItem !== "undefined") {
+      void navigator.clipboard.write([new ClipboardItem({ "image/png": new Blob([bytes], { type: "image/png" }) })])
+        .then(() => { this.#video.dataset.clipboardCopy = "image"; })
+        .catch(error => { this.#video.dataset.clipboardCopy = "failed"; this.#video.dataset.clipboardCopyError = String(error); });
+      return;
+    }
+    // HTTP pages can only copy rich content through a trusted native copy gesture.
+    const container = document.createElement("div");
+    container.contentEditable = "true";
+    container.style.cssText = "position:fixed;left:-10000px;top:0";
+    const image = document.createElement("img");
+    image.src = `data:image/png;base64,${base64}`;
+    container.append(image);
+    document.body.append(container);
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNode(image);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    try { this.#video.dataset.clipboardCopy = document.execCommand("copy") ? "image-html" : "failed"; }
+    finally { selection?.removeAllRanges(); container.remove(); this.#video.focus({ preventScroll: true }); }
   }
 
   #copyHostTextToBrowser(text: string): void {

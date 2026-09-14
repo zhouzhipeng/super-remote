@@ -2,6 +2,7 @@
 
 mod audio;
 mod clipboard;
+mod clipboard_image;
 mod config;
 mod control;
 #[cfg(windows)]

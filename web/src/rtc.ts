@@ -307,6 +307,42 @@ export class RemoteSession extends EventTarget {
     return this.#clipboardRequest({ type: "write", text, paste });
   }
 
+  #imageWriteQueue: Promise<unknown> = Promise.resolve();
+
+  writeClipboardImage(image: Blob): Promise<unknown> {
+    const operation = this.#imageWriteQueue.catch(() => undefined).then(async () => {
+      if (image.size > 16 * 1024 * 1024) throw new Error("剪贴板图片超过 16 MiB");
+      let png = image;
+      if (image.type !== "image/png") {
+        const bitmap = await createImageBitmap(image);
+        try {
+          if (bitmap.width * bitmap.height > 16 * 1024 * 1024) throw new Error("图片像素过大");
+          const canvas = document.createElement("canvas");
+          canvas.width = bitmap.width; canvas.height = bitmap.height;
+          canvas.getContext("2d")!.drawImage(bitmap, 0, 0);
+          png = await new Promise<Blob>((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error("图片转换失败")), "image/png"));
+        } finally { bitmap.close(); }
+      }
+      if (png.size > 16 * 1024 * 1024) throw new Error("剪贴板图片超过 16 MiB");
+      const bytes = new Uint8Array(await png.arrayBuffer());
+      // Keep a bounded window in flight so WAN latency is paid per window,
+      // while ordered delivery keeps the final paste behind every image chunk.
+      for (let windowStart = 0; windowStart < bytes.length; windowStart += 8192 * 16) {
+        const requests: Promise<string>[] = [];
+        for (let offset = windowStart; offset < Math.min(bytes.length, windowStart + 8192 * 16); offset += 8192) {
+          const part = bytes.subarray(offset, offset + 8192);
+          requests.push(this.#clipboardRequest({ type: "image_chunk", data: btoa(String.fromCharCode(...part)),
+            start: offset === 0, last: offset + part.length === bytes.length, paste: true }));
+        }
+        const results = await Promise.allSettled(requests);
+        const failure = results.find(result => result.status === "rejected");
+        if (failure?.status === "rejected") throw failure.reason;
+      }
+    });
+    this.#imageWriteQueue = operation;
+    return operation;
+  }
+
   pasteHostClipboard(): Promise<string> {
     return this.#clipboardRequest({ type: "paste" });
   }
@@ -393,7 +429,7 @@ export class RemoteSession extends EventTarget {
     this.close();
   }
 
-  #clipboardRequest(message: { type: "read" } | { type: "write"; text: string; paste: boolean } | { type: "paste" }): Promise<string> {
+  #clipboardRequest(message: { type: "read" } | { type: "write"; text: string; paste: boolean } | { type: "paste" } | { type: "image_chunk"; data: string; start: boolean; last: boolean; paste: boolean }): Promise<string> {
     const channel = this.#clipboard;
     if (!channel || channel.readyState !== "open") return Promise.reject(new Error("剪贴板通道尚未连接"));
     const id = ++this.#clipboardRequestId;
@@ -503,7 +539,8 @@ export class RemoteSession extends EventTarget {
       latency => this.#stats?.setInputLatency(latency),
       text => { void this.writeClipboard(text, true).catch(error => this.#clipboardError(error)); },
       () => { void this.pasteHostClipboard().catch(error => this.#clipboardError(error)); },
-      () => localClipboardTextDuringGesture());
+      () => localClipboardTextDuringGesture(),
+      image => { void this.writeClipboardImage(image).catch(error => this.#clipboardError(error)); });
     this.video.dataset.inputTransport = direct ? "webrtc-input" : "websocket-control";
   }
 

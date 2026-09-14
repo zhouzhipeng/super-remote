@@ -251,3 +251,10 @@ domain names in `deploy/nginx/nginx.conf`, provide TLS certificates under both c
 directories, then run `docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d`.
 Do not expose the signaling service directly, enable coturn `no-auth`, or put permanent TURN
 credentials in the browser bundle.
+
+
+### 图片剪贴板
+
+远程画面中的 Ctrl+C/Ctrl+V（Mac 上 Cmd+C/Cmd+V）支持图片：本机截图或复制的图片会分块发送到 Windows 主机，完整写入系统剪贴板后再粘贴；远程会话内复制的图片可以直接在主机粘贴。单张 PNG 上限为 16 MiB，解码像素内存上限为 64 MiB。
+
+主机图片复制到本机通过现有的同机信令剪贴板桥接读取。HTTPS/localhost 使用浏览器 PNG 剪贴板 API，需要允许剪贴板访问；普通 HTTP 回退为富文本图片复制，能否在目标应用粘贴取决于浏览器和目标应用，不能保证等同于原生图片剪贴板。剪贴板面板的文本框仍用于手动同步文字。

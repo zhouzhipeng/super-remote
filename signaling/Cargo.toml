@@ -25,6 +25,8 @@ rust-embed = "8.7"
 mime_guess = "2.0"
 
 [target.'cfg(windows)'.dependencies]
+arboard = "3.6.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",
   "Win32_System_DataExchange",

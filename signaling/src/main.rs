@@ -1,6 +1,9 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod auth;
+#[path = "../../host/src/clipboard_image.rs"]
+#[allow(dead_code)]
+mod clipboard_image;
 mod local_clipboard;
 mod state;
 mod turn_mux;
@@ -41,6 +44,7 @@ struct WsQuery {
 #[derive(Serialize)]
 struct LocalClipboardResponse {
     text: String,
+    image: Option<String>,
 }
 
 #[tokio::main]
@@ -188,13 +192,18 @@ async fn local_clipboard_text(State(state): State<Arc<AppState>>, headers: Heade
     // the client clipboard. Wait briefly for the Host's Ctrl+C to advance the
     // shared Windows clipboard sequence before returning its text.
     match tokio::task::spawn_blocking(|| {
-        local_clipboard::read_text_after_copy(std::time::Duration::from_millis(140))
+        let text = local_clipboard::read_text_after_copy(std::time::Duration::from_millis(140))?;
+        let image = clipboard_image::read_png()?.map(|png| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(png)
+        });
+        Ok::<_, anyhow::Error>((text, image))
     })
     .await
     {
-        Ok(Ok(text)) => {
+        Ok(Ok((text, image))) => {
             info!(subject = %principal.subject, bytes = text.len(), "served Host clipboard to browser copy gesture");
-            Json(LocalClipboardResponse { text }).into_response()
+            Json(LocalClipboardResponse { text, image }).into_response()
         }
         Ok(Err(error)) => api_error(
             StatusCode::CONFLICT,

@@ -240,15 +240,30 @@ impl PeerConnectionEventHandler for Handler {
                 let handshake = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     loop {
                         match channel.poll().await {
-                            Some(DataChannelEvent::OnMessage(message)) if message.is_string && message.data.as_ref() == b"start" => return true,
-                            None | Some(DataChannelEvent::OnClose | DataChannelEvent::OnError) => return false,
+                            Some(DataChannelEvent::OnMessage(message))
+                                if message.is_string && message.data.as_ref() == b"start" =>
+                            {
+                                return true;
+                            }
+                            None | Some(DataChannelEvent::OnClose | DataChannelEvent::OnError) => {
+                                return false;
+                            }
                             _ => {}
                         }
                     }
-                }).await.unwrap_or(false);
+                })
+                .await
+                .unwrap_or(false);
                 if handshake {
                     let _ = tile_mode.send(true);
-                    if let Err(error) = crate::desktop_tiles::serve(channel.clone(), retired, tile_active, input_state.clone()).await {
+                    if let Err(error) = crate::desktop_tiles::serve(
+                        channel.clone(),
+                        retired,
+                        tile_active,
+                        input_state.clone(),
+                    )
+                    .await
+                    {
                         warn!(%error, "idle refinement stopped; low-latency video continues");
                     }
                 }
@@ -323,6 +338,7 @@ impl PeerConnectionEventHandler for Handler {
 }
 
 async fn serve_clipboard(channel: Arc<dyn DataChannel>) {
+    let mut image_upload = Vec::new();
     while let Some(event) = channel.poll().await {
         match event {
             DataChannelEvent::OnMessage(message) if message.is_string => {
@@ -333,7 +349,51 @@ async fn serve_clipboard(channel: Arc<dyn DataChannel>) {
                     }) {
                     Ok(request) => {
                         let id = request.id();
+                        let image_result = if let ClipboardRequest::ImageChunk {
+                            data,
+                            start,
+                            last,
+                            paste,
+                            ..
+                        } = &request
+                        {
+                            use base64::Engine;
+                            if *start {
+                                image_upload.clear();
+                            }
+                            let result = (|| -> anyhow::Result<Option<(Vec<u8>, bool)>> {
+                                anyhow::ensure!(data.len() <= 12 * 1024, "image chunk too large");
+                                let bytes =
+                                    base64::engine::general_purpose::STANDARD.decode(data)?;
+                                anyhow::ensure!(
+                                    image_upload.len() + bytes.len()
+                                        <= crate::clipboard_image::MAX_IMAGE_BYTES,
+                                    "image exceeds 16 MiB"
+                                );
+                                image_upload.extend(bytes);
+                                Ok(if *last {
+                                    Some((std::mem::take(&mut image_upload), *paste))
+                                } else {
+                                    None
+                                })
+                            })();
+                            if result.is_err() {
+                                image_upload.clear();
+                            }
+                            Some(result)
+                        } else {
+                            None
+                        };
                         match tokio::task::spawn_blocking(move || {
+                            if let Some(result) = image_result {
+                                if let Some((png, paste)) = result? {
+                                    crate::clipboard_image::write_png(&png)?;
+                                    if paste {
+                                        input::paste_clipboard()?;
+                                    }
+                                }
+                                return Ok(ClipboardResponse::Ack { id });
+                            }
                             process_clipboard_request(request)
                         })
                         .await
@@ -396,7 +456,12 @@ fn process_clipboard_request(request: ClipboardRequest) -> anyhow::Result<Clipbo
             info!(bytes = text.len(), paste, "wrote Web clipboard to Host");
             Ok(ClipboardResponse::Ack { id })
         }
+        ClipboardRequest::ImageChunk { .. } => anyhow::bail!("image chunk requires session state"),
         ClipboardRequest::Paste { id } => {
+            if crate::clipboard_image::read_png()?.is_some() {
+                input::paste_clipboard()?;
+                return Ok(ClipboardResponse::Ack { id });
+            }
             let text = clipboard::read_text()?;
             anyhow::ensure!(
                 text.len() <= MAX_CLIPBOARD_TEXT_BYTES,
@@ -470,7 +535,9 @@ pub async fn accept_offer(
         local_cursor: config.local_cursor,
         control_only: false,
         tile_mode,
-        tile_eligible: config.local_cursor && config.h264_file.is_none() && config.monitor_index == 0,
+        tile_eligible: config.local_cursor
+            && config.h264_file.is_none()
+            && config.monitor_index == 0,
     });
     let peer = Arc::new(
         PeerConnectionBuilder::new()
