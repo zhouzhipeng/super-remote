@@ -1,0 +1,98 @@
+// Isolated browser fixture: no installed Host, credentials or real input.
+import assert from "node:assert/strict";
+import { createRequire } from "node:module";
+import { createServer } from "vite";
+import { fileURLToPath } from "node:url";
+const require = createRequire(import.meta.url);
+const { chromium } = require(process.env.PLAYWRIGHT_PACKAGE || "playwright");
+const server = await createServer({ root: fileURLToPath(new URL("..", import.meta.url)), server: { host: "127.0.0.1", port: 0 } });
+await server.listen();
+const browser = await chromium.launch({ executablePath: process.env.CHROME_EXECUTABLE, headless: true });
+try {
+  const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+  await page.route("**/tile-fixture", route => route.fulfill({ contentType: "text/html", body:
+    '<link rel="stylesheet" href="/src/style.css"><main class="remote"><video></video><div style="height:48px"></div></main>' }));
+  await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/tile-fixture`);
+  const result = await page.evaluate(async () => {
+    const { DesktopTiles } = await import("/src/desktop-tiles.ts");
+    class Channel extends EventTarget {
+      sent = []; closed = false;
+      send(data) { this.sent.push(data); }
+      close() { this.closed = true; }
+      receive(data) { this.dispatchEvent(new MessageEvent("message", { data })); }
+    }
+    const channel = new Channel(), video = document.querySelector("video");
+    let commits = 0;
+    const display = new DesktopTiles(video, channel, () => { commits++; });
+    channel.dispatchEvent(new Event("open"));
+    const wait = async predicate => {
+      const start = performance.now();
+      while (!predicate()) { if (performance.now() - start > 5000) throw new Error("commit timeout"); await new Promise(r => setTimeout(r, 5)); }
+    };
+    const png = async (w, h, color) => {
+      const canvas = document.createElement("canvas"); canvas.width = w; canvas.height = h;
+      const context = canvas.getContext("2d"); context.fillStyle = color; context.fillRect(0,0,w,h);
+      return new Uint8Array(await (await new Promise(r => canvas.toBlob(r, "image/png"))).arrayBuffer());
+    };
+    const packet = async (x,y,w,h,color) => {
+      const image = await png(w,h,color), data = new Uint8Array(12 + image.length), view = new DataView(data.buffer);
+      [x,y,w,h].forEach((value,i) => view.setUint16(i * 2,value,true)); view.setUint32(8,image.length,true); data.set(image,12); return data;
+    };
+    const send = (id,w,h,parts,copies=[]) => {
+      const data = new Uint8Array(parts.reduce((n,p) => n+p.length,0)); let offset = 0;
+      for (const part of parts) { data.set(part,offset); offset += part.length; }
+      channel.receive(JSON.stringify({ type:"begin",id,width:w,height:h,bytes:data.length,tiles:parts.length,copies }));
+      // Deliberately split inside headers and PNG bytes.
+      for (let offset=0; offset<data.length; offset+=17) channel.receive(data.slice(offset,offset+17).buffer);
+      channel.receive(JSON.stringify({type:"end",id}));
+    };
+    send(1,130,2,[await packet(0,0,128,2,"rgb(17,34,51)"),await packet(128,0,2,2,"rgb(17,34,51)")]);
+    await wait(() => commits === 1);
+    send(2,130,2,[await packet(128,0,2,2,"rgb(1,2,255)")]);
+    await wait(() => commits === 2);
+    const canvas = document.querySelector(".desktop-tiles"), context = canvas.getContext("2d");
+    const unchanged = [...context.getImageData(127,0,1,1).data], changed = [...context.getImageData(128,0,1,1).data];
+    if (!canvas.hidden) throw new Error("Unvalidated snapshot became visible");
+    channel.receive(JSON.stringify({type:"show",id:2,input:"0"}));
+    await new Promise(r => requestAnimationFrame(r));
+    const aligned = Math.abs(canvas.getBoundingClientRect().height - video.getBoundingClientRect().height) < 1;
+    const mode = video.dataset.displayTransport;
+    video.dataset.latestInput = "10";
+    video.dispatchEvent(new Event("remote-input"));
+    if (!canvas.hidden) throw new Error("Local input did not immediately hide refinement");
+    channel.receive(JSON.stringify({type:"show",id:2,input:"0"}));
+    if (!canvas.hidden) throw new Error("Old snapshot covered newer input");
+    channel.receive(JSON.stringify({type:"show",id:2,input:"10"}));
+    if (canvas.hidden) throw new Error("Validated snapshot stayed hidden");
+    channel.receive(JSON.stringify({type:"invalidate"}));
+    if (!canvas.hidden) throw new Error("Remote change did not invalidate refinement");
+    send(3,2,1,[await packet(0,0,2,1,"rgb(44,55,66)")]);
+    await wait(() => commits === 3);
+    const resized = [canvas.width,canvas.height,...context.getImageData(0,0,1,1).data];
+    send(4,2,256,[await packet(0,0,2,128,"rgb(200,0,0)"),await packet(0,128,2,128,"rgb(0,0,200)")]);
+    const copies = [{x:0,y:0,width:2,height:128,source_y:128},{x:0,y:128,width:2,height:128,source_y:0}];
+    send(5,2,256,[],copies);
+    send(6,2,256,[],copies);
+    await wait(() => commits === 6);
+    const scrollRestored=[...context.getImageData(0,0,1,1).data,...context.getImageData(0,128,1,1).data];
+    channel.receive(JSON.stringify({type:"begin",id:7,width:256,height:128,bytes:100,tiles:2}));
+    channel.receive(JSON.stringify({type:"cancel",id:7}));
+    if (channel.closed) throw new Error("Cancellation closed the channel");
+    send(8,2,256,[],copies);
+    await wait(() => commits === 7);
+    channel.receive(JSON.stringify({type:"begin",id:9,width:256,height:128,bytes:100,tiles:2}));
+    channel.receive(JSON.stringify({type:"end",id:9}));
+    return { unchanged,changed,aligned,mode,resized,scrollRestored,commits,closed:channel.closed,
+      cleaned:!document.querySelector(".desktop-tiles") && !video.dataset.desktopWidth,
+      sent:channel.sent };
+  });
+  assert.deepEqual(result.unchanged,[17,34,51,255]);
+  assert.deepEqual(result.changed,[1,2,255,255]);
+  assert.deepEqual(result.resized,[2,1,44,55,66,255]);
+  assert.equal(result.mode,"lossless-tiles");
+  assert.ok(result.aligned && result.closed && result.cleaned);
+  assert.equal(result.commits,7);
+  assert.deepEqual(result.scrollRestored,[200,0,0,255,0,0,200,255]);
+  assert.deepEqual(result.sent,["start",... [1,2,3,4,5,6,8].map(id=>JSON.stringify({type:"ack",id}))]);
+  console.log("PASS: lossless pixels, unchanged regions, chunk boundaries, resize, layout, commit ACK and failure cleanup");
+} finally { await browser.close(); await server.close(); }

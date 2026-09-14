@@ -13,6 +13,8 @@ pub struct HostConfig {
     /// Negotiated per session; never enabled by a configuration file alone.
     #[serde(skip)]
     pub local_cursor: bool,
+    #[serde(skip)]
+    pub hybrid_video: bool,
     #[serde(default)]
     pub follow_primary_display: bool,
     pub server_url: String,
@@ -241,6 +243,7 @@ mod tests {
     fn config() -> Arc<HostConfig> {
         Arc::new(HostConfig {
             local_cursor: false,
+            hybrid_video: false,
             follow_primary_display: false,
             server_url: String::new(),
             device_id: "device".into(),

@@ -326,11 +326,15 @@ async function sessionView(deviceId: string): Promise<void> {
   app.querySelector("#disconnect-confirm")!.addEventListener("click", leaveSession);
   app.querySelector("#back")!.addEventListener("click", leaveSession);
   const soundButton = app.querySelector<HTMLButtonElement>("#sound")!;
+  const updateSoundButton = (): void => {
+    soundButton.textContent = video.muted ? "开启声音" : "静音";
+  };
+  // Reconnects reset the media element to muted, without a toolbar click.
+  video.addEventListener("volumechange", updateSoundButton);
+  updateSoundButton();
   soundButton.addEventListener("click", () => {
-    const muted = !video.muted;
-    void session.setMuted(muted).then(() => {
-      soundButton.textContent = muted ? "开启声音" : "静音";
-    }).catch(() => { state.textContent = "浏览器阻止了声音播放，请再点一次"; });
+    void session.setMuted(!video.muted)
+      .catch(() => { state.textContent = "浏览器阻止了声音播放，请再点一次"; });
   });
   try { await session.connect(deviceId); } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

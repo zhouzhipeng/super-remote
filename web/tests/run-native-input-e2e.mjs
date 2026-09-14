@@ -11,6 +11,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
+// Explicit opt-in variant captures the primary desktop into the browser only.
+const tileTest = process.env.REMOTE_TILE_TEST === "1";
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_PACKAGE || "playwright");
@@ -50,12 +52,16 @@ try {
   assert.ok(ready, "isolated signaling failed to start");
   const config = path.join(temp, "host.toml");
   fs.writeFileSync(config, `server_url = ${JSON.stringify(origin)}\ndevice_id = "native-input-test"\ndevice_name = "Native Input Test"\ndevice_token = "${token}"\nwidth = 640\nheight = 360\nfps = 30\nbitrate = 2000000\nh264_file = ${JSON.stringify(clip)}\n`);
+  if (tileTest) {
+    // No production service is touched and no desktop pixels are saved.
+    fs.writeFileSync(config, `server_url = ${JSON.stringify(origin)}\ndevice_id = "native-input-test"\ndevice_name = "Native Tile Test"\ndevice_token = "${token}"\nwidth = 2560\nheight = 1600\nfps = 60\nbitrate = 20000000\nffmpeg_path = ${JSON.stringify(process.env.FFMPEG_EXECUTABLE.replaceAll("\\", "/"))}\nffmpeg_encoder = "h264_nvenc"\nffmpeg_capture_mode = "ddagrab"\n`);
+  }
   start(process.env.HOST_EXECUTABLE || path.join(root, "target/debug/remote-host.exe"), [config]);
   browser = await chromium.launch({ executablePath: process.env.CHROME_EXECUTABLE, headless: true });
-  const page = await browser.newPage({ viewport: { width: 1000, height: 750 } });
+  const page = await browser.newPage({ viewport: { width: 1000, height: 750 }, deviceScaleFactor: tileTest ? 2 : 1 });
   const errors = [];
   page.on("pageerror", error => errors.push(error.message));
-  await page.addInitScript(() => {
+  await page.addInitScript(ackDelay => {
     const Native = RTCPeerConnection;
     window.__dual = { channels: {} };
     const NativeSocket = WebSocket;
@@ -72,10 +78,19 @@ try {
       addTransceiver(kind, init) { if (kind === "video") window.__dual.video = this; return super.addTransceiver(kind, init); }
       createDataChannel(label, options) {
         if (label === "input-fast") window.__dual.input = this;
-        const channel = super.createDataChannel(label, options); window.__dual.channels[label] = channel; return channel;
+        const channel = super.createDataChannel(label, options); window.__dual.channels[label] = channel;
+        if ((label === "desktop-refinement-v1" || label === "desktop-tiles-v1") && ackDelay > 0) {
+          const send = channel.send.bind(channel);
+          channel.send = data => {
+            if (typeof data === "string" && data.startsWith('{"type":"ack"')) {
+              setTimeout(() => { if (channel.readyState === "open") send(data); }, ackDelay);
+            } else send(data);
+          };
+        }
+        return channel;
       }
     };
-  });
+  }, Number(process.env.REMOTE_TILE_ACK_DELAY_MS || "0"));
   // Emulate an FRP/reverse-proxy idle timeout. RTC input and media do not
   // refresh the separate signaling socket; server Ping must keep it alive.
   proxy = net.createServer(client => {
@@ -94,8 +109,11 @@ try {
   await page.locator('[name="password"]').fill(password);
   await page.locator('form button').click();
   await page.locator('[data-device="native-input-test"]').click();
-  await page.waitForFunction(() => document.querySelector("video")?.currentTime > 1
-    && document.querySelector("video").dataset.inputTransport === "webrtc-input", null, { timeout: 30_000 });
+  await page.waitForFunction(tiles => (tiles
+    ? document.querySelector("video")?.readyState >= 2
+    : document.querySelector("video")?.currentTime > 1)
+    && document.querySelector("video").dataset.inputTransport === "webrtc-input", tileTest, { timeout: 30_000 });
+  if (tileTest) await page.waitForFunction(() => window.__dual.channels["desktop-refinement-v1"]?.readyState === "open");
   const result = await page.evaluate(async () => {
     const route = async peer => {
       const stats = await peer.getStats();
@@ -104,6 +122,7 @@ try {
       const local = stats.get(pair.localCandidateId), remote = stats.get(pair.remoteCandidateId);
       return { localPort: local.port, remotePort: remote.port, protocol: local.protocol };
     };
+    window.__dual.probeInput = async () => {
     const latency = {};
     for (const label of ["input-fast", "input-reliable"]) {
       const channel = window.__dual.channels[label], samples = [];
@@ -125,13 +144,42 @@ try {
       samples.sort((a,b) => a-b);
       latency[label] = { samples: samples.length, medianMs: samples[20], p95Ms: samples[38] };
     }
-    return { video: await route(window.__dual.video), input: await route(window.__dual.input), latency };
+    return latency;
+    };
+    return { video: await route(window.__dual.video), input: await route(window.__dual.input), latency: await window.__dual.probeInput() };
   });
   assert.notEqual(result.video.remotePort, result.input.remotePort, "native Host must use independent UDP sockets");
   assert.notEqual(result.video.localPort, result.input.localPort, "browser must use independent UDP sockets");
+  const videoStats = () => page.evaluate(async () => {
+    const reports = await window.__dual.video.getStats();
+    const r = [...reports.values()].find(r => r.type === "inbound-rtp" && r.kind === "video");
+    return { frames: r.framesDecoded, bytes: r.bytesReceived, jitterBufferDelay: r.jitterBufferDelay,
+      jitterBufferEmittedCount: r.jitterBufferEmittedCount, totalDecodeTime: r.totalDecodeTime };
+  });
+  const videoStart = await videoStats();
+  const tileStart = await page.evaluate(() => Number(document.querySelector("video")?.dataset.tileFrame || "0"));
   await page.waitForTimeout(32_000);
+  if (tileTest) result.tileUpdatesPerSecond = (await page.evaluate(() => Number(document.querySelector("video")?.dataset.tileFrame || "0")) - tileStart) / 32;
+  const videoEnd = await videoStats();
+  const decoded = videoEnd.frames - videoStart.frames;
+  result.continuousVideo = { frames: decoded, fps: decoded / 32,
+    mbps: (videoEnd.bytes - videoStart.bytes) * 8 / 32 / 1e6,
+    decodeMs: (videoEnd.totalDecodeTime - videoStart.totalDecodeTime) * 1000 / decoded,
+    jitterBufferMs: (videoEnd.jitterBufferDelay - videoStart.jitterBufferDelay) * 1000 /
+      (videoEnd.jitterBufferEmittedCount - videoStart.jitterBufferEmittedCount) };
+  assert.ok(decoded > 32 * 20, "continuous video stalled during refinement");
+  result.artificialCommitAckDelayMs = Number(process.env.REMOTE_TILE_ACK_DELAY_MS || "0");
+  result.sustainedLatency = await page.evaluate(() => window.__dual.probeInput());
   assert.equal(await page.evaluate(() => window.__dual.socket.readyState), 1, "idle proxy closed the signaling socket");
   assert.equal(await page.evaluate(() => window.__dual.video.connectionState), "connected");
+  if (tileTest) {
+    result.tiles = await page.evaluate(() => ({ ...document.querySelector("video").dataset }));
+    assert.ok(["lossless-tiles", "hybrid-video", undefined].includes(result.tiles.displayTransport));
+    await page.evaluate(() => (window.__dual.channels["desktop-refinement-v1"] ?? window.__dual.channels["desktop-tiles-v1"]).close());
+    await page.waitForFunction(() => !document.querySelector("video").dataset.displayTransport
+      && document.querySelector("video").currentTime > 1, null, { timeout: 30_000 });
+    result.tileFallback = "H.264 continued";
+  }
   await page.evaluate(() => window.__dual.input.close());
   await page.waitForFunction(() => document.querySelector("video")?.dataset.inputTransport === "websocket-control");
   assert.equal(await page.evaluate(() => window.__dual.video.connectionState), "connected");
@@ -152,6 +200,8 @@ try {
   });
   await page.locator("#back").click();
   assert.deepEqual(errors, []);
+  if (tileTest) assert.ok(logs.join("").includes("hybrid=true"), "Host never enabled hybrid video");
+  result.pipeline = logs.join("").split("\n").filter(line => /video pipeline five-second window|idle desktop refinement committed/.test(line)).slice(-6);
   console.log(JSON.stringify({ ...result, heartbeat: "survived 32s behind a 20s idle-timeout proxy", fallback: "websocket-control; video remained connected" }, null, 2));
 } catch (error) {
   console.error(logs.join("").split("\n").filter(line => /error|warn|failed/i.test(line) && !/browser client report|ticket|token/i.test(line)).slice(-20).join("\n"));

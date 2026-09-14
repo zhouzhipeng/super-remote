@@ -89,3 +89,43 @@ pub fn encoding_args(encoder: &str, bitrate: u32, fps: u16) -> Vec<String> {
     ]);
     args
 }
+
+/// Bound motion traffic while idle lossless tiles restore exact desktop pixels.
+pub fn hybrid_encoding_args(encoder: &str, bitrate: u32, fps: u16) -> Vec<String> {
+    let ceiling = bitrate.min(4_000_000);
+    let mut args = encoding_args(encoder, ceiling, fps);
+    if encoder == "h264_nvenc" {
+        let rc = args.iter().position(|arg| arg == "-rc").unwrap();
+        args[rc + 1] = "vbr".into();
+        let qp = args.iter().position(|arg| arg == "-qp").unwrap();
+        args[qp] = "-cq".into();
+        args.extend([
+            "-b:v".into(),
+            (ceiling / 2).to_string(),
+            "-maxrate".into(),
+            ceiling.to_string(),
+            "-bufsize".into(),
+            ceiling
+                .div_ceil(u32::from(fps))
+                .saturating_mul(2)
+                .to_string(),
+        ]);
+    }
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hybrid_nvenc_bounds_motion_without_changing_legacy_quality() {
+        let legacy = super::encoding_args("h264_nvenc", 20_000_000, 60);
+        assert!(legacy.iter().any(|arg| arg == "constqp"));
+        let args = super::hybrid_encoding_args("h264_nvenc", 20_000_000, 60);
+        let value = |key| &args[args.iter().position(|arg| arg == key).unwrap() + 1];
+        assert_eq!(value("-rc"), "vbr");
+        assert_eq!(value("-cq"), "18");
+        assert_eq!(value("-maxrate"), "4000000");
+        assert_eq!(value("-bufsize"), "133334");
+        assert_eq!(value("-bf"), "0");
+    }
+}

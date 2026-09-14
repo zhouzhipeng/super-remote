@@ -168,7 +168,9 @@ async fn stream_ffmpeg(
             "-i".to_owned(),
             format!(
                 "ddagrab=output_idx={}:draw_mouse={}:framerate={}:dup_frames=1",
-                config.monitor_index, u8::from(!config.local_cursor), desktop_duplication_fps
+                config.monitor_index,
+                u8::from(!config.local_cursor),
+                desktop_duplication_fps
             ),
         ]);
     } else {
@@ -209,11 +211,12 @@ async fn stream_ffmpeg(
         "-fps_mode".to_owned(),
         "passthrough".to_owned(),
     ]);
-    args.extend(ffmpeg_options::encoding_args(
-        &config.ffmpeg_encoder,
-        config.bitrate,
-        config.fps,
-    ));
+    let encode = if config.hybrid_video {
+        ffmpeg_options::hybrid_encoding_args
+    } else {
+        ffmpeg_options::encoding_args
+    };
+    args.extend(encode(&config.ffmpeg_encoder, config.bitrate, config.fps));
     // Flush each encoded packet even on static screens with tiny delta frames.
     args.extend(["-flush_packets", "1", "-f", "h264", "pipe:1"].map(str::to_owned));
     let mut command = Command::new(&path);
@@ -230,7 +233,10 @@ async fn stream_ffmpeg(
         width = config.width,
         height = config.height,
         bitrate = config.bitrate,
-        fixed_qp = ffmpeg_options::fixed_qp(&config.ffmpeg_encoder),
+        hybrid = config.hybrid_video,
+        fixed_qp = (!config.hybrid_video)
+            .then(|| ffmpeg_options::fixed_qp(&config.ffmpeg_encoder))
+            .flatten(),
         "FFmpeg video capture started"
     );
     let stdout = child
@@ -310,8 +316,7 @@ async fn stream_ffmpeg(
     let mut sent_in_window = 0u64;
     let mut max_write_time = Duration::ZERO;
     let mut report_at = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut next_frame_at = tokio::time::Instant::now() + duration;
-    let mut pacing_rebases = 0u64;
+
     let result = async {
         while active.load(Ordering::Acquire) {
             let data = tokio::select! {
@@ -325,15 +330,8 @@ async fn stream_ffmpeg(
                     continue;
                 }
             };
-            let now = tokio::time::Instant::now();
-            if now < next_frame_at {
-                tokio::time::sleep_until(next_frame_at).await;
-            } else {
-                // Never send a late backlog as a burst. Rebase the cadence at
-                // the current frame so Safari always sees evenly spaced RTP.
-                next_frame_at = now;
-                pacing_rebases += 1;
-            }
+            // Live capture already provides cadence. A second clock here makes
+            // small scheduler overruns accumulate in FFmpeg's output pipe.
             let write_started = tokio::time::Instant::now();
             let write_result = track
                 .sample_writer(ssrc, payload_type)
@@ -357,16 +355,13 @@ async fn stream_ffmpeg(
                     width = config.width,
                     height = config.height,
                     sent_frames = sent_in_window,
-                    pacing_rebases,
                     max_rtp_write_us = max_write_time.as_micros(),
                     "video pipeline five-second window"
                 );
                 sent_in_window = 0;
-                pacing_rebases = 0;
                 max_write_time = Duration::ZERO;
                 report_at += Duration::from_secs(5);
             }
-            next_frame_at += duration;
         }
         anyhow::Ok(())
     }

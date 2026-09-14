@@ -9,6 +9,8 @@ mod cursor;
 #[cfg(windows)]
 mod display_power;
 mod ffmpeg_options;
+#[cfg(windows)]
+mod desktop_tiles;
 mod input;
 mod rtc;
 mod signaling;

@@ -4,8 +4,10 @@ export class StatsMonitor {
   #lastAudioBytes = 0;
   #lastTime = 0;
   #inputLatencyMs: number | null = null;
+  #lastTileBytes = 0;
 
-  constructor(private readonly peer: RTCPeerConnection, private readonly output: HTMLElement) {}
+  constructor(private readonly peer: RTCPeerConnection, private readonly output: HTMLElement,
+    private readonly video?: HTMLVideoElement) {}
 
   start(): void {
     this.#timer = window.setInterval(() => void this.#refresh(), 1000);
@@ -41,6 +43,11 @@ export class StatsMonitor {
       }
     });
     const now = performance.now();
+    const seconds = this.#lastTime ? (now - this.#lastTime) / 1000 : 0;
+    const tiles = this.video?.dataset.displayTransport === "lossless-tiles";
+    const tileBytes = Number(this.video?.dataset.tileBytes ?? 0);
+    const tileMbps = seconds ? Math.max(0, tileBytes - this.#lastTileBytes) * 8 / seconds / 1_000_000 : 0;
+    this.#lastTileBytes = tileBytes;
     const bitrate = this.#lastTime ? ((bytes - this.#lastBytes) * 8) / ((now - this.#lastTime) / 1000) / 1_000_000 : 0;
     const audioKbps = this.#lastTime ? ((audioBytes - this.#lastAudioBytes) * 8) / ((now - this.#lastTime) / 1000) / 1_000 : 0;
     this.#lastBytes = bytes;
@@ -48,6 +55,10 @@ export class StatsMonitor {
     this.#lastTime = now;
     const loss = packetsLost + packetsReceived > 0 ? (packetsLost / (packetsLost + packetsReceived)) * 100 : 0;
     const inputLatency = this.#inputLatencyMs === null ? "—" : this.#inputLatencyMs.toFixed(1);
+    if (tiles) {
+      this.output.textContent = `静止无损补偿 · 视频 ${fps.toFixed(0)} FPS | ${(bitrate + tileMbps).toFixed(1)} Mbps | 更新 ${this.video?.dataset.tileCount ?? 0} 块 · 复用 ${this.video?.dataset.tileCopies ?? 0} 块 | 绘制 ${this.video?.dataset.tileDecodeMs ?? "—"} ms | Input RTT ${inputLatency} ms | ${route}`;
+      return;
+    }
     this.output.textContent = `FPS ${fps.toFixed(0)}  |  ${bitrate.toFixed(1)} Mbps  |  音频 ${audioKbps.toFixed(0)} kbps  |  RTT ${rttMs.toFixed(0)} ms  |  Input RTT ${inputLatency} ms  |  Loss ${loss.toFixed(1)}%  |  Jitter ${jitterMs.toFixed(1)} ms  |  ${codec.replace("video/", "")}  |  ${route}`;
   }
 }

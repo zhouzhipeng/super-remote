@@ -9,73 +9,35 @@ allowed to build an unbounded queue.
 
 ## Components
 
-- `protocol`: shared signaling types and the fixed-width binary input protocol.
-- `signaling`: Axum HTTP/WebSocket service with user/device authentication, one-use
-  WebSocket tickets, session authorization and short-lived coturn REST credentials.
-- `web`: Vite/TypeScript browser client with device/session UI, WebRTC, fullscreen,
-  keyboard/mouse forwarding and a `getStats()` debug overlay.
-- `host`: Windows agent with webrtc-rs 0.20.x, trickle ICE, bundled FFmpeg
-  Desktop Duplication/GDI capture, NVENC/AMF/software H.264 backends,
-  WASAPI loopback/Opus system audio, strict DataChannel validation
-  and Win32 `SendInput` injection.
-- `control-panel`: native Rust/Win32 Windows control panel for live service, client,
-  capture and encoder status; start/stop/restart actions; Web/QR shortcuts; and an
-  optional capture-excluded, local-input-released privacy screen.
-- `launcher`: native Rust Windows launcher that handles elevation, credentials, display/LAN
-  discovery, firewall rules, QR generation and service supervision without Python.
-- `deploy`: production-oriented Nginx, signaling and authenticated coturn deployment.
+Windows clients negotiate `desktop-refinement-v1` alongside continuously running
+H.264 video. During scrolling/typing, NVENC uses VBR with CQ 18, a maximum of
+4 Mbps (or the lower configured bitrate), a two-frame VBV and no B-frames or
+lookahead. The live encoder supplies frame cadence without a second sender timer.
+Input keeps its separate PeerConnection and high-priority injection worker.
 
-## Local build
+After input has been idle for 450 ms and desktop pixels stable for 300 ms, the
+Host sends lossless 128-pixel PNG damage tiles and byte-verified scroll copies.
+Only one refinement can be in flight, in 8 KiB chunks with a 16 KiB outstanding
+threshold. New input cancels further chunks. The client retains completed pixels
+as its delta baseline but shows them only after the Host re-captures and verifies
+that the transferred snapshot is still current. Local input hides the overlay
+immediately; an input timestamp watermark rejects late show messages. Remote
+pixel changes invalidate the overlay. Refinement failure leaves video running.
 
-Requirements: Rust 1.94+, Node.js 24+, npm 11+, Windows 10 1809 or later for the Host.
+Moving H.264 remains lossy and may soften detailed motion under the bitrate cap;
+settled PNG refinements preserve exact 8-bit GDI RGB pixels, not HDR. Continuously
+animated desktops may remain on video because a stable refinement is unavailable.
+This is not an RDP protocol implementation or a measured RDP latency equivalence.
+Unsupported clients retain the legacy video path. Deploy Host and Web together.
 
-For a one-command developer LAN test on Windows, run:
-
-```powershell
-python start_remote_desktop.py
-```
-
-The legacy developer script remains useful while changing capture pipelines. Production
-builds instead use `super-remote.exe`: it performs the same orchestration natively and uses
-the FFmpeg runtime included in the installer. The native launcher now requires the
-60 FPS constant-quality NVENC + Desktop Duplication pipeline, at full primary-display
-resolution. It checks both synthetic encoding and 120 real desktop frames with the
-production encoder options, discards the encoded test output, and retries up to three
-times (15 seconds maximum per probe). Failures and timeouts are recorded in
-`C:\ProgramData\Super Remote\encoder-probes.log`. It reports an explicit error rather
-than silently reducing to 30 FPS, GDI or 1920-pixel capture. This strict launcher mode
-requires working NVIDIA NVENC; AMF/software remain developer Host backends, not an
-automatic substitute. Steady-state capture is still off while no client is connected;
-the brief startup diagnostic is the exception. Target computers require no separate
-Python, Node.js or FFmpeg installation. Runtime
-state and the long-lived direct-access QR code are written under `C:\ProgramData\Super Remote`.
-The QR contains a bearer token, so treat it as a permanent password and do not
-share it. Windows Firewall must allow the configured TCP Web port (8080 by default)
-from the local subnet for direct LAN access.
-
-### FRP TCP access
-
-The native launcher also enables an authenticated TURN/TCP bridge on the Web port.
-For a **raw FRP TCP** mapping, Chrome derives this fallback from the page it opened:
-`http://remote.example:45678/` automatically adds
-`turn:remote.example:45678?transport=tcp`. There is no hardcoded public IP, domain,
-or external port, and no extra public UDP port mapping is required for this path.
-The local Web port and FRP's external port may differ. Direct UDP/STUN remains
-available; Safari retains its existing ICE configuration. Chrome additionally
-uses an independent STUN discovery fallback if the Google STUN hostname fails.
-
-HTTP/WebSocket requests and TURN binary streams share the listener without being
-mixed inside the WebSocket signaling protocol. TURN still requires the same
-short-lived, authenticated credentials; the bridge only connects to the bundled
-loopback TURN service. It does not turn the installation into an unauthenticated
-relay. TCP relaying can add latency under packet loss; direct UDP remains preferred.
-
-This automatic fallback is for plain HTTP over a raw TCP tunnel, **not** an HTTP/HTTPS
-reverse proxy. It does not add TLS to plain HTTP. HTTPS deployments should retain
-their explicitly configured, publicly reachable TURN/TLS service. Standalone
-signaling opts into the bridge with `REMOTE_TURN_TCP_BRIDGE=127.0.0.1:3478` alongside
-its existing `REMOTE_TURN_URLS` and `REMOTE_TURN_SECRET`; the native launcher sets
-these automatically. A server without the bridge does not advertise this capability.
+Validation: `npm test`, `node web/tests/run-desktop-tiles-e2e.mjs`, and Host tests
+check exact damage/copy reconstruction, cancellation, stale snapshot rejection,
+resize and cleanup. With the browser/FFmpeg test environment set,
+`REMOTE_TILE_TEST=1 node web/tests/run-native-input-e2e.mjs` uses isolated services
+and live capture without saving desktop pixels. It measures continuous video
+and input ACKs, not input-to-visible latency. The optional
+`REMOTE_TILE_ACK_DELAY_MS=100` delays only application refinement ACKs, not the
+network or video stream. See `docs/latency-0.1.25.md` for limitations and results.
 
 `web/tests/run-frp-tcp-e2e.mjs` runs the embedded Web UI, real Rust signaling and
 bundled TURN behind an isolated TCP forwarder with a random external port. Its
@@ -86,7 +48,7 @@ Build Web and `remote-signaling` first, then run with `PLAYWRIGHT_PACKAGE`,
 `CHROME_EXECUTABLE`, `TURN_EXECUTABLE` and `TEST_RELAY_IP` (the Host's physical LAN
 IPv4) set. No installed service or existing browser session is stopped.
 
-NVENC uses constant QP 18 with spatial/temporal AQ disabled to keep static desktop
+Legacy video-only NVENC uses constant QP 18 with spatial/temporal AQ disabled to keep static desktop
 detail stable across periodic keyframes. H.264 remains lossy; this is not pixel-exact
 lossless streaming. Bandwidth varies with screen activity;
 the configured `bitrate` is still used by the developer AMF/software backends but is not a
@@ -237,9 +199,9 @@ The launcher's NVIDIA path follows Sunshine's low-latency encode architecture: c
 complete physical primary display with DXGI Desktop Duplication → D3D11 GPU scaling/NV12 →
 NVENC H.264 sized to the browser's physical video area → WebRTC. The output preserves the
 display aspect ratio, never crops the source, and can stream the full physical primary-display
-resolution to a high-DPI browser. Bitrate scales with the requested pixel count up to 20 Mbps,
-which keeps 60 FPS ahead of the WebRTC sender instead of queuing oversized encoded frames.
-It uses NVENC's quality-oriented low-latency P4 preset, constant QP 18 with AQ disabled, two
+resolution to a high-DPI browser. Legacy configured bitrate scales with requested pixel count up to 20 Mbps;
+hybrid clients use the bounded video rate described above.
+It uses NVENC's low-latency P4 preset, AQ disabled, two
 encoder surfaces, forced IDR frames and zero-latency tuning. DDA is sampled slightly above the
 target rate, then surplus GPU frames are removed before NVENC to produce a stable 60 FPS encoded
 stream without ever discarding dependent H.264 P-frames. A one-frame backpressured handoff

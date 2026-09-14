@@ -155,6 +155,7 @@ export class InputController {
     const view = packet(InputType.MouseMove, 4, flags);
     view.setUint16(12, move.x, true);
     view.setUint16(14, move.y, true);
+    this.#notifyInput(bytes(view));
     this.#fast.send(bytes(view));
   }
 
@@ -312,8 +313,17 @@ export class InputController {
     window.clearTimeout(this.#pasteFocusTimer);
   };
 
+  #notifyInput(data: ArrayBufferView<ArrayBuffer>): void {
+    const timestamp = new DataView(data.buffer, data.byteOffset, data.byteLength).getBigUint64(4, true);
+    this.#video.dataset.latestInput = timestamp.toString();
+    this.#video.dispatchEvent(new Event("remote-input"));
+  }
+
   #sendReliable(data: ArrayBufferView<ArrayBuffer>): void {
-    if (this.#reliable.readyState === "open") this.#reliable.send(data);
+    if (this.#reliable.readyState === "open") {
+      this.#notifyInput(data);
+      this.#reliable.send(data);
+    }
   }
 
   #inputAck = (raw: Event): void => {
@@ -332,7 +342,8 @@ export class InputController {
 
   #normalizedPoint(clientX: number, clientY: number): { x: number; y: number } | null {
     const rect = this.#video.getBoundingClientRect();
-    const sourceAspect = this.#video.videoWidth / this.#video.videoHeight;
+    const sourceAspect = Number(this.#video.dataset.desktopWidth || this.#video.videoWidth)
+      / Number(this.#video.dataset.desktopHeight || this.#video.videoHeight);
     if (!Number.isFinite(sourceAspect) || sourceAspect <= 0) return null;
     const boxAspect = rect.width / rect.height;
     const displayWidth = boxAspect > sourceAspect ? rect.height * sourceAspect : rect.width;

@@ -33,6 +33,7 @@ def main() -> None:
     parser.add_argument("--ffmpeg", required=True, type=Path)
     parser.add_argument("--output", type=Path, default=Path("target/video-stability"))
     parser.add_argument("--production", action="store_true", help="Test exact Rust production arguments and assert stable decoded frames")
+    parser.add_argument("--hybrid", action="store_true", help="Validate bounded motion encoding with idle refinement enabled")
     parser.add_argument("--probe-qp", action="store_true", help="Compare complete YUV pixels at several fixed quality levels")
     parser.add_argument("--only", help="Run just one named scenario")
     options = parser.parse_args()
@@ -58,12 +59,12 @@ def main() -> None:
         "constqp18_long": ["-rc", "constqp", "-qp", "18", "-spatial-aq", "0", "-g", "600"],
         "cbr_intra_refresh": ["-rc", "cbr", "-spatial-aq", "1", "-aq-strength", "8", "-b:v", "20M", "-maxrate", "20M", "-bufsize", "1333336", "-g", "120", "-intra-refresh", "1"],
     }
-    if options.production:
+    if options.production or options.hybrid:
         cargo = shutil.which("cargo")
         if not cargo:
             raise RuntimeError("Rust is required to read the production encoder arguments")
         arguments = subprocess.run(
-            [cargo, "run", "--quiet", "--locked", "-p", "remote-host", "--example", "ffmpeg_arguments"],
+            [cargo, "run", "--quiet", "--locked", "-p", "remote-host", "--example", "ffmpeg_arguments", *(["--", "--hybrid"] if options.hybrid else [])],
             cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, check=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=120,
         )
@@ -100,7 +101,7 @@ def main() -> None:
                 "encode_seconds": encode_seconds, "encode_fps": 360 / encode_seconds,
                 "largest_changes": sorted(enumerate(values, start=1), key=lambda p: p[1], reverse=True)[:10],
             }
-            if options.production or options.probe_qp:
+            if options.production or options.hybrid or options.probe_qp:
                 filters = ["-vf", crop.rstrip(",")] if crop else []
                 checksums = run(options.ffmpeg, ["-i", str(clip), "-an", *filters, "-f", "framemd5", "-"])
                 hashes = [line.rsplit(",", 1)[1].strip() for line in checksums.splitlines() if line and not line.startswith("#")]
@@ -118,9 +119,13 @@ def main() -> None:
     # Machine-readable evidence accompanies the generated clips.
     (directory / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
     print(f"Evidence: {directory.resolve()}")
-    if options.production and any("error" in value for value in results.values()):
+    if (options.production or options.hybrid) and any("error" in value for value in results.values()):
         raise RuntimeError("production encoding validation failed")
-    if options.production:
+    if options.hybrid:
+        for name, result in results.items():
+            if result["bitrate_mbps"] > 4.5:
+                raise RuntimeError(f"{name}: hybrid video exceeded the motion bitrate budget")
+    if options.production and not options.hybrid:
         for name, result in results.items():
             # H.264 4:2:0 is lossy; identical hashes are recorded, not promised.
             # Bound measured variation well below a single 8-bit code value:

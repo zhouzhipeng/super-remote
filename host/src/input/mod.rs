@@ -8,11 +8,21 @@ use remote_protocol::input::TimedInputEvent;
 #[derive(Default)]
 pub struct SessionInput {
     latest_position: u64,
+    latest_input: u64,
+    input_at: Option<std::time::Instant>,
     held: PressedInputs,
     using_control: bool,
 }
 
 impl SessionInput {
+    pub fn activity(&self) -> (u64, std::time::Duration) {
+        (
+            self.latest_input,
+            self.input_at
+                .map_or(std::time::Duration::MAX, |at| at.elapsed()),
+        )
+    }
+
     fn is_stale_move(&self, event: &TimedInputEvent) -> bool {
         matches!(
             event.event,
@@ -33,6 +43,8 @@ impl SessionInput {
         ) {
             self.latest_position = self.latest_position.max(event.timestamp_us);
         }
+        self.latest_input = self.latest_input.max(event.timestamp_us);
+        self.input_at = Some(std::time::Instant::now());
         self.held.observe(event.event);
     }
 

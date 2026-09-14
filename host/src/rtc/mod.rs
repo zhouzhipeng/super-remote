@@ -58,6 +58,8 @@ struct Handler {
     input_state: Arc<std::sync::Mutex<input::SessionInput>>,
     local_cursor: bool,
     control_only: bool,
+    tile_mode: watch::Sender<bool>,
+    tile_eligible: bool,
 }
 
 pub struct AcceptedSession {
@@ -224,8 +226,35 @@ impl PeerConnectionEventHandler for Handler {
         let retired = self.retired.clone();
         let input_state = self.input_state.clone();
         let local_cursor = self.local_cursor;
+        let tile_mode = self.tile_mode.clone();
+        let tile_eligible = self.tile_eligible && !self.control_only;
+        let tile_active = self.media_active.clone();
         runtime.spawn(Box::pin(async move {
             let label = channel.label().await.unwrap_or_default();
+            #[cfg(windows)]
+            if label == "desktop-refinement-v1" && tile_eligible {
+                if input_channels.fetch_or(4, Ordering::AcqRel) & 4 != 0 {
+                    let _ = channel.close().await;
+                    return;
+                }
+                let handshake = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        match channel.poll().await {
+                            Some(DataChannelEvent::OnMessage(message)) if message.is_string && message.data.as_ref() == b"start" => return true,
+                            None | Some(DataChannelEvent::OnClose | DataChannelEvent::OnError) => return false,
+                            _ => {}
+                        }
+                    }
+                }).await.unwrap_or(false);
+                if handshake {
+                    let _ = tile_mode.send(true);
+                    if let Err(error) = crate::desktop_tiles::serve(channel.clone(), retired, tile_active, input_state.clone()).await {
+                        warn!(%error, "idle refinement stopped; low-latency video continues");
+                    }
+                }
+                let _ = channel.close().await;
+                return;
+            }
             if label == "cursor" && local_cursor {
                 #[cfg(windows)]
                 crate::cursor::serve(channel, retired).await;
@@ -426,6 +455,7 @@ pub async fn accept_offer(
     let retired = Arc::new(AtomicBool::new(false));
     let (media_state, media_state_rx) = watch::channel(MediaState::WAITING);
     let input_state = Arc::new(std::sync::Mutex::new(input::SessionInput::default()));
+    let (tile_mode, tile_mode_rx) = watch::channel(false);
     let handler = Arc::new(Handler {
         session_id,
         outbound: outbound.clone(),
@@ -439,6 +469,8 @@ pub async fn accept_offer(
         input_state: input_state.clone(),
         local_cursor: config.local_cursor,
         control_only: false,
+        tile_mode,
+        tile_eligible: config.local_cursor && config.h264_file.is_none() && config.monitor_index == 0,
     });
     let peer = Arc::new(
         PeerConnectionBuilder::new()
@@ -562,6 +594,7 @@ pub async fn accept_offer(
             stats,
             stream_active,
             video_state,
+            tile_mode_rx,
         )
         .await
         {
@@ -641,16 +674,22 @@ async fn supervise_video(
     stats: Arc<HostStats>,
     active: Arc<AtomicBool>,
     mut state: watch::Receiver<MediaState>,
+    mut tile_mode: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     while wait_until_running(&mut state).await? {
-        let result = video::stream(
-            config.clone(),
-            track.clone(),
-            payload_type,
-            stats.clone(),
-            active.clone(),
-        )
-        .await;
+        let mut session_config = (*config).clone();
+        session_config.hybrid_video = *tile_mode.borrow_and_update();
+        let session_config = Arc::new(session_config);
+        let result = tokio::select! {
+            result = video::stream(
+                session_config.clone(),
+                track.clone(),
+                payload_type,
+                stats.clone(),
+                active.clone(),
+            ) => result,
+            result = tile_mode.changed() => { result?; continue; },
+        };
         if let Err(error) = result {
             // RDP/display changes temporarily invalidate Desktop Duplication.
             // Keep the negotiated peer alive and recreate capture after a delay.

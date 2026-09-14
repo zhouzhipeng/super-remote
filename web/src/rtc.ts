@@ -4,6 +4,7 @@ import { chromiumCompatibleIceServers, remoteIceCandidate, shouldUseChromiumLanC
 import { InputController } from "./input.ts";
 import { ControlInputChannel } from "./control-input.ts";
 import { LocalCursor } from "./local-cursor.ts";
+import { DesktopTiles } from "./desktop-tiles.ts";
 import { ScrollPreview } from "./scroll-preview.ts";
 import { requestInteractivePlayback } from "./input-latency.ts";
 import { disconnectMessage } from "./session-close.ts";
@@ -41,6 +42,7 @@ export class RemoteSession extends EventTarget {
   #fastInput: RTCDataChannel | null = null;
   #reliableInput: RTCDataChannel | null = null;
   #cursor: LocalCursor | null = null;
+  #desktopTiles: DesktopTiles | null = null;
   #scrollPreview: ScrollPreview | null = null;
   scrollPreviewEnabled = true;
 
@@ -122,6 +124,11 @@ export class RemoteSession extends EventTarget {
     };
     peer.addTransceiver("video", { direction: "recvonly" });
     peer.addTransceiver("audio", { direction: "recvonly" });
+    this.#desktopTiles = new DesktopTiles(this.video,
+      peer.createDataChannel("desktop-refinement-v1", { ordered: true }), () => {
+        this.#scrollPreview?.destroy(); this.#scrollPreview = null;
+        this.#progress("ready");
+      });
     const fast = inputPeer.createDataChannel("input-fast", { ordered: false, maxRetransmits: 0 });
     const reliable = inputPeer.createDataChannel("input-reliable", { ordered: true });
     this.#fastInput = fast; this.#reliableInput = reliable;
@@ -193,7 +200,7 @@ export class RemoteSession extends EventTarget {
       if (peer.connectionState === "connected") {
         this.#setState("connected");
         this.#progress("video");
-        this.#stats = new StatsMonitor(peer, this.statsOutput);
+        this.#stats = new StatsMonitor(peer, this.statsOutput, this.video);
         this.#stats.start();
         this.#startInput(false);
         this.#reportTimers.push(window.setTimeout(() => this.#startInput(true), 1500));
@@ -323,6 +330,7 @@ export class RemoteSession extends EventTarget {
     this.#input?.destroy(); // release keys before revoking the session
     this.#scrollPreview?.destroy(); this.#scrollPreview = null;
     this.#cursor?.destroy(); this.#cursor = null;
+    this.#desktopTiles?.destroy(); this.#desktopTiles = null;
     this.#inputPeer?.close(); this.#inputPeer = null;
     this.#pendingInputIce.length = 0;
     this.#controlInput?.close();
