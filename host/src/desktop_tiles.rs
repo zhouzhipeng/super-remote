@@ -245,6 +245,27 @@ fn changed_tiles(
     Ok((output, count, copies))
 }
 
+// Tile indices whose old pixels must remain transparent over live video.
+fn invalid_tiles(previous: &Desktop, current: &Desktop) -> Vec<usize> {
+    let cols = previous.width.div_ceil(TILE);
+    let rows = previous.height.div_ceil(TILE);
+    if previous.width != current.width || previous.height != current.height {
+        return (0..cols * rows).collect();
+    }
+    let mut invalid = Vec::new();
+    for index in 0..cols * rows {
+        let x = index % cols * TILE;
+        let y = index / cols * TILE;
+        let width = TILE.min(previous.width - x);
+        let height = TILE.min(previous.height - y);
+        if (0..height).any(|dy| {
+            let start = ((y + dy) * previous.width + x) * 3;
+            previous.rgb[start..start + width * 3] != current.rgb[start..start + width * 3]
+        }) { invalid.push(index); }
+    }
+    invalid
+}
+
 pub async fn serve(
     channel: Arc<dyn DataChannel>,
     retired: Arc<AtomicBool>,
@@ -283,8 +304,8 @@ pub async fn serve(
         }
     }));
     let mut previous: Option<Desktop> = None;
-    let mut observed: Option<Desktop> = None;
-    let mut stable_since = std::time::Instant::now();
+    let mut last_refinement = std::time::Instant::now() - Duration::from_secs(1);
+    let mut last_mask: Option<(u32, u64, Vec<usize>)> = None;
     let mut id = 0u32;
     let mut committed = 0u32;
     let mut shown = false;
@@ -298,35 +319,29 @@ pub async fn serve(
         if !active.load(Ordering::Acquire) {
             continue;
         }
-        let current = tokio::task::spawn_blocking(capture).await??;
         let (watermark, idle) = activity();
-        let changed = observed.as_ref() != Some(&current);
-        if changed || idle < Duration::from_millis(450) {
-            stable_since = std::time::Instant::now();
+        if idle < Duration::from_millis(250) {
             if shown {
                 channel.send_text("{\"type\":\"invalidate\"}").await?;
                 shown = false;
             }
+            last_mask = None;
+            continue; // Do not capture/encode full RGB desktops during input.
         }
-        observed = Some(current);
-        if stable_since.elapsed() < Duration::from_millis(300) || idle < Duration::from_millis(450)
-        {
-            continue;
-        }
-        if previous.as_ref() == observed.as_ref() {
-            if !shown && committed != 0 {
-                channel
-                    .send_text(
-                        &serde_json::json!({"type":"show", "id":committed,
-                    "input":watermark.to_string()})
-                        .to_string(),
-                    )
-                    .await?;
+        let current = tokio::task::spawn_blocking(capture).await??;
+        let mut unchanged = false;
+        if let Some(baseline) = &previous {
+            let invalid = invalid_tiles(baseline, &current);
+            unchanged = invalid.is_empty();
+            let mask = (committed, watermark, invalid);
+            if last_mask.as_ref() != Some(&mask) {
+                channel.send_text(&serde_json::json!({"type":"show", "id":committed,
+                    "input":watermark.to_string(), "hidden":mask.2}).to_string()).await?;
+                last_mask = Some(mask);
                 shown = true;
             }
-            continue;
         }
-        let current = observed.take().unwrap();
+        if unchanged || last_refinement.elapsed() < Duration::from_millis(300) { continue; }
         let (old, current, payload, count, copies) =
             tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 let (payload, count, copies) = changed_tiles(previous.as_ref(), &current)?;
@@ -335,7 +350,6 @@ pub async fn serve(
             .await??;
         previous = old;
         if activity().0 != watermark {
-            observed = Some(current);
             continue;
         }
         id = id
@@ -373,8 +387,7 @@ pub async fn serve(
             channel
                 .send_text(&serde_json::json!({"type":"cancel", "id":id}).to_string())
                 .await?;
-            observed = Some(current);
-            stable_since = std::time::Instant::now();
+            last_refinement = std::time::Instant::now();
             continue;
         }
         channel
@@ -396,8 +409,8 @@ pub async fn serve(
         previous = Some(current);
         // Re-capture and validate AFTER transfer and ACK. A completed but stale
         // snapshot stays hidden; its pixels remain a valid delta baseline.
-        observed = None;
-        stable_since = std::time::Instant::now();
+        last_mask = None;
+        last_refinement = std::time::Instant::now();
     }
 }
 

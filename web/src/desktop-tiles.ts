@@ -38,6 +38,7 @@ type Update = { id: number; width: number; height: number; tiles: number; copies
 export class DesktopTiles {
   #canvas = document.createElement("canvas");
   #back = document.createElement("canvas");
+  #baseline = document.createElement("canvas");
   #pending: Update | null = null;
   #closed = false;
   #committing = false;
@@ -88,8 +89,16 @@ export class DesktopTiles {
         if (message.id === this.#lastId && typeof message.input === "string"
           && /^\d+$/.test(message.input)
           && BigInt(message.input) >= BigInt(this.video.dataset.latestInput || "0")) {
-          this.#canvas.hidden = false;
-          this.video.dataset.displayTransport = "lossless-tiles";
+          const cols = Math.ceil(this.#canvas.width / 128), rows = Math.ceil(this.#canvas.height / 128);
+          const hidden: number[] = message.hidden ?? [];
+          if (!Array.isArray(hidden) || hidden.length > cols * rows || hidden.some(index =>
+            !Number.isInteger(index) || index < 0 || index >= cols * rows)) throw new Error("Invalid refinement mask");
+          const context = this.#canvas.getContext("2d")!;
+          context.clearRect(0, 0, this.#canvas.width, this.#canvas.height);
+          context.drawImage(this.#baseline, 0, 0);
+          for (const index of hidden) context.clearRect(index % cols * 128, Math.floor(index / cols) * 128, 128, 128);
+          this.#canvas.hidden = hidden.length === cols * rows;
+          this.video.dataset.displayTransport = this.#canvas.hidden ? "hybrid-video" : "lossless-tiles";
         }
       } else if (message.type === "cancel") {
         if (!this.#pending || this.#pending.id !== message.id) throw new Error("Unexpected cancellation");
@@ -144,7 +153,7 @@ export class DesktopTiles {
     // Read every scroll-copy from the PREVIOUS committed image, never from a
     // region another copy has already overwritten in the current update.
     for (const copy of update.copies) {
-      context.drawImage(this.#canvas, copy.x, copy.source_y, copy.width, copy.height,
+      context.drawImage(this.#baseline, copy.x, copy.source_y, copy.width, copy.height,
         copy.x, copy.y, copy.width, copy.height);
     }
     // Decode in small batches so a full desktop does not monopolize the main
@@ -168,7 +177,11 @@ export class DesktopTiles {
     if (this.#canvas.width !== update.width || this.#canvas.height !== update.height) {
       this.#canvas.width = update.width; this.#canvas.height = update.height;
     }
-    this.#canvas.getContext("2d", { alpha: false })!.drawImage(this.#back, 0, 0);
+    if (this.#baseline.width !== update.width || this.#baseline.height !== update.height) {
+      this.#baseline.width = update.width; this.#baseline.height = update.height;
+    }
+    this.#baseline.getContext("2d", { alpha: false })!.drawImage(this.#back, 0, 0);
+    this.#canvas.getContext("2d")!.drawImage(this.#back, 0, 0);
     this.#hide();
     this.video.dataset.desktopWidth = String(update.width);
     this.video.dataset.desktopHeight = String(update.height);
@@ -195,8 +208,8 @@ export class DesktopTiles {
     this.channel.close();
     this.#resize.disconnect();
     this.#canvas.remove();
-    this.#canvas.width = this.#back.width = 0;
-    this.#canvas.height = this.#back.height = 0;
+    this.#canvas.width = this.#back.width = this.#baseline.width = 0;
+    this.#canvas.height = this.#back.height = this.#baseline.height = 0;
     for (const key of ["desktopWidth", "desktopHeight", "displayTransport", "tileCount", "tileBytes", "tileFrame", "tileCopies", "tileDecodeMs", "tileReceiveToCommitMs"]) delete this.video.dataset[key];
   };
 }

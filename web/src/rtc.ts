@@ -125,7 +125,7 @@ export class RemoteSession extends EventTarget {
     peer.addTransceiver("video", { direction: "recvonly" });
     peer.addTransceiver("audio", { direction: "recvonly" });
     this.#desktopTiles = new DesktopTiles(this.video,
-      peer.createDataChannel("desktop-refinement-v1", { ordered: true }), () => {
+      peer.createDataChannel("desktop-refinement-v2", { ordered: true }), () => {
         this.#scrollPreview?.destroy(); this.#scrollPreview = null;
         this.#progress("ready");
       });

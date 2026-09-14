@@ -232,7 +232,7 @@ impl PeerConnectionEventHandler for Handler {
         runtime.spawn(Box::pin(async move {
             let label = channel.label().await.unwrap_or_default();
             #[cfg(windows)]
-            if label == "desktop-refinement-v1" && tile_eligible {
+            if label == "desktop-refinement-v2" && tile_eligible {
                 if input_channels.fetch_or(4, Ordering::AcqRel) & 4 != 0 {
                     let _ = channel.close().await;
                     return;

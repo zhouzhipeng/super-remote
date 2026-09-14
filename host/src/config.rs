@@ -64,6 +64,19 @@ pub struct IceServerConfig {
 }
 
 impl HostConfig {
+    /// Keep the interaction stream ready; native-resolution refinements provide
+    /// detail after input stops, without reinitializing NVENC on every key.
+    pub fn interaction_video(&self) -> Self {
+        let mut config = self.clone();
+        let longest = self.width.max(self.height).max(1);
+        if longest > 640 {
+            config.width = ((u64::from(self.width) * 640 / u64::from(longest)) as u32 & !1).max(2);
+            config.height = ((u64::from(self.height) * 640 / u64::from(longest)) as u32 & !1).max(2);
+        }
+        config.bitrate = config.bitrate.min(800_000);
+        config
+    }
+
     pub fn refresh_display(self: &Arc<Self>) -> Arc<Self> {
         #[cfg(windows)]
         if self.follow_primary_display && self.h264_file.is_none() {

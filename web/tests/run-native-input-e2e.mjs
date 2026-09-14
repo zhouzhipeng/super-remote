@@ -79,7 +79,7 @@ try {
       createDataChannel(label, options) {
         if (label === "input-fast") window.__dual.input = this;
         const channel = super.createDataChannel(label, options); window.__dual.channels[label] = channel;
-        if ((label === "desktop-refinement-v1" || label === "desktop-tiles-v1") && ackDelay > 0) {
+        if ((label === "desktop-refinement-v2" || label === "desktop-tiles-v1") && ackDelay > 0) {
           const send = channel.send.bind(channel);
           channel.send = data => {
             if (typeof data === "string" && data.startsWith('{"type":"ack"')) {
@@ -113,7 +113,7 @@ try {
     ? document.querySelector("video")?.readyState >= 2
     : document.querySelector("video")?.currentTime > 1)
     && document.querySelector("video").dataset.inputTransport === "webrtc-input", tileTest, { timeout: 30_000 });
-  if (tileTest) await page.waitForFunction(() => window.__dual.channels["desktop-refinement-v1"]?.readyState === "open");
+  if (tileTest) await page.waitForFunction(() => window.__dual.channels["desktop-refinement-v2"]?.readyState === "open");
   const result = await page.evaluate(async () => {
     const route = async peer => {
       const stats = await peer.getStats();
@@ -175,7 +175,7 @@ try {
   if (tileTest) {
     result.tiles = await page.evaluate(() => ({ ...document.querySelector("video").dataset }));
     assert.ok(["lossless-tiles", "hybrid-video", undefined].includes(result.tiles.displayTransport));
-    await page.evaluate(() => (window.__dual.channels["desktop-refinement-v1"] ?? window.__dual.channels["desktop-tiles-v1"]).close());
+    await page.evaluate(() => (window.__dual.channels["desktop-refinement-v2"] ?? window.__dual.channels["desktop-tiles-v1"]).close());
     await page.waitForFunction(() => !document.querySelector("video").dataset.displayTransport
       && document.querySelector("video").currentTime > 1, null, { timeout: 30_000 });
     result.tileFallback = "H.264 continued";
