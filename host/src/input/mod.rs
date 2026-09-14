@@ -43,8 +43,11 @@ impl SessionInput {
         ) {
             self.latest_position = self.latest_position.max(event.timestamp_us);
         }
-        self.latest_input = self.latest_input.max(event.timestamp_us);
-        self.input_at = Some(std::time::Instant::now());
+        // Pointer motion updates the local cursor without suspending sharp tiles.
+        if !matches!(event.event, InputEvent::MouseMove { .. } | InputEvent::MouseRelative { .. }) {
+            self.latest_input = self.latest_input.max(event.timestamp_us);
+            self.input_at = Some(std::time::Instant::now());
+        }
         self.held.observe(event.event);
     }
 
@@ -205,6 +208,7 @@ mod worker_tests {
             event: InputEvent::MouseMove { x: 1, y: 2 },
         };
         state.observe(move_at(10));
+        assert_eq!(state.activity(), (0, std::time::Duration::MAX));
         assert!(state.is_stale_move(&move_at(9)));
         assert!(state.is_stale_move(&move_at(10)));
         let click = TimedInputEvent {
@@ -220,7 +224,10 @@ mod worker_tests {
         assert!(state.is_stale_move(&move_at(19)));
         assert!(!state.is_stale_move(&move_at(21)));
         assert!(!state.is_stale_move(&click));
+        let input_at = state.input_at;
         state.observe(move_at(30));
+        assert_eq!(state.latest_input, 20);
+        assert_eq!(state.input_at, input_at);
         state.observe(click);
         assert!(state.is_stale_move(&move_at(29)));
     }

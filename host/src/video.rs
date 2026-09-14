@@ -141,7 +141,11 @@ async fn stream_ffmpeg(
     stats: Arc<HostStats>,
     active: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    let config = if config.hybrid_video { Arc::new(config.interaction_video()) } else { config };
+    let config = if config.hybrid_video {
+        Arc::new(config.interaction_video())
+    } else {
+        config
+    };
     let fps = config.fps.to_string();
     // Poll Desktop Duplication slightly faster than the RTP cadence. Display
     // refresh and Windows timer quantization otherwise leave a 60 Hz request at

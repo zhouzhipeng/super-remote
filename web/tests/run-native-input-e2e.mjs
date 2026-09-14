@@ -79,7 +79,7 @@ try {
       createDataChannel(label, options) {
         if (label === "input-fast") window.__dual.input = this;
         const channel = super.createDataChannel(label, options); window.__dual.channels[label] = channel;
-        if ((label === "desktop-refinement-v2" || label === "desktop-tiles-v1") && ackDelay > 0) {
+        if ((label === "desktop-refinement-v3" || label === "desktop-tiles-v1") && ackDelay > 0) {
           const send = channel.send.bind(channel);
           channel.send = data => {
             if (typeof data === "string" && data.startsWith('{"type":"ack"')) {
@@ -113,7 +113,7 @@ try {
     ? document.querySelector("video")?.readyState >= 2
     : document.querySelector("video")?.currentTime > 1)
     && document.querySelector("video").dataset.inputTransport === "webrtc-input", tileTest, { timeout: 30_000 });
-  if (tileTest) await page.waitForFunction(() => window.__dual.channels["desktop-refinement-v2"]?.readyState === "open");
+  if (tileTest) await page.waitForFunction(() => window.__dual.channels["desktop-refinement-v3"]?.readyState === "open");
   const result = await page.evaluate(async () => {
     const route = async peer => {
       const stats = await peer.getStats();
@@ -153,16 +153,17 @@ try {
   const videoStats = () => page.evaluate(async () => {
     const reports = await window.__dual.video.getStats();
     const r = [...reports.values()].find(r => r.type === "inbound-rtp" && r.kind === "video");
-    return { frames: r.framesDecoded, bytes: r.bytesReceived, jitterBufferDelay: r.jitterBufferDelay,
+    return { width:r.frameWidth, height:r.frameHeight, frames: r.framesDecoded, bytes: r.bytesReceived, jitterBufferDelay: r.jitterBufferDelay,
       jitterBufferEmittedCount: r.jitterBufferEmittedCount, totalDecodeTime: r.totalDecodeTime };
   });
+  if (tileTest) await page.waitForFunction(() => { const v=document.querySelector("video"); return v.videoWidth <= 1280 && v.videoHeight <= 1280; });
   const videoStart = await videoStats();
   const tileStart = await page.evaluate(() => Number(document.querySelector("video")?.dataset.tileFrame || "0"));
   await page.waitForTimeout(32_000);
   if (tileTest) result.tileUpdatesPerSecond = (await page.evaluate(() => Number(document.querySelector("video")?.dataset.tileFrame || "0")) - tileStart) / 32;
   const videoEnd = await videoStats();
   const decoded = videoEnd.frames - videoStart.frames;
-  result.continuousVideo = { frames: decoded, fps: decoded / 32,
+  result.continuousVideo = { width:videoEnd.width, height:videoEnd.height, frames: decoded, fps: decoded / 32,
     mbps: (videoEnd.bytes - videoStart.bytes) * 8 / 32 / 1e6,
     decodeMs: (videoEnd.totalDecodeTime - videoStart.totalDecodeTime) * 1000 / decoded,
     jitterBufferMs: (videoEnd.jitterBufferDelay - videoStart.jitterBufferDelay) * 1000 /
@@ -173,9 +174,14 @@ try {
   assert.equal(await page.evaluate(() => window.__dual.socket.readyState), 1, "idle proxy closed the signaling socket");
   assert.equal(await page.evaluate(() => window.__dual.video.connectionState), "connected");
   if (tileTest) {
+    const captures = logs.join("").split("\n").filter(line => line.includes("FFmpeg video capture started"));
+    assert.equal(captures.length, 1, "startup restarted video capture during mode negotiation");
+    assert.ok(captures[0].includes("hybrid=true"), "first encoder used the wrong mode");
+    result.startupCaptureCount = captures.length;
     result.tiles = await page.evaluate(() => ({ ...document.querySelector("video").dataset }));
-    assert.ok(["lossless-tiles", "hybrid-video", undefined].includes(result.tiles.displayTransport));
-    await page.evaluate(() => (window.__dual.channels["desktop-refinement-v2"] ?? window.__dual.channels["desktop-tiles-v1"]).close());
+    assert.ok(Number(result.tiles.tileFrame) > 0, "native-resolution refinement never committed");
+    assert.ok(Math.max(videoEnd.width, videoEnd.height) <= 1280, "interaction stream is not low resolution");
+    await page.evaluate(() => (window.__dual.channels["desktop-refinement-v3"] ?? window.__dual.channels["desktop-tiles-v1"]).close());
     await page.waitForFunction(() => !document.querySelector("video").dataset.displayTransport
       && document.querySelector("video").currentTime > 1, null, { timeout: 30_000 });
     result.tileFallback = "H.264 continued";

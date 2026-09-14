@@ -9,24 +9,28 @@ allowed to build an unbounded queue.
 
 ## Components
 
-Windows clients negotiate `desktop-refinement-v1` alongside continuously running
-H.264 video. During scrolling/typing, NVENC uses VBR with CQ 18, a maximum of
-4 Mbps (or the lower configured bitrate), a two-frame VBV and no B-frames or
-lookahead. The live encoder supplies frame cadence without a second sender timer.
+Windows clients negotiate `desktop-refinement-v2` alongside continuously running
+H.264 video. Its longest edge is at most 1280 pixels, VBR/CQ 18 is capped at
+2 Mbps (or the lower configured bitrate), with a two-frame VBV and no B-frames.
+The low-resolution stream stays ready: clicking the mouse, scrolling,
+and keyboard down/up hide sharp overlays immediately without restarting NVENC.
+Pointer movement alone retains sharp overlays and does not postpone refinement.
 Input keeps its separate PeerConnection and high-priority injection worker.
 
-After input has been idle for 450 ms and desktop pixels stable for 300 ms, the
-Host sends lossless 128-pixel PNG damage tiles and byte-verified scroll copies.
-Only one refinement can be in flight, in 8 KiB chunks with a 16 KiB outstanding
-threshold. New input cancels further chunks. The client retains completed pixels
-as its delta baseline but shows them only after the Host re-captures and verifies
-that the transferred snapshot is still current. Local input hides the overlay
-immediately; an input timestamp watermark rejects late show messages. Remote
-pixel changes invalidate the overlay. Refinement failure leaves video running.
+After input has been idle for 250 ms, the Host sends native-resolution lossless
+128-pixel PNG damage tiles and verified scroll copies, at most one update every
+300 ms. RGB capture/PNG work pauses during sustained input. One refinement can
+be in flight, in 8 KiB chunks with a 16 KiB outstanding threshold. New input
+cancels further chunks. Every shown tile is revalidated against a new capture;
+changed tiles remain transparent over live video, so a blinking caret does not
+prevent the rest of the desktop becoming sharp. An input watermark rejects late
+show messages. Display masks never modify the retained delta/copy baseline.
+Refinement channel failure restores full-resolution video as a fallback.
 
-Moving H.264 remains lossy and may soften detailed motion under the bitrate cap;
-settled PNG refinements preserve exact 8-bit GDI RGB pixels, not HDR. Continuously
-animated desktops may remain on video because a stable refinement is unavailable.
+Motion is deliberately blurry under this input-first policy. Stable regions
+return to original 8-bit GDI RGB pixels (not HDR) after transfer and validation;
+250 ms is the idle trigger, not a guarantee of completed quality recovery.
+Continuous animation remains low-resolution in the affected regions.
 This is not an RDP protocol implementation or a measured RDP latency equivalence.
 Unsupported clients retain the legacy video path. Deploy Host and Web together.
 
@@ -37,7 +41,7 @@ resize and cleanup. With the browser/FFmpeg test environment set,
 and live capture without saving desktop pixels. It measures continuous video
 and input ACKs, not input-to-visible latency. The optional
 `REMOTE_TILE_ACK_DELAY_MS=100` delays only application refinement ACKs, not the
-network or video stream. See `docs/latency-0.1.25.md` for limitations and results.
+network or video stream. See `docs/latency-0.1.28.md` for limitations and results.
 
 `web/tests/run-frp-tcp-e2e.mjs` runs the embedded Web UI, real Rust signaling and
 bundled TURN behind an isolated TCP forwarder with a random external port. Its

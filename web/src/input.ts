@@ -156,7 +156,6 @@ export class InputController {
     const view = packet(InputType.MouseMove, 4, flags);
     view.setUint16(12, move.x, true);
     view.setUint16(14, move.y, true);
-    this.#notifyInput(bytes(view));
     this.#fast.send(bytes(view));
   }
 

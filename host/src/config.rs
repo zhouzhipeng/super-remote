@@ -69,11 +69,11 @@ impl HostConfig {
     pub fn interaction_video(&self) -> Self {
         let mut config = self.clone();
         let longest = self.width.max(self.height).max(1);
-        if longest > 640 {
-            config.width = ((u64::from(self.width) * 640 / u64::from(longest)) as u32 & !1).max(2);
-            config.height = ((u64::from(self.height) * 640 / u64::from(longest)) as u32 & !1).max(2);
+        if longest > 1280 {
+            config.width = ((u64::from(self.width) * 1280 / u64::from(longest)) as u32 & !1).max(2);
+            config.height = ((u64::from(self.height) * 1280 / u64::from(longest)) as u32 & !1).max(2);
         }
-        config.bitrate = config.bitrate.min(800_000);
+        config.bitrate = config.bitrate.min(2_000_000);
         config
     }
 
@@ -278,6 +278,21 @@ mod tests {
             ice_servers: Vec::new(),
             control_status_path: None,
         })
+    }
+
+    #[test]
+    fn interaction_video_caps_pixels_without_changing_capture_or_aspect() {
+        let original = config().with_display_size(4000, 2560);
+        let low = original.interaction_video();
+        assert_eq!((low.width, low.height, low.bitrate), (1280, 818, 2_000_000));
+        assert_eq!((low.ffmpeg_capture_width, low.ffmpeg_capture_height), (4000, 2560));
+        assert_eq!((original.width, original.height), (4000, 2560));
+        let portrait = config().with_display_size(1200, 1920).interaction_video();
+        assert_eq!((portrait.width, portrait.height), (800, 1280));
+        let small = config().with_display_size(320, 200).interaction_video();
+        assert_eq!((small.width, small.height), (320, 200));
+        let args = crate::ffmpeg_options::hybrid_encoding_args("h264_nvenc", low.bitrate, low.fps);
+        assert_eq!(args[args.iter().position(|a| a == "-maxrate").unwrap() + 1], "2000000");
     }
 
     #[test]

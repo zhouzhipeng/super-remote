@@ -58,7 +58,7 @@ struct Handler {
     input_state: Arc<std::sync::Mutex<input::SessionInput>>,
     local_cursor: bool,
     control_only: bool,
-    tile_mode: watch::Sender<bool>,
+    tile_mode: watch::Sender<Option<bool>>,
     tile_eligible: bool,
 }
 
@@ -232,7 +232,7 @@ impl PeerConnectionEventHandler for Handler {
         runtime.spawn(Box::pin(async move {
             let label = channel.label().await.unwrap_or_default();
             #[cfg(windows)]
-            if label == "desktop-refinement-v2" && tile_eligible {
+            if label == "desktop-refinement-v3" && tile_eligible {
                 if input_channels.fetch_or(4, Ordering::AcqRel) & 4 != 0 {
                     let _ = channel.close().await;
                     return;
@@ -255,7 +255,23 @@ impl PeerConnectionEventHandler for Handler {
                 .await
                 .unwrap_or(false);
                 if handshake {
-                    let _ = tile_mode.send(true);
+                    let _ = tile_mode.send(Some(true));
+                    // Start capture in its final mode, but do not expose PNG
+                    // overlays until the browser has actually presented video.
+                    let video_ready = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                        loop {
+                            match channel.poll().await {
+                                Some(DataChannelEvent::OnMessage(message)) if message.is_string && message.data.as_ref() == b"video-ready" => return true,
+                                None | Some(DataChannelEvent::OnClose | DataChannelEvent::OnError) => return false,
+                                _ => {}
+                            }
+                        }
+                    }).await.unwrap_or(false);
+                    if !video_ready {
+                        let _ = tile_mode.send(Some(false));
+                        let _ = channel.close().await;
+                        return;
+                    }
                     if let Err(error) = crate::desktop_tiles::serve(
                         channel.clone(),
                         retired,
@@ -264,8 +280,9 @@ impl PeerConnectionEventHandler for Handler {
                     )
                     .await
                     {
-                        warn!(%error, "idle refinement stopped; low-latency video continues");
+                        warn!(%error, "idle refinement stopped; restoring full-resolution video");
                     }
+                    let _ = tile_mode.send(Some(false));
                 }
                 let _ = channel.close().await;
                 return;
@@ -520,7 +537,8 @@ pub async fn accept_offer(
     let retired = Arc::new(AtomicBool::new(false));
     let (media_state, media_state_rx) = watch::channel(MediaState::WAITING);
     let input_state = Arc::new(std::sync::Mutex::new(input::SessionInput::default()));
-    let (tile_mode, tile_mode_rx) = watch::channel(false);
+    let tile_eligible = config.local_cursor && config.h264_file.is_none() && config.monitor_index == 0;
+    let (tile_mode, tile_mode_rx) = watch::channel(if tile_eligible { None } else { Some(false) });
     let handler = Arc::new(Handler {
         session_id,
         outbound: outbound.clone(),
@@ -734,6 +752,20 @@ async fn wait_until_running(state: &mut watch::Receiver<MediaState>) -> anyhow::
     }
 }
 
+async fn resolved_video_mode(mode: &mut watch::Receiver<Option<bool>>) -> anyhow::Result<bool> {
+    loop {
+        if let Some(value) = *mode.borrow_and_update() { return Ok(value); }
+        mode.changed().await?;
+    }
+}
+
+async fn changed_video_mode(mode: &mut watch::Receiver<Option<bool>>, current: bool) -> anyhow::Result<()> {
+    loop {
+        if resolved_video_mode(mode).await? != current { return Ok(()); }
+        mode.changed().await?;
+    }
+}
+
 async fn supervise_video(
     config: Arc<HostConfig>,
     track: Arc<TrackLocalStaticSample>,
@@ -741,11 +773,15 @@ async fn supervise_video(
     stats: Arc<HostStats>,
     active: Arc<AtomicBool>,
     mut state: watch::Receiver<MediaState>,
-    mut tile_mode: watch::Receiver<bool>,
+    mut tile_mode: watch::Receiver<Option<bool>>,
 ) -> anyhow::Result<()> {
     while wait_until_running(&mut state).await? {
         let mut session_config = (*config).clone();
-        session_config.hybrid_video = *tile_mode.borrow_and_update();
+        session_config.hybrid_video = tokio::time::timeout(
+            std::time::Duration::from_secs(5), resolved_video_mode(&mut tile_mode)
+        ).await.unwrap_or(Ok(false))?;
+        if !active.load(Ordering::Acquire) { continue; }
+        let current_mode = session_config.hybrid_video;
         let session_config = Arc::new(session_config);
         let result = tokio::select! {
             result = video::stream(
@@ -755,7 +791,7 @@ async fn supervise_video(
                 stats.clone(),
                 active.clone(),
             ) => result,
-            result = tile_mode.changed() => { result?; continue; },
+            result = changed_video_mode(&mut tile_mode, current_mode) => { result?; continue; },
         };
         if let Err(error) = result {
             // RDP/display changes temporarily invalidate Desktop Duplication.
@@ -839,6 +875,18 @@ async fn negotiated_payload_type(sender: &Arc<dyn RtpSender>) -> anyhow::Result<
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn startup_waits_for_mode_and_duplicate_notifications_do_not_restart_capture() {
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), super::resolved_video_mode(&mut rx)).await.is_err());
+        tx.send(Some(true)).unwrap();
+        assert!(super::resolved_video_mode(&mut rx).await.unwrap());
+        tx.send(Some(true)).unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), super::changed_video_mode(&mut rx, true)).await.is_err());
+        tx.send(Some(false)).unwrap();
+        super::changed_video_mode(&mut rx, true).await.unwrap();
+    }
+
     use super::{MulticastDnsMode, host_setting_engine};
 
     #[test]

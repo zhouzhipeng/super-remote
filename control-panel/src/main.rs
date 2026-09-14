@@ -2192,8 +2192,10 @@ mod windows_app {
 
         impl HiddenPanel {
             fn new() -> Self {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let directory = std::env::temp_dir().join(format!(
-                    "super-remote-panel-test-{}-{}",
+                    "super-remote-panel-test-{}-{}-{sequence}",
                     std::process::id(),
                     SystemTime::now()
                         .duration_since(UNIX_EPOCH)

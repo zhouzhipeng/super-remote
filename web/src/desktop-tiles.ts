@@ -47,6 +47,8 @@ export class DesktopTiles {
   #queuedBytes = 0;
   #lastId = 0;
   #bytes = 0;
+  #videoReadySent = false;
+  #qualityTransition: Animation | null = null;
   #resize: ResizeObserver;
   private video: HTMLVideoElement;
   private channel: RTCDataChannel;
@@ -62,16 +64,25 @@ export class DesktopTiles {
     });
     this.#resize.observe(video);
     video.addEventListener("remote-input", this.#hide);
+    video.addEventListener("playing", this.#videoReady);
     channel.binaryType = "arraybuffer";
     channel.addEventListener("open", this.#open);
     channel.addEventListener("message", this.#message);
     channel.addEventListener("close", this.destroy);
   }
   #hide = (): void => {
+    this.#qualityTransition?.cancel(); this.#qualityTransition = null;
     this.#canvas.hidden = true;
     this.video.dataset.displayTransport = "hybrid-video";
   };
-  #open = (): void => { this.channel.send("start"); };
+  #videoReady = (): void => {
+    if (!this.#videoReadySent && this.channel.readyState === "open"
+      && this.video.readyState >= 2 && this.video.videoWidth > 0) {
+      this.#videoReadySent = true;
+      this.channel.send("video-ready");
+    }
+  };
+  #open = (): void => { this.channel.send("start"); this.#videoReady(); };
   #message = (event: MessageEvent): void => {
     if (this.#closed) return;
     try {
@@ -89,15 +100,27 @@ export class DesktopTiles {
         if (message.id === this.#lastId && typeof message.input === "string"
           && /^\d+$/.test(message.input)
           && BigInt(message.input) >= BigInt(this.video.dataset.latestInput || "0")) {
-          const cols = Math.ceil(this.#canvas.width / 128), rows = Math.ceil(this.#canvas.height / 128);
+          const cols = Math.ceil(this.#baseline.width / 128), rows = Math.ceil(this.#baseline.height / 128);
           const hidden: number[] = message.hidden ?? [];
           if (!Array.isArray(hidden) || hidden.length > cols * rows || hidden.some(index =>
             !Number.isInteger(index) || index < 0 || index >= cols * rows)) throw new Error("Invalid refinement mask");
+          const resized = this.#canvas.width !== this.#baseline.width || this.#canvas.height !== this.#baseline.height;
+          const reveal = this.#canvas.hidden || resized;
+          // Resize only when validated pixels can be drawn in this same task.
+          // Changing canvas dimensions during decode clears the visible bitmap.
+          if (resized) {
+            this.#canvas.width = this.#baseline.width; this.#canvas.height = this.#baseline.height;
+          }
           const context = this.#canvas.getContext("2d")!;
           context.clearRect(0, 0, this.#canvas.width, this.#canvas.height);
           context.drawImage(this.#baseline, 0, 0);
           for (const index of hidden) context.clearRect(index % cols * 128, Math.floor(index / cols) * 128, 128, 128);
           this.#canvas.hidden = hidden.length === cols * rows;
+          if (reveal && !this.#canvas.hidden) {
+            this.#qualityTransition?.cancel();
+            this.#qualityTransition = this.#canvas.animate([{ opacity: 0 }, { opacity: 1 }],
+              { duration: 100, easing: "ease-out" });
+          }
           this.video.dataset.displayTransport = this.#canvas.hidden ? "hybrid-video" : "lossless-tiles";
         }
       } else if (message.type === "cancel") {
@@ -174,15 +197,12 @@ export class DesktopTiles {
       } finally { for (const result of decoded) if (result.status === "fulfilled") result.value.close(); }
     }
     if (this.#closed) return;
-    if (this.#canvas.width !== update.width || this.#canvas.height !== update.height) {
-      this.#canvas.width = update.width; this.#canvas.height = update.height;
-    }
     if (this.#baseline.width !== update.width || this.#baseline.height !== update.height) {
       this.#baseline.width = update.width; this.#baseline.height = update.height;
     }
     this.#baseline.getContext("2d", { alpha: false })!.drawImage(this.#back, 0, 0);
-    this.#canvas.getContext("2d")!.drawImage(this.#back, 0, 0);
-    this.#hide();
+    // Keep the last validated display visible while the new baseline awaits
+    // host validation. A commit is not an input event and must not flash video.
     this.video.dataset.desktopWidth = String(update.width);
     this.video.dataset.desktopHeight = String(update.height);
     this.video.dataset.tileCount = String(update.tiles);
@@ -199,12 +219,14 @@ export class DesktopTiles {
   destroy = (): void => {
     if (this.#closed) return;
     this.#closed = true;
+    this.#qualityTransition?.cancel(); this.#qualityTransition = null;
     this.#pending = null;
     this.#queue.length = 0;
     this.channel.removeEventListener("open", this.#open);
     this.channel.removeEventListener("message", this.#message);
     this.channel.removeEventListener("close", this.destroy);
     this.video.removeEventListener("remote-input", this.#hide);
+    this.video.removeEventListener("playing", this.#videoReady);
     this.channel.close();
     this.#resize.disconnect();
     this.#canvas.remove();

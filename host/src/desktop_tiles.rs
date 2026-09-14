@@ -261,7 +261,20 @@ fn invalid_tiles(previous: &Desktop, current: &Desktop) -> Vec<usize> {
         if (0..height).any(|dy| {
             let start = ((y + dy) * previous.width + x) * 3;
             previous.rgb[start..start + width * 3] != current.rgb[start..start + width * 3]
-        }) { invalid.push(index); }
+        }) {
+            invalid.push(index);
+        }
+    }
+    invalid
+}
+
+// A caret-sized change should wait for its lossless replacement, not expose
+// an entire low-resolution tile. Bound the actual changed pixels, not tile area.
+fn presentation_mask(previous: &Desktop, current: &Desktop, invalid: Vec<usize>) -> Vec<usize> {
+    if previous.width == current.width && previous.height == current.height {
+        let changed = previous.rgb.chunks_exact(3).zip(current.rgb.chunks_exact(3))
+            .filter(|(a, b)| a != b).take(513).count();
+        if changed <= 512 { return Vec::new(); }
     }
     invalid
 }
@@ -333,15 +346,22 @@ pub async fn serve(
         if let Some(baseline) = &previous {
             let invalid = invalid_tiles(baseline, &current);
             unchanged = invalid.is_empty();
-            let mask = (committed, watermark, invalid);
+            let mask = (committed, watermark, presentation_mask(baseline, &current, invalid));
             if last_mask.as_ref() != Some(&mask) {
-                channel.send_text(&serde_json::json!({"type":"show", "id":committed,
-                    "input":watermark.to_string(), "hidden":mask.2}).to_string()).await?;
+                channel
+                    .send_text(
+                        &serde_json::json!({"type":"show", "id":committed,
+                    "input":watermark.to_string(), "hidden":mask.2})
+                        .to_string(),
+                    )
+                    .await?;
                 last_mask = Some(mask);
                 shown = true;
             }
         }
-        if unchanged || last_refinement.elapsed() < Duration::from_millis(300) { continue; }
+        if unchanged || last_refinement.elapsed() < Duration::from_millis(300) {
+            continue;
+        }
         let (old, current, payload, count, copies) =
             tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 let (payload, count, copies) = changed_tiles(previous.as_ref(), &current)?;
@@ -417,6 +437,41 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn blinking_caret_keeps_sharp_pixels_until_lossless_replacement() {
+        let before = Desktop { width: 256, height: 128, rgb: vec![240; 256 * 128 * 3] };
+        let mut after = Desktop { width: 256, height: 128, rgb: before.rgb.clone() };
+        // A caret straddling two tiles still must not expose either tile.
+        for y in 20..60 { for x in 127..129 {
+            let i = (y * 256 + x) * 3;
+            after.rgb[i..i+3].fill(0);
+        }}
+        assert_eq!(invalid_tiles(&before, &after), vec![0, 1]);
+        assert!(presentation_mask(&before, &after, invalid_tiles(&before, &after)).is_empty());
+        assert!(presentation_mask(&after, &before, invalid_tiles(&after, &before)).is_empty());
+        after.rgb[..513*3].fill(0);
+        assert_eq!(presentation_mask(&before, &after, invalid_tiles(&before, &after)), vec![0, 1]);
+    }
+
+    #[test]
+    fn blinking_tile_does_not_prevent_other_regions_becoming_sharp() {
+        let before = Desktop {
+            width: 256,
+            height: 129,
+            rgb: vec![42; 256 * 129 * 3],
+        };
+        let mut after = Desktop {
+            width: 256,
+            height: 129,
+            rgb: before.rgb.clone(),
+        };
+        after.rgb[(128 * 256 + 255) * 3] = 43;
+        assert_eq!(invalid_tiles(&before, &after), vec![3]);
+        assert!(invalid_tiles(&before, &before).is_empty());
+        after.width = 128;
+        assert_eq!(invalid_tiles(&before, &after), vec![0, 1, 2, 3]);
+    }
+
     #[test]
     fn scrolling_reuses_pixels_and_reconstructs_every_rgb_byte() {
         let (width, height) = (384usize, 512usize);
