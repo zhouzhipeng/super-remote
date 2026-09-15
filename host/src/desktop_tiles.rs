@@ -15,15 +15,7 @@ use std::{
     time::Duration,
 };
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
-use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Graphics::{
-    Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP},
-    Direct3D11::*,
-    Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-    Dxgi::*,
-};
 use windows::Win32::{Graphics::Gdi::*, UI::WindowsAndMessaging::*};
-use windows::core::Interface;
 
 const TILE: usize = 128;
 const MAX_PIXELS: usize = 8192 * 4320;
@@ -73,9 +65,6 @@ const STABLE_CONFIRM: Duration = Duration::from_millis(60);
 const MOTION_RANGE: isize = 1024;
 /// Below this, spawning encoder threads costs more than it saves.
 const PARALLEL_TILE_THRESHOLD: usize = 8;
-/// Consecutive duplication failures before a session settles for GDI. A mode
-/// change or a secure desktop recovers well inside this.
-const DUPLICATION_FAILURE_LIMIT: u32 = 30;
 /// A refinement cycle slower than this cannot present motion: it caps the sharp
 /// layer at under 7 updates per second.
 const MOTION_CYCLE: Duration = Duration::from_millis(150);
@@ -155,18 +144,9 @@ struct Desktop {
     rgb: Vec<u8>,
 }
 
-/// Pre-composition fallback, used only when Desktop Duplication is unavailable.
-///
-/// `BitBlt` on the screen DC reads the layer *underneath* DWM composition. An
-/// acrylic surface - the Windows 11 taskbar, Start, notification flyouts, any
-/// Mica or WinUI chrome - is its transparent backing there rather than the
-/// blurred result on screen, and `SRCCOPY` discards alpha, so those regions
-/// arrive as near black. The video layer is captured after composition and
-/// shows them correctly, which is why the two layers disagreed.
-///
 /// `rgb` is a buffer recycled from a retired `Desktop`. A fresh 3-byte-per-pixel
 /// allocation every tick churns tens of megabytes per second at 4K.
-fn capture_gdi(mut rgb: Vec<u8>) -> anyhow::Result<Desktop> {
+fn capture(mut rgb: Vec<u8>) -> anyhow::Result<Desktop> {
     unsafe {
         // Tokio's blocking worker can have a different DPI context from main.
         // Capture physical pixels, never a DPI-virtualized desktop bitmap.
@@ -274,201 +254,6 @@ fn capture_gdi(mut rgb: Vec<u8>) -> anyhow::Result<Desktop> {
             height: height as usize,
             rgb,
         })
-    }
-}
-
-/// Captures the desktop as the user actually sees it: after DWM composition,
-/// so acrylic and Mica surfaces carry their blurred result rather than the
-/// transparent backing `capture_gdi` reads.
-///
-/// The COM objects stay on one thread for the life of the session and the
-/// duplication persists across frames - it reports only what changed, so
-/// recreating it per frame would both cost and lie.
-struct DesktopDuplication {
-    device: ID3D11Device,
-    context: ID3D11DeviceContext,
-    output: IDXGIOutput1,
-    duplication: IDXGIOutputDuplication,
-    /// Also the frame cache: duplication answers "nothing new" rather than
-    /// resending, and the refinement loop still needs pixels. Re-reading the
-    /// texture that already holds the last frame costs nothing, where keeping a
-    /// second copy of the desktop would be a 24 MB clone per frame at 4K.
-    staging: Option<(u32, u32, ID3D11Texture2D)>,
-    /// Whether `staging` holds a copied frame rather than an uninitialised one.
-    filled: bool,
-}
-
-impl DesktopDuplication {
-    fn start(monitor: u32) -> anyhow::Result<Self> {
-        unsafe {
-            let mut device = None;
-            let mut context = None;
-            // WARP keeps a session usable on a host with no usable 3D adapter;
-            // duplication itself is performed by the display driver either way.
-            let created = D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )
-            .or_else(|_| {
-                D3D11CreateDevice(
-                    None,
-                    D3D_DRIVER_TYPE_WARP,
-                    HMODULE::default(),
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                    None,
-                    D3D11_SDK_VERSION,
-                    Some(&mut device),
-                    None,
-                    Some(&mut context),
-                )
-            });
-            created?;
-            let device = device.ok_or_else(|| anyhow::anyhow!("no Direct3D device"))?;
-            let context = context.ok_or_else(|| anyhow::anyhow!("no Direct3D context"))?;
-            let adapter = device.cast::<IDXGIDevice>()?.GetAdapter()?;
-            let output = adapter.EnumOutputs(monitor)?.cast::<IDXGIOutput1>()?;
-            let duplication = output.DuplicateOutput(&device)?;
-            Ok(Self {
-                device,
-                context,
-                output,
-                duplication,
-                staging: None,
-                filled: false,
-            })
-        }
-    }
-
-    /// A mode change, a desktop switch or a full-screen transition invalidates
-    /// the duplication rather than the device.
-    fn restart(&mut self) -> anyhow::Result<()> {
-        self.duplication = unsafe { self.output.DuplicateOutput(&self.device) }?;
-        self.staging = None;
-        Ok(())
-    }
-
-    fn capture(&mut self, reuse: Vec<u8>) -> anyhow::Result<Desktop> {
-        // Only the first frame has nothing to fall back on, and there waiting is
-        // the point; afterwards a poll must not block the refinement loop.
-        let timeout = if self.filled { 0 } else { 500 };
-        let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
-        let mut resource = None;
-        match unsafe { self.duplication.AcquireNextFrame(timeout, &mut info, &mut resource) } {
-            Ok(()) => {}
-            Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => return self.repeat(reuse),
-            Err(error) if error.code() == DXGI_ERROR_ACCESS_LOST => {
-                self.restart()?;
-                return self.repeat(reuse);
-            }
-            Err(error) => return Err(error.into()),
-        }
-        // `LastPresentTime` is zero when only the pointer moved. The refinement
-        // path draws the cursor in the browser, so that is not a desktop change.
-        let result = match resource.filter(|_| info.LastPresentTime != 0) {
-            Some(resource) => self.read(&resource, reuse),
-            None => self.repeat(reuse),
-        };
-        // Acquire and release must pair even when the read failed, or the next
-        // acquire returns DXGI_ERROR_INVALID_CALL forever.
-        let _ = unsafe { self.duplication.ReleaseFrame() };
-        result
-    }
-
-    /// The last delivered image, read again out of the staging texture that
-    /// still holds it.
-    fn repeat(&mut self, rgb: Vec<u8>) -> anyhow::Result<Desktop> {
-        let (width, height, staging) = self
-            .staging
-            .clone()
-            .filter(|_| self.filled)
-            .ok_or_else(|| anyhow::anyhow!("no desktop frame has been delivered yet"))?;
-        self.read_staging(&staging, width as usize, height as usize, rgb)
-    }
-
-    fn staging(&mut self, desc: &D3D11_TEXTURE2D_DESC) -> anyhow::Result<ID3D11Texture2D> {
-        if let Some((width, height, texture)) = &self.staging
-            && *width == desc.Width
-            && *height == desc.Height
-        {
-            return Ok(texture.clone());
-        }
-        let staging_desc = D3D11_TEXTURE2D_DESC {
-            Usage: D3D11_USAGE_STAGING,
-            BindFlags: 0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-            MiscFlags: 0,
-            ..*desc
-        };
-        let mut texture = None;
-        unsafe { self.device.CreateTexture2D(&staging_desc, None, Some(&mut texture))? };
-        let texture = texture.ok_or_else(|| anyhow::anyhow!("no staging texture"))?;
-        self.staging = Some((desc.Width, desc.Height, texture.clone()));
-        Ok(texture)
-    }
-
-    fn read(&mut self, resource: &IDXGIResource, rgb: Vec<u8>) -> anyhow::Result<Desktop> {
-        let frame = resource.cast::<ID3D11Texture2D>()?;
-        let mut desc = D3D11_TEXTURE2D_DESC::default();
-        unsafe { frame.GetDesc(&mut desc) };
-        // 8-bit BGRA is what duplication delivers for an SDR desktop. An HDR
-        // surface would need tone mapping the lossless layer does not claim.
-        anyhow::ensure!(
-            desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM,
-            "unsupported desktop surface format"
-        );
-        let (width, height) = (desc.Width as usize, desc.Height as usize);
-        anyhow::ensure!(
-            width > 0 && width <= 8192 && height > 0 && height <= 4320 && width * height <= MAX_PIXELS,
-            "unsupported desktop dimensions"
-        );
-        let staging = self.staging(&desc)?;
-        unsafe { self.context.CopyResource(&staging, &frame) };
-        self.filled = true;
-        self.read_staging(&staging, width, height, rgb)
-    }
-
-    fn read_staging(
-        &mut self,
-        staging: &ID3D11Texture2D,
-        width: usize,
-        height: usize,
-        mut rgb: Vec<u8>,
-    ) -> anyhow::Result<Desktop> {
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            self.context
-                .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?
-        };
-        let pitch = mapped.RowPitch as usize;
-        let source = mapped.pData as *const u8;
-        let read = (|| -> anyhow::Result<()> {
-            anyhow::ensure!(!source.is_null() && pitch >= width * 4, "unusable desktop mapping");
-            let needed = width * height * 3;
-            if rgb.len() != needed {
-                rgb.clear();
-                rgb.resize(needed, 0);
-            }
-            for (y, destination) in rgb.chunks_exact_mut(width * 3).enumerate() {
-                // Rows are pitch-aligned, so each one is addressed separately.
-                let row = unsafe { std::slice::from_raw_parts(source.add(y * pitch), width * 4) };
-                for (out, pixel) in destination.chunks_exact_mut(3).zip(row.chunks_exact(4)) {
-                    out[0] = pixel[2];
-                    out[1] = pixel[1];
-                    out[2] = pixel[0];
-                }
-            }
-            Ok(())
-        })();
-        unsafe { self.context.Unmap(staging, 0) };
-        read?;
-        Ok(Desktop { width, height, rgb })
     }
 }
 
@@ -603,87 +388,6 @@ fn desktop_tiles(desktop: &Desktop) -> usize {
     desktop.width.div_ceil(TILE) * desktop.height.div_ceil(TILE)
 }
 
-/// Owns the capture thread for a session.
-///
-/// Duplication's COM objects must not move between threads, so they never
-/// leave this one; only recycled buffers and finished frames cross the channel.
-struct DesktopSource {
-    requests: tokio::sync::mpsc::Sender<Vec<u8>>,
-    frames: tokio::sync::mpsc::Receiver<anyhow::Result<Desktop>>,
-}
-
-impl DesktopSource {
-    fn start(monitor: u32) -> anyhow::Result<Self> {
-        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<anyhow::Result<Desktop>>(1);
-        std::thread::Builder::new()
-            .name("desktop-refinement-capture".into())
-            .spawn(move || {
-                let mut duplication = match DesktopDuplication::start(monitor) {
-                    Ok(duplication) => Some(duplication),
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            "Desktop Duplication unavailable; the sharp layer will capture \
-                             composited surfaces as their pre-composition pixels"
-                        );
-                        None
-                    }
-                };
-                let mut failures = 0u32;
-                while let Some(reuse) = request_rx.blocking_recv() {
-                    let frame = match duplication.as_mut() {
-                        Some(source) => match source.capture(reuse) {
-                            Ok(desktop) => {
-                                failures = 0;
-                                Ok(desktop)
-                            }
-                            // One failure is not proof the path is gone - a mode
-                            // change or a secure desktop recovers by itself - but
-                            // a session must not stall on it either. Fall back for
-                            // this frame; give up on duplication once it is clear
-                            // the path is not coming back, so a broken adapter
-                            // cannot burn a capture and a log line every tick.
-                            Err(error) => {
-                                failures += 1;
-                                if failures >= DUPLICATION_FAILURE_LIMIT {
-                                    tracing::warn!(
-                                        %error,
-                                        "Desktop Duplication failed repeatedly; falling back to \
-                                         GDI for this session"
-                                    );
-                                    duplication = None;
-                                } else {
-                                    tracing::debug!(%error, "duplication frame failed; using GDI");
-                                }
-                                capture_gdi(Vec::new())
-                            }
-                        },
-                        None => capture_gdi(reuse),
-                    };
-                    if frame_tx.blocking_send(frame).is_err() {
-                        return;
-                    }
-                }
-            })?;
-        Ok(Self {
-            requests: request_tx,
-            frames: frame_rx,
-        })
-    }
-
-    async fn capture(&mut self, reuse: Vec<u8>) -> anyhow::Result<Desktop> {
-        self.requests
-            .send(reuse)
-            .await
-            .map_err(|_| anyhow::anyhow!("desktop capture stopped"))?;
-        self.frames
-            .recv()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("desktop capture stopped"))?
-    }
-}
-
 /// Whether the screen still matches the committed baseline. The per-tile
 /// refinement mask is no longer transmitted, so the loop only needs the answer,
 /// not the list - and a whole-buffer comparison stops at the first difference
@@ -741,7 +445,6 @@ pub async fn serve(
             }
         }
     }));
-    let mut source = DesktopSource::start(0)?;
     let mut previous: Option<Desktop> = None;
     // Retired pixel buffers are handed back here instead of being reallocated.
     let mut spare: Vec<u8> = Vec::new();
@@ -803,7 +506,7 @@ pub async fn serve(
         }
         let cycle_started = std::time::Instant::now();
         let reuse = std::mem::take(&mut spare);
-        let current = source.capture(reuse).await?;
+        let current = tokio::task::spawn_blocking(move || capture(reuse)).await??;
         let mut unchanged = false;
         if let Some(baseline) = &previous {
             unchanged = unchanged_desktop(baseline, &current);
@@ -1104,7 +807,7 @@ mod tests {
     #[test]
     #[ignore = "captures the current primary desktop; run explicitly for DPI validation"]
     fn capture_uses_physical_desktop_dimensions() {
-        let desktop = capture_gdi(Vec::new()).unwrap();
+        let desktop = capture(Vec::new()).unwrap();
         unsafe {
             let mut mode = DEVMODEW::default();
             mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
