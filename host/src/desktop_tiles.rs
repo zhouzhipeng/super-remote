@@ -268,15 +268,14 @@ fn invalid_tiles(previous: &Desktop, current: &Desktop) -> Vec<usize> {
     invalid
 }
 
-// A caret-sized change should wait for its lossless replacement, not expose
-// an entire low-resolution tile. Bound the actual changed pixels, not tile area.
-fn presentation_mask(previous: &Desktop, current: &Desktop, invalid: Vec<usize>) -> Vec<usize> {
-    if previous.width == current.width && previous.height == current.height {
-        let changed = previous.rgb.chunks_exact(3).zip(current.rgb.chunks_exact(3))
-            .filter(|(a, b)| a != b).take(513).count();
-        if changed <= 512 { return Vec::new(); }
-    }
-    invalid
+// Crossing from live video back to PNG must not replay an earlier layout.
+// Once on the sharp path, ordered deltas remain authoritative (typing/automatic
+// changes keep their established sharpness policy). Tolerate only caret-sized
+// differences during recovery, never a different window/fullscreen layout.
+fn can_restore_snapshot(shown: bool, baseline: &Desktop, current: &Desktop) -> bool {
+    if baseline.width != current.width || baseline.height != current.height { return false; }
+    shown || baseline.rgb.chunks_exact(3).zip(current.rgb.chunks_exact(3))
+        .filter(|(a,b)| a != b).take(513).count() <= 512
 }
 
 pub async fn serve(
@@ -321,19 +320,20 @@ pub async fn serve(
     let mut last_mask: Option<(u32, u64, Vec<usize>)> = None;
     let mut id = 0u32;
     let mut committed = 0u32;
+    let mut committed_input = None;
     let mut shown = false;
     let activity = || input.lock().unwrap_or_else(|e| e.into_inner()).activity();
     loop {
         if retired.load(Ordering::Acquire) {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(16)).await;
         anyhow::ensure!(!ack_rx.is_closed(), "desktop channel closed");
         if !active.load(Ordering::Acquire) {
             continue;
         }
-        let (watermark, idle) = activity();
-        if idle < Duration::from_millis(250) {
+        let (watermark, _) = activity();
+        if !input.lock().unwrap_or_else(|e| e.into_inner()).refinement_ready() {
             if shown {
                 channel.send_text("{\"type\":\"invalidate\"}").await?;
                 shown = false;
@@ -346,8 +346,10 @@ pub async fn serve(
         if let Some(baseline) = &previous {
             let invalid = invalid_tiles(baseline, &current);
             unchanged = invalid.is_empty();
-            let mask = (committed, watermark, presentation_mask(baseline, &current, invalid));
-            if last_mask.as_ref() != Some(&mask) {
+            let mask = (committed, watermark, Vec::<usize>::new());
+            if committed_input == Some(watermark)
+                && can_restore_snapshot(shown, baseline, &current)
+                && last_mask.as_ref() != Some(&mask) {
                 channel
                     .send_text(
                         &serde_json::json!({"type":"show", "id":committed,
@@ -359,7 +361,12 @@ pub async fn serve(
                 shown = true;
             }
         }
-        if unchanged || last_refinement.elapsed() < Duration::from_millis(300) {
+        if unchanged {
+            // An unchanged scene can safely reuse its baseline after a mouse event.
+            committed_input = Some(watermark);
+            continue;
+        }
+        if last_refinement.elapsed() < Duration::from_millis(16) {
             continue;
         }
         let (old, current, payload, count, copies) =
@@ -426,6 +433,7 @@ pub async fn serve(
             "idle desktop refinement committed"
         );
         committed = id;
+        committed_input = Some(watermark);
         previous = Some(current);
         // Re-capture and validate AFTER transfer and ACK. A completed but stale
         // snapshot stays hidden; its pixels remain a valid delta baseline.
@@ -438,19 +446,18 @@ pub async fn serve(
 mod tests {
     use super::*;
     #[test]
-    fn blinking_caret_keeps_sharp_pixels_until_lossless_replacement() {
-        let before = Desktop { width: 256, height: 128, rgb: vec![240; 256 * 128 * 3] };
-        let mut after = Desktop { width: 256, height: 128, rgb: before.rgb.clone() };
-        // A caret straddling two tiles still must not expose either tile.
-        for y in 20..60 { for x in 127..129 {
-            let i = (y * 256 + x) * 3;
-            after.rgb[i..i+3].fill(0);
-        }}
-        assert_eq!(invalid_tiles(&before, &after), vec![0, 1]);
-        assert!(presentation_mask(&before, &after, invalid_tiles(&before, &after)).is_empty());
-        assert!(presentation_mask(&after, &before, invalid_tiles(&after, &before)).is_empty());
-        after.rgb[..513*3].fill(0);
-        assert_eq!(presentation_mask(&before, &after, invalid_tiles(&before, &after)), vec![0, 1]);
+    fn fullscreen_transition_cannot_restore_an_intermediate_snapshot() {
+        let windowed = Desktop { width: 256, height: 128, rgb: vec![30; 256 * 128 * 3] };
+        let fullscreen = Desktop { width: 256, height: 128, rgb: vec![220; 256 * 128 * 3] };
+        assert!(!can_restore_snapshot(false, &windowed, &fullscreen));
+        assert!(can_restore_snapshot(false, &fullscreen, &fullscreen));
+        // Reverse transition must reject the old fullscreen snapshot too.
+        assert!(!can_restore_snapshot(false, &fullscreen, &windowed));
+        let mut caret = Desktop { width: 256, height: 128, rgb: fullscreen.rgb.clone() };
+        caret.rgb[..80 * 3].fill(0);
+        assert!(can_restore_snapshot(false, &fullscreen, &caret));
+        // Existing sharp-only automatic updates are not forced onto low-res video.
+        assert!(can_restore_snapshot(true, &windowed, &fullscreen));
     }
 
     #[test]

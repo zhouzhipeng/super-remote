@@ -97,7 +97,8 @@ export class DesktopTiles {
       if (message.type === "invalidate") {
         this.#hide();
       } else if (message.type === "show") {
-        if (message.id === this.#lastId && typeof message.input === "string"
+        if (performance.now() >= Number(this.video.dataset.wheelActiveUntil || 0)
+          && message.id === this.#lastId && typeof message.input === "string"
           && /^\d+$/.test(message.input)
           && BigInt(message.input) >= BigInt(this.video.dataset.latestInput || "0")) {
           const cols = Math.ceil(this.#baseline.width / 128), rows = Math.ceil(this.#baseline.height / 128);

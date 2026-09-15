@@ -9,30 +9,24 @@ allowed to build an unbounded queue.
 
 ## Components
 
-Windows clients negotiate `desktop-refinement-v2` alongside continuously running
-H.264 video. Its longest edge is at most 1280 pixels, VBR/CQ 18 is capped at
-2 Mbps (or the lower configured bitrate), with a two-frame VBV and no B-frames.
-The low-resolution stream stays ready: clicking the mouse, scrolling,
-and keyboard down/up hide sharp overlays immediately without restarting NVENC.
-Pointer movement alone retains sharp overlays and does not postpone refinement.
-Input keeps its separate PeerConnection and high-priority injection worker.
+Windows clients negotiate `desktop-refinement-v3` alongside continuously running
+H.264 (1280-pixel longest edge, 2 Mbps maximum). Only mouse button/wheel activity
+requests the low-resolution interaction path. Pointer motion and keyboard events
+do not hide, pause, or cancel native-resolution PNG/copy updates.
 
-After input has been idle for 250 ms, the Host sends native-resolution lossless
-128-pixel PNG damage tiles and verified scroll copies, at most one update every
-300 ms. RGB capture/PNG work pauses during sustained input. One refinement can
-be in flight, in 8 KiB chunks with a 16 KiB outstanding threshold. New input
-cancels further chunks. Every shown tile is revalidated against a new capture;
-changed tiles remain transparent over live video, so a blinking caret does not
-prevent the rest of the desktop becoming sharp. An input watermark rejects late
-show messages. Display masks never modify the retained delta/copy baseline.
-Refinement channel failure restores full-resolution video as a fallback.
+Without a mouse-triggered interaction window, automatic scrolling/animation and
+typing retain the last sharp display until each new lossless update arrives.
+Changed tiles no longer expose low-resolution video. Capture is polled at 16 ms;
+there is one refinement in flight and no 300 ms idle-update throttle. This is not
+a guaranteed 60 Hz update rate: PNG cost and transport/ACK RTT still apply.
+Large automatic changes may update less smoothly on a slow link but stay sharp.
+After mouse interaction, refinement resumes after a 250 ms idle window.
 
-Motion is deliberately blurry under this input-first policy. Stable regions
-return to original 8-bit GDI RGB pixels (not HDR) after transfer and validation;
-250 ms is the idle trigger, not a guarantee of completed quality recovery.
-Continuous animation remains low-resolution in the affected regions.
-This is not an RDP protocol implementation or a measured RDP latency equivalence.
-Unsupported clients retain the legacy video path. Deploy Host and Web together.
+Startup determines the video mode before starting NVENC; PNGs wait for playable
+video. Validated updates replace pixels atomically; quality recovery fades in
+over 100 ms without delaying new mouse input. Fallback after refinement-channel
+failure still uses video. Lossless means 8-bit GDI RGB, not HDR preservation.
+Deploy the Host and Web together.
 
 Validation: `npm test`, `node web/tests/run-desktop-tiles-e2e.mjs`, and Host tests
 check exact damage/copy reconstruction, cancellation, stale snapshot rejection,

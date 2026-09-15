@@ -366,8 +366,13 @@ export class InputController {
   };
 
   #notifyInput(data: ArrayBufferView<ArrayBuffer>): void {
-    const timestamp = new DataView(data.buffer, data.byteOffset, data.byteLength).getBigUint64(4, true);
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    if (view.getUint8(0) === InputType.Keyboard) return;
+    const timestamp = view.getBigUint64(4, true);
     this.#video.dataset.latestInput = timestamp.toString();
+    if (view.getUint8(0) === InputType.MouseWheel) {
+      this.#video.dataset.wheelActiveUntil = String(performance.now() + 900);
+    }
     this.#video.dispatchEvent(new Event("remote-input"));
   }
 

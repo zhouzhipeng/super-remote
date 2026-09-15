@@ -10,11 +10,17 @@ pub struct SessionInput {
     latest_position: u64,
     latest_input: u64,
     input_at: Option<std::time::Instant>,
+    wheel_at: Option<std::time::Instant>,
     held: PressedInputs,
     using_control: bool,
 }
 
 impl SessionInput {
+    pub fn refinement_ready(&self) -> bool {
+        self.activity().1 >= std::time::Duration::from_millis(250)
+            && self.wheel_at.is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(900))
+    }
+
     pub fn activity(&self) -> (u64, std::time::Duration) {
         (
             self.latest_input,
@@ -43,10 +49,14 @@ impl SessionInput {
         ) {
             self.latest_position = self.latest_position.max(event.timestamp_us);
         }
-        // Pointer motion updates the local cursor without suspending sharp tiles.
-        if !matches!(event.event, InputEvent::MouseMove { .. } | InputEvent::MouseRelative { .. }) {
+        // Typing and pointer motion retain sharp incremental updates.
+        // Only mouse buttons/wheel suspend them for the interactive video path.
+        if !matches!(event.event, InputEvent::MouseMove { .. } | InputEvent::MouseRelative { .. } | InputEvent::Keyboard { .. }) {
             self.latest_input = self.latest_input.max(event.timestamp_us);
             self.input_at = Some(std::time::Instant::now());
+        }
+        if matches!(event.event, InputEvent::MouseWheel { .. }) {
+            self.wheel_at = Some(std::time::Instant::now());
         }
         self.held.observe(event.event);
     }
@@ -174,6 +184,31 @@ pub fn spawn_priority(
 
 #[cfg(test)]
 mod worker_tests {
+    #[test]
+    fn scroll_gaps_keep_video_running_without_delaying_typing() {
+        let mut state = super::SessionInput::default();
+        assert!(state.refinement_ready());
+        state.input_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(500));
+        state.wheel_at = state.input_at;
+        assert!(!state.refinement_ready());
+        state.wheel_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(950));
+        assert!(state.refinement_ready());
+        state.input_at = Some(std::time::Instant::now());
+        assert!(!state.refinement_ready());
+    }
+
+    #[test]
+    fn typing_does_not_suspend_or_cancel_sharp_updates() {
+        let mut state = super::SessionInput::default();
+        for down in [true, false] {
+            state.observe(remote_protocol::input::TimedInputEvent {
+                timestamp_us: 100, flags: 0,
+                event: remote_protocol::input::InputEvent::Keyboard { scan_code: 30, down, extended: false },
+            });
+            assert_eq!(state.activity(), (0, std::time::Duration::MAX));
+        }
+    }
+
     #[test]
     fn late_rtc_packets_and_close_do_not_release_fallback_keys() {
         use remote_protocol::input::{InputEvent, TimedInputEvent};

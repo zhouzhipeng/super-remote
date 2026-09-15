@@ -103,14 +103,21 @@ try {
     for (const event of [new PointerEvent("pointermove",point), new PointerEvent("pointerdown",point),
       new PointerEvent("pointerup",point),new WheelEvent("wheel",{deltaY:120}),
       new KeyboardEvent("keydown",{code:"KeyA",bubbles:true}),new KeyboardEvent("keyup",{code:"KeyA",bubbles:true})]) {
+      delete video.dataset.wheelActiveUntil;
       channel.receive(JSON.stringify({type:"show",id:6,input:video.dataset.latestInput || "10"}));
       if (canvas.hidden) throw new Error("Input fixture did not show refinement");
       video.dispatchEvent(event);
       if (event.type === "pointermove") {
         if (canvas.hidden || video.dataset.latestInput !== "10") throw new Error("Pointer motion reduced quality");
+      } else if (event.type === "keydown" || event.type === "keyup") {
+        if (canvas.hidden) throw new Error("Typing reduced quality");
       } else if (!canvas.hidden) throw new Error(`${event.type} did not switch immediately to video`);
     }
     if (fast.sent.length !== 1 || reliable.sent.length !== 5) throw new Error("An input transition was lost");
+    video.dispatchEvent(new WheelEvent("wheel",{deltaY:120}));
+    channel.receive(JSON.stringify({type:"show",id:6,input:video.dataset.latestInput}));
+    if (!canvas.hidden) throw new Error("Sharp overlay interrupted the active scroll window");
+    delete video.dataset.wheelActiveUntil;
     input.destroy();
     channel.receive(JSON.stringify({type:"begin",id:7,width:256,height:128,bytes:100,tiles:2}));
     channel.receive(JSON.stringify({type:"cancel",id:7}));
