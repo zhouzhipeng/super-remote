@@ -25,13 +25,21 @@ const IDLE_INTERVAL: Duration = Duration::from_millis(16);
 /// baseline (and its motion estimate) stays anchored to the live screen, but
 /// rarely enough to leave the interaction video its bandwidth. Measured from
 /// the *end* of the previous refinement, so a slow link throttles itself.
-const INTERACTION_INTERVAL: Duration = Duration::from_millis(200);
+///
+/// The sharp layer is not presented while interacting, so every byte spent here
+/// is taken from the video stream that *is* being watched - during precisely the
+/// moments the user is judging whether scrolling is smooth. This interval and
+/// `INTERACTION_TILE_LIMIT` together are a bandwidth budget, not just a size cap:
+/// at roughly 6 KiB for a tile of text they keep refinement near 1 Mbit/s.
+const INTERACTION_INTERVAL: Duration = Duration::from_millis(600);
 /// PNG tiles encoded and sent in one update while interacting. A scroll is
-/// copy rectangles plus one or two newly exposed bands; a whole-desktop
-/// repaint is an order of magnitude more and waits for the window to close
-/// rather than competing with the video. Checked before encoding, so a
-/// rejected update costs damage detection only.
-const INTERACTION_TILE_LIMIT: usize = 96;
+/// copy rectangles - which cost almost nothing - plus the newly exposed band;
+/// this admits that band and declines anything that has stopped being a
+/// translation. Checked before encoding, so a rejected update costs damage
+/// detection only. Keeping it small matters more than keeping the baseline
+/// perfectly fresh: an older baseline costs one larger delta once the scroll
+/// ends, while an oversized one costs the video stream throughout it.
+const INTERACTION_TILE_LIMIT: usize = 24;
 /// Reliable bytes allowed in flight for one refinement. Refinement shares the
 /// media PeerConnection; input has its own transport, so this bounds only how
 /// much of a superseded update can still be on the wire - and how long queued

@@ -34,6 +34,7 @@ pub struct WheelSmoother {
     pending_y: i32,
     slice_x: i32,
     slice_y: i32,
+    injected_at: Option<std::time::Instant>,
 }
 
 impl Default for WheelSmoother {
@@ -50,7 +51,21 @@ impl WheelSmoother {
             pending_y: 0,
             slice_x: 0,
             slice_y: 0,
+            injected_at: None,
         }
+    }
+
+    /// Whether a slice may be injected now.
+    ///
+    /// A relay delivers wheel packets in clumps after a stall, and injecting a
+    /// clump microseconds apart is one jump to the remote application - which
+    /// Chromium is also documented to drop outright when fine wheel events
+    /// arrive in a burst. Spacing engages only above the tick rate, so ordinary
+    /// per-frame scrolling is never held back and a scroll still starts on the
+    /// packet that begins it.
+    fn ready(&self, now: std::time::Instant) -> bool {
+        self.injected_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= WHEEL_TICK)
     }
 
     fn push(&mut self, delta_x: i16, delta_y: i16) {
@@ -64,11 +79,19 @@ impl WheelSmoother {
         }
     }
 
-    /// The next delta to inject, or `None` once the burst has fully drained.
-    fn take(&mut self) -> Option<(i16, i16)> {
+    /// The next delta to inject, or `None` when the burst has drained or the
+    /// previous slice is still too recent.
+    fn take(&mut self, now: std::time::Instant) -> Option<(i16, i16)> {
+        if !self.ready(now) {
+            return None;
+        }
         let x = take_axis(&mut self.pending_x, self.slice_x);
         let y = take_axis(&mut self.pending_y, self.slice_y);
-        (x != 0 || y != 0).then_some((x, y))
+        let slice = (x != 0 || y != 0).then_some((x, y));
+        if slice.is_some() {
+            self.injected_at = Some(now);
+        }
+        slice
     }
 
     fn pending(&self) -> bool {
@@ -123,7 +146,7 @@ impl SessionInput {
     /// Inject the next queued wheel slice. A no-op once the burst has drained,
     /// so a spurious wake costs one lock and nothing else.
     pub fn drain_wheel(&mut self) {
-        if let Some((delta_x, delta_y)) = self.wheel.take()
+        if let Some((delta_x, delta_y)) = self.wheel.take(std::time::Instant::now())
             && let Err(error) = inject_event(remote_protocol::input::InputEvent::MouseWheel {
                 delta_x,
                 delta_y,
@@ -336,9 +359,14 @@ mod worker_tests {
 
     #[test]
     fn wheel_bursts_are_paced_without_inventing_or_losing_motion() {
+        // One shared clock that only ever advances, a full tick per attempt:
+        // pacing is asserted separately, this walks each burst to the end.
+        let clock = std::cell::Cell::new(std::time::Instant::now());
         let drain = |smoother: &mut super::WheelSmoother| {
             let mut slices = Vec::new();
-            while let Some(slice) = smoother.take() {
+            loop {
+                clock.set(clock.get() + super::WHEEL_TICK);
+                let Some(slice) = smoother.take(clock.get()) else { break };
                 slices.push(slice);
                 assert!(slices.len() < 64, "a burst must always drain");
             }
@@ -385,6 +413,27 @@ mod worker_tests {
         for (x, y) in drain(&mut wide) {
             assert!(i32::from(x).abs() <= 32767 && i32::from(y).abs() <= 32767);
         }
+    }
+
+    #[test]
+    fn a_clump_of_wheel_packets_is_spaced_instead_of_injected_at_once() {
+        let start = std::time::Instant::now();
+        let mut wheel = super::WheelSmoother::new(120);
+        // The packet that begins a scroll is never held back.
+        wheel.push(0, 120);
+        assert_eq!(wheel.take(start), Some((0, 120)));
+        // A second packet arriving in the same clump waits for the tick rather
+        // than landing on top of the first as one jump.
+        wheel.push(0, 120);
+        assert_eq!(wheel.take(start + std::time::Duration::from_millis(1)), None);
+        assert!(wheel.pending(), "a held slice is still owed");
+        assert_eq!(wheel.take(start + super::WHEEL_TICK), Some((0, 120)));
+        // Ordinary per-frame scrolling is slower than the tick, so it is never
+        // delayed: the third notch injects on arrival.
+        let frame = start + std::time::Duration::from_millis(16);
+        wheel.push(0, 120);
+        assert_eq!(wheel.take(frame), Some((0, 120)));
+        assert!(!wheel.pending());
     }
 
     #[test]

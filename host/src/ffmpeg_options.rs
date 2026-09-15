@@ -107,10 +107,16 @@ pub fn hybrid_encoding_args(encoder: &str, bitrate: u32, fps: u16) -> Vec<String
             (ceiling / 2).to_string(),
             "-maxrate".into(),
             ceiling.to_string(),
+            // VBV buffer, in frames at the ceiling. Two frames forced the rate
+            // controller to fit a scroll - full-frame motion over detailed text,
+            // the most expensive thing a desktop encoder sees - inside twice the
+            // average frame, so quality collapsed frame by frame for exactly as
+            // long as the user was scrolling. Six absorbs that burst and still
+            // bounds the queue it can build on a relay to about 100 ms.
             "-bufsize".into(),
             ceiling
                 .div_ceil(u32::from(fps))
-                .saturating_mul(2)
+                .saturating_mul(6)
                 .to_string(),
         ]);
     }
@@ -129,7 +135,7 @@ mod tests {
         assert_eq!(value("-cq"), "18");
         assert_eq!(value("-b:v"), "3000000");
         assert_eq!(value("-maxrate"), "6000000");
-        assert_eq!(value("-bufsize"), "200000");
+        assert_eq!(value("-bufsize"), "600000");
         assert_eq!(value("-bf"), "0");
         // No hidden ceiling: a deployment configured for more gets more.
         let wide = super::hybrid_encoding_args("h264_nvenc", 20_000_000, 60);
