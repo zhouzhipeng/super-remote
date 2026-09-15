@@ -27,13 +27,23 @@ pub const WHEEL_TICK: std::time::Duration = std::time::Duration::from_millis(8);
 /// already pixel-accurate passes straight through - is what makes a flick read
 /// as motion. Net displacement is preserved exactly: nothing is invented and
 /// nothing is dropped.
+/// Ticks any queued motion must clear in once input stops. Bounding the drain
+/// is what keeps a released gesture from outliving itself.
+const DRAIN_TICKS: u32 = 8;
+
 #[derive(Debug)]
 pub struct WheelSmoother {
     step: i32,
     pending_x: i32,
     pending_y: i32,
-    slice_x: i32,
-    slice_y: i32,
+    /// The finest delta the client has sent on this axis: a floor on a slice,
+    /// never the drain rate.
+    finest_x: i32,
+    finest_y: i32,
+    /// Units injected per tick, fixed when input arrives so that draining does
+    /// not decay asymptotically toward a stop it never reaches.
+    rate_x: i32,
+    rate_y: i32,
     injected_at: Option<std::time::Instant>,
 }
 
@@ -49,10 +59,24 @@ impl WheelSmoother {
             step: i32::from(step).max(1),
             pending_x: 0,
             pending_y: 0,
-            slice_x: 0,
-            slice_y: 0,
+            finest_x: 0,
+            finest_y: 0,
+            rate_x: 0,
+            rate_y: 0,
             injected_at: None,
         }
+    }
+
+    /// Units to inject per tick for `pending`.
+    ///
+    /// The client's own granularity is a floor, not the rate. Momentum decays
+    /// its deltas toward a single unit while a backlog is still queued behind
+    /// the spacing below, and draining hundreds of units one at a time is a
+    /// scroll that visibly refuses to stop. Everything queued clears within
+    /// `DRAIN_TICKS` unless `step` deliberately paces a genuinely long flick.
+    fn drain_rate(&self, pending: i32, finest: i32) -> i32 {
+        let paced = (pending.unsigned_abs().div_ceil(DRAIN_TICKS) as i32).max(finest);
+        self.step.min(paced).max(1)
     }
 
     /// Whether a slice may be injected now.
@@ -72,11 +96,15 @@ impl WheelSmoother {
         self.pending_x = self.pending_x.saturating_add(i32::from(delta_x));
         self.pending_y = self.pending_y.saturating_add(i32::from(delta_y));
         if delta_x != 0 {
-            self.slice_x = self.step.min(i32::from(delta_x).abs());
+            self.finest_x = self.step.min(i32::from(delta_x).abs());
         }
         if delta_y != 0 {
-            self.slice_y = self.step.min(i32::from(delta_y).abs());
+            self.finest_y = self.step.min(i32::from(delta_y).abs());
         }
+        // Fixed here, not per tick: recomputing from the shrinking remainder
+        // every tick is a decay curve, and a decay curve has no last tick.
+        self.rate_x = self.drain_rate(self.pending_x, self.finest_x);
+        self.rate_y = self.drain_rate(self.pending_y, self.finest_y);
     }
 
     /// The next delta to inject, or `None` when the burst has drained or the
@@ -85,8 +113,8 @@ impl WheelSmoother {
         if !self.ready(now) {
             return None;
         }
-        let x = take_axis(&mut self.pending_x, self.slice_x);
-        let y = take_axis(&mut self.pending_y, self.slice_y);
+        let x = take_axis(&mut self.pending_x, self.rate_x);
+        let y = take_axis(&mut self.pending_y, self.rate_y);
         let slice = (x != 0 || y != 0).then_some((x, y));
         if slice.is_some() {
             self.injected_at = Some(now);
@@ -412,6 +440,32 @@ mod worker_tests {
         wide.push(i16::MIN, i16::MAX);
         for (x, y) in drain(&mut wide) {
             assert!(i32::from(x).abs() <= 32767 && i32::from(y).abs() <= 32767);
+        }
+    }
+
+    #[test]
+    fn a_released_gesture_stops_instead_of_trickling_out_its_backlog() {
+        let start = std::time::Instant::now();
+        let mut wheel = super::WheelSmoother::new(120);
+        // A momentum gesture: packets arrive faster than the tick, so spacing
+        // queues them, and their deltas decay toward a single unit the way
+        // macOS momentum does. Taking the rate from the last, smallest packet
+        // is what made a released scroll run on for seconds.
+        for delta in [60, 48, 36, 24, 18, 12, 8, 5, 3, 2, 1, 1] {
+            wheel.push(0, delta);
+            wheel.take(start); // inside the spacing window after the first
+        }
+        assert!(wheel.pending(), "the gesture is queued behind spacing");
+        let mut now = start;
+        let mut ticks = 0;
+        while wheel.pending() {
+            now += super::WHEEL_TICK;
+            wheel.take(now);
+            ticks += 1;
+            assert!(
+                ticks <= super::DRAIN_TICKS,
+                "a released gesture must not outlive itself: still scrolling after {ticks} ticks"
+            );
         }
     }
 
