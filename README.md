@@ -52,6 +52,16 @@ immediately so the scroll still starts without added latency. Lowering
 in applications that accumulate high-resolution deltas; legacy applications that
 only handle whole notches need the default.
 
+Windows transparency effects are suspended while a client is connected and the
+setting is restored on disconnect (`suspend_transparency`, default on). Acrylic
+falls back to a solid colour whenever its surface loses focus, so the taskbar
+alternates between two appearances and the darker one reads as a shadow over a
+remote view; there is no supported way to hold acrylic in its focused state.
+Turning the effect off also stops a blurred backdrop from re-rendering, and
+having to be encoded and sent, whenever anything moves behind it. A host killed
+mid-session leaves the effect off until the next session restores it or the
+setting is changed by hand.
+
 Startup determines the video mode before starting NVENC; PNGs wait for playable
 video. Validated updates replace pixels atomically; quality recovery fades in
 over 100 ms without delaying new mouse input, and a retracted sharp layer fades

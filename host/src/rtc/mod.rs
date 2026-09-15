@@ -800,6 +800,12 @@ async fn supervise_video(
     mut state: watch::Receiver<MediaState>,
     mut tile_mode: watch::Receiver<Option<bool>>,
 ) -> anyhow::Result<()> {
+    // Held for the whole session rather than per stream: the encoder restarts on
+    // a display or viewport change, and toggling the desktop effect on each one
+    // would make it flicker.
+    #[cfg(windows)]
+    let _transparency =
+        crate::desktop_effects::TransparencyGuard::acquire(config.suspend_transparency);
     while wait_until_running(&mut state).await? {
         let mut session_config = (*config).clone();
         session_config.hybrid_video = tokio::time::timeout(
