@@ -67,10 +67,17 @@ try {
     video.dataset.latestInput = "10";
     video.dispatchEvent(new Event("remote-input"));
     if (!canvas.hidden) throw new Error("Local input did not immediately hide refinement");
+    // Hiding is synchronous, but the retired bitmap fades on its own layer
+    // instead of cutting straight to a downscaled video frame.
+    const fade = document.querySelector(".desktop-tiles-fade");
+    if (!fade || fade.hidden || !fade.getAnimations().length)
+      throw new Error("Retracted refinement cut straight to video");
     channel.receive(JSON.stringify({type:"show",id:2,input:"0"}));
     if (!canvas.hidden) throw new Error("Old snapshot covered newer input");
     channel.receive(JSON.stringify({type:"show",id:2,input:"10"}));
     if (canvas.hidden) throw new Error("Validated snapshot stayed hidden");
+    if (!fade.hidden || fade.getAnimations().length)
+      throw new Error("Fade layer outlived the sharp layer returning");
     channel.receive(JSON.stringify({type:"invalidate"}));
     if (!canvas.hidden) throw new Error("Remote change did not invalidate refinement");
     send(3,2,1,[await packet(0,0,2,1,"rgb(44,55,66)")]);
@@ -135,7 +142,8 @@ try {
     channel.receive(JSON.stringify({type:"begin",id:9,width:256,height:128,bytes:100,tiles:2}));
     channel.receive(JSON.stringify({type:"end",id:9}));
     return { unchanged,changed,aligned,mode,resized,scrollRestored,commits,closed:channel.closed,
-      cleaned:!document.querySelector(".desktop-tiles") && !video.dataset.desktopWidth,
+      cleaned:!document.querySelector(".desktop-tiles") && !document.querySelector(".desktop-tiles-fade")
+        && !video.dataset.desktopWidth,
       sent:channel.sent };
   });
   assert.deepEqual(result.unchanged,[17,34,51,255]);

@@ -12,6 +12,10 @@ export interface InputTransport extends EventTarget {
 
 const HEADER_LENGTH = 12;
 const ACK_REQUESTED = 0x01;
+// Mirrors the Host's wheel presentation window. This timer starts when the
+// packet is sent and the Host's when it is injected, so this one always expires
+// first and can never block a sharp frame the Host has already judged valid.
+const WHEEL_PRESENTATION_WINDOW_MS = 220;
 // At most one tiny input message may wait in SCTP. Larger limits make the
 // remote pointer replay stale positions after a transient network stall.
 const FAST_BUFFER_LIMIT = 16;
@@ -377,13 +381,18 @@ export class InputController {
 
   #notifyInput(data: ArrayBufferView<ArrayBuffer>): void {
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    if (view.getUint8(0) === InputType.Keyboard || view.getUint8(0) === InputType.MouseMove) return;
+    const type = view.getUint8(0);
+    if (type === InputType.Keyboard || type === InputType.MouseMove) return;
     const timestamp = view.getBigUint64(4, true);
     this.#video.dataset.latestInput = timestamp.toString();
-    if (view.getUint8(0) === InputType.MouseWheel) {
-      this.#video.dataset.wheelActiveUntil = String(performance.now() + 900);
+    const wheel = type === InputType.MouseWheel;
+    if (wheel) {
+      this.#video.dataset.wheelActiveUntil =
+        String(performance.now() + WHEEL_PRESENTATION_WINDOW_MS);
     }
-    this.#video.dispatchEvent(new Event("remote-input"));
+    // The kind of input decides how the sharp layer is retracted; a moving
+    // scene cannot hold a stale frame over the video for as long as a still one.
+    this.#video.dispatchEvent(new CustomEvent("remote-input", { detail: { wheel } }));
   }
 
   #sendReliable(data: ArrayBufferView<ArrayBuffer>): void {

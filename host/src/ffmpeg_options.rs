@@ -90,9 +90,12 @@ pub fn encoding_args(encoder: &str, bitrate: u32, fps: u16) -> Vec<String> {
     args
 }
 
-/// Bound motion traffic while idle lossless tiles restore exact desktop pixels.
+/// Rate-controlled motion path used while lossless tiles restore exact pixels
+/// after input settles. The ceiling is whatever the caller already resolved
+/// (`HostConfig::interaction_video`); a second, lower limit here silently
+/// capped the interaction stream no matter how the deployment was configured.
 pub fn hybrid_encoding_args(encoder: &str, bitrate: u32, fps: u16) -> Vec<String> {
-    let ceiling = bitrate.min(4_000_000);
+    let ceiling = bitrate.max(1);
     let mut args = encoding_args(encoder, ceiling, fps);
     if encoder == "h264_nvenc" {
         let rc = args.iter().position(|arg| arg == "-rc").unwrap();
@@ -117,15 +120,19 @@ pub fn hybrid_encoding_args(encoder: &str, bitrate: u32, fps: u16) -> Vec<String
 #[cfg(test)]
 mod tests {
     #[test]
-    fn hybrid_nvenc_bounds_motion_without_changing_legacy_quality() {
+    fn hybrid_nvenc_honours_the_caller_ceiling_without_changing_legacy_quality() {
         let legacy = super::encoding_args("h264_nvenc", 20_000_000, 60);
         assert!(legacy.iter().any(|arg| arg == "constqp"));
-        let args = super::hybrid_encoding_args("h264_nvenc", 20_000_000, 60);
+        let args = super::hybrid_encoding_args("h264_nvenc", 6_000_000, 60);
         let value = |key| &args[args.iter().position(|arg| arg == key).unwrap() + 1];
         assert_eq!(value("-rc"), "vbr");
         assert_eq!(value("-cq"), "18");
-        assert_eq!(value("-maxrate"), "4000000");
-        assert_eq!(value("-bufsize"), "133334");
+        assert_eq!(value("-b:v"), "3000000");
+        assert_eq!(value("-maxrate"), "6000000");
+        assert_eq!(value("-bufsize"), "200000");
         assert_eq!(value("-bf"), "0");
+        // No hidden ceiling: a deployment configured for more gets more.
+        let wide = super::hybrid_encoding_args("h264_nvenc", 20_000_000, 60);
+        assert_eq!(wide[wide.iter().position(|arg| arg == "-maxrate").unwrap() + 1], "20000000");
     }
 }

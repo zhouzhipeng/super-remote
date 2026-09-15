@@ -10,9 +10,13 @@ allowed to build an unbounded queue.
 ## Components
 
 Windows clients negotiate `desktop-refinement-v3` alongside continuously running
-H.264 (1280-pixel longest edge, 2 Mbps maximum). Only mouse button/wheel activity
-requests the low-resolution interaction path. Pointer motion and keyboard events
-do not hide, pause, or cancel native-resolution PNG/copy updates.
+H.264. That stream keeps one size for the whole session — mouse input hides the
+sharp layer over it rather than switching resolution — so its size *is* the
+picture during interaction: `interaction_max_edge` (default 1920) and
+`interaction_bitrate` (default 6 Mbps) set it, and both should be tuned to the
+deployed link. Only mouse button/wheel activity requests that path. Pointer
+motion and keyboard events do not hide, pause, or cancel native-resolution
+PNG/copy updates.
 
 Without a mouse-triggered interaction window, automatic scrolling/animation and
 typing retain the last sharp display until each new lossless update arrives.
@@ -20,12 +24,23 @@ Changed tiles no longer expose low-resolution video. Capture is polled at 16 ms;
 there is one refinement in flight and no 300 ms idle-update throttle. This is not
 a guaranteed 60 Hz update rate: PNG cost and transport/ACK RTT still apply.
 Large automatic changes may update less smoothly on a slow link but stay sharp.
-After mouse interaction, refinement resumes after a 250 ms idle window.
+
+Refinement also continues *during* interaction, at a 200 ms cadence measured
+from the end of the previous update and limited to 96 encoded tiles, so the
+delta baseline stays anchored to the live screen instead of freezing at the
+pre-scroll frame. Presentation resumes 200 ms after a button and 220 ms after a
+wheel, gated on evidence rather than on the timer alone: a no-op capture may
+only certify the current input state once the scene has held still for 60 ms.
+The sharp layer is never presented while a scroll is still in progress — it can
+only be a full pipeline round-trip behind, and showing that would trade blur for
+input lag.
 
 Startup determines the video mode before starting NVENC; PNGs wait for playable
 video. Validated updates replace pixels atomically; quality recovery fades in
-over 100 ms without delaying new mouse input. Fallback after refinement-channel
-failure still uses video. Lossless means 8-bit GDI RGB, not HDR preservation.
+over 100 ms without delaying new mouse input, and a retracted sharp layer fades
+out on its own layer (60 ms for a wheel, 120 ms otherwise) so input never waits
+on the transition. Fallback after refinement-channel failure still uses video.
+Lossless means 8-bit GDI RGB, not HDR preservation.
 Deploy the Host and Web together.
 
 Validation: `npm test`, `node web/tests/run-desktop-tiles-e2e.mjs`, and Host tests
