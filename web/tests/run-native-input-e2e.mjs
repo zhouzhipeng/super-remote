@@ -178,6 +178,7 @@ try {
     assert.equal(captures.length, 1, "startup restarted video capture during mode negotiation");
     assert.ok(captures[0].includes("hybrid=true"), "first encoder used the wrong mode");
     result.startupCaptureCount = captures.length;
+    result.firstKeyframe = logs.join("").split("\n").filter(line=>line.includes("initial H.264 keyframe captured"));
     result.tiles = await page.evaluate(() => ({ ...document.querySelector("video").dataset }));
     assert.ok(Number(result.tiles.tileFrame) > 0, "native-resolution refinement never committed");
     assert.ok(Math.max(videoEnd.width, videoEnd.height) <= 1280, "interaction stream is not low resolution");

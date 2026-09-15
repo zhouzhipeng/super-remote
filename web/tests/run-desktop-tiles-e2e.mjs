@@ -100,6 +100,14 @@ try {
     const input = new InputController(video, fast, reliable, () => {}, () => {}, () => {}, () => ({text:""}), () => {});
     const box = video.getBoundingClientRect();
     const point = {clientX:box.x+box.width/2,clientY:box.y+box.height/2,pointerId:1};
+    video.dispatchEvent(new WheelEvent("wheel",{...point,deltaY:120}));
+    if (reliable.sent.length !== 2 || reliable.sent[0][0] !== 1 || reliable.sent[1][0] !== 4)
+      throw new Error("First wheel did not position the remote pointer before scrolling");
+    const pos = new DataView(reliable.sent[0].buffer, reliable.sent[0].byteOffset);
+    if (Math.abs(pos.getUint16(12,true)-32768)>1 || Math.abs(pos.getUint16(14,true)-32768)>1)
+      throw new Error("First wheel coordinates are incorrect");
+    fast.sent.length=0; reliable.sent.length=0;
+    video.dataset.latestInput="10";
     for (const event of [new PointerEvent("pointermove",point), new PointerEvent("pointerdown",point),
       new PointerEvent("pointerup",point),new WheelEvent("wheel",{deltaY:120}),
       new KeyboardEvent("keydown",{code:"KeyA",bubbles:true}),new KeyboardEvent("keyup",{code:"KeyA",bubbles:true})]) {

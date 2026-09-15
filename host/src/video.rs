@@ -165,6 +165,11 @@ async fn stream_ffmpeg(
         "info".to_owned(),
         "-nostdin".to_owned(),
         "-nostats".to_owned(),
+        // The live desktop format/rate are explicit. Do not spend seconds
+        // probing frames before initializing the low-resolution encoder.
+        "-probesize".to_owned(), "32".to_owned(),
+        "-analyzeduration".to_owned(), "0".to_owned(),
+        "-fpsprobesize".to_owned(), "0".to_owned(),
     ];
     if config.ffmpeg_capture_mode == "ddagrab" {
         args.extend([

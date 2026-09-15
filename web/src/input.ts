@@ -179,6 +179,16 @@ export class InputController {
     if (this.#reliable.readyState !== "open") return;
     const delta = this.#wheelDelta.convert(event.deltaX, event.deltaY, event.deltaMode);
     if (delta.x === 0 && delta.y === 0) return;
+    // Wheel can be the first interaction after connection. Send its target
+    // position on the SAME ordered transport so it cannot hit the Host's old
+    // cursor position or race an unreliable pointer packet.
+    const point = this.#normalizedPoint(event.clientX, event.clientY);
+    if (point) {
+      this.#pendingMove.take();
+      const position = packet(InputType.MouseMove, 4);
+      position.setUint16(12, point.x, true); position.setUint16(14, point.y, true);
+      this.#sendReliable(bytes(position));
+    }
     const view = packet(InputType.MouseWheel, 4, ACK_REQUESTED);
     view.setInt16(12, delta.x, true);
     view.setInt16(14, delta.y, true);
@@ -367,7 +377,7 @@ export class InputController {
 
   #notifyInput(data: ArrayBufferView<ArrayBuffer>): void {
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    if (view.getUint8(0) === InputType.Keyboard) return;
+    if (view.getUint8(0) === InputType.Keyboard || view.getUint8(0) === InputType.MouseMove) return;
     const timestamp = view.getBigUint64(4, true);
     this.#video.dataset.latestInput = timestamp.toString();
     if (view.getUint8(0) === InputType.MouseWheel) {
