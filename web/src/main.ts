@@ -1,6 +1,7 @@
 import "./style.css";
 import { accessToken, listDevices, login, logout, setAccessToken } from "./api.ts";
 import { CONNECTION_STEPS, connectionProgressSnapshot } from "./connection-progress.ts";
+import { fullscreenRemembered, rememberFullscreen } from "./fullscreen-preference.ts";
 import { RemoteSession, type ConnectionProgressDetail, type SessionDisconnectDetail } from "./rtc.ts";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
@@ -281,6 +282,10 @@ async function sessionView(deviceId: string): Promise<void> {
   };
   const onFullscreenChange = (): void => {
     updateFullscreenButton();
+    // Remember the choice, including leaving with Escape or the window chrome.
+    // `leaveSession` detaches this listener before its own exit, so returning to
+    // the device list does not overwrite what the user asked for.
+    rememberFullscreen(document.fullscreenElement === remote);
     requestAnimationFrame(() => scheduleResizeReconnect(true));
   };
   document.addEventListener("fullscreenchange", onFullscreenChange);
@@ -289,6 +294,22 @@ async function sessionView(deviceId: string): Promise<void> {
       .catch((error) => { state.textContent = `无法切换全屏：${error instanceof Error ? error.message : String(error)}`; });
   });
   updateFullscreenButton();
+  // Restoring the remembered state has exactly one opportunity: requestFullscreen
+  // needs the activation from the click that opened this view, and every line of
+  // this function up to the connect below runs in that same task. Awaiting the
+  // transition first also lets the Host fit its encoder to the final viewport
+  // instead of renegotiating a quarter second after connecting.
+  const restoreFullscreen = async (): Promise<void> => {
+    if (!fullscreenRemembered() || document.fullscreenElement) return;
+    // A missing API throws synchronously rather than rejecting, so this covers
+    // both that and a browser refusing the request outright.
+    try { await remote.requestFullscreen(); } catch { return; }
+    // The transition already scheduled a forced reconnect through the handler
+    // above. Nothing is connected yet, so drop it and negotiate once.
+    window.clearTimeout(resizeTimer);
+    forceResize = false;
+    connectedArea = physicalVideoArea(video);
+  };
 
   const leaveSession = (): void => {
     if (disposed) return;
@@ -318,6 +339,7 @@ async function sessionView(deviceId: string): Promise<void> {
     void session.setMuted(!video.muted)
       .catch(() => { state.textContent = "浏览器阻止了声音播放，请再点一次"; });
   });
+  await restoreFullscreen();
   try { await session.connect(deviceId); } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     state.textContent = message;
