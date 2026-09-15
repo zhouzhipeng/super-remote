@@ -2,8 +2,11 @@
 .desktop-tiles { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none; z-index: 1; }
 .desktop-tiles[hidden] { display: none; }
 /* Holds the retired sharp bitmap while it fades, so hiding .desktop-tiles stays
-   an instant, synchronous operation instead of a visible quality step. */
-.desktop-tiles-fade { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none; z-index: 2; }
+   an instant, synchronous operation instead of a visible quality step. Shares
+   z-index 1 with .desktop-tiles: both are desktop pixels and must stay under
+   every overlay (2), the toolbar (3) and the clipboard panel (4). The two are
+   never visible at the same time, so they cannot occlude each other. */
+.desktop-tiles-fade { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none; z-index: 1; }
 .desktop-tiles-fade[hidden] { display: none; }
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; }

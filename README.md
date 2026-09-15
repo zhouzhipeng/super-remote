@@ -25,6 +25,13 @@ there is one refinement in flight and no 300 ms idle-update throttle. This is no
 a guaranteed 60 Hz update rate: PNG cost and transport/ACK RTT still apply.
 Large automatic changes may update less smoothly on a slow link but stay sharp.
 
+A scene that keeps outrunning that path is the exception. When three consecutive
+updates are each slow to deliver, large, and already out of date on arrival — a
+playing video, not a keystroke or a window opening — the whole sharp layer is
+retracted and H.264 carries the motion, and refinement backs off to 1 s so it
+stops competing for the link with the stream being watched. Sharpness returns on
+its own once the scene settles.
+
 Refinement also continues *during* interaction, at a 200 ms cadence measured
 from the end of the previous update and limited to 96 encoded tiles, so the
 delta baseline stays anchored to the live screen instead of freezing at the

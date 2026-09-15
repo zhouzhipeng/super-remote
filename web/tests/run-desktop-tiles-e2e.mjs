@@ -72,6 +72,11 @@ try {
     const fade = document.querySelector(".desktop-tiles-fade");
     if (!fade || fade.hidden || !fade.getAnimations().length)
       throw new Error("Retracted refinement cut straight to video");
+    // Both layers are desktop pixels and must share one stacking plane below
+    // every overlay, the toolbar and the corner hint. Raising the fade layer
+    // above .desktop-tiles makes it cover UI for the length of every fade.
+    if (getComputedStyle(fade).zIndex !== getComputedStyle(canvas).zIndex)
+      throw new Error("Fade layer left the desktop-pixel plane and can occlude UI");
     channel.receive(JSON.stringify({type:"show",id:2,input:"0"}));
     if (!canvas.hidden) throw new Error("Old snapshot covered newer input");
     channel.receive(JSON.stringify({type:"show",id:2,input:"10"}));
