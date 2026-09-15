@@ -52,15 +52,18 @@ immediately so the scroll still starts without added latency. Lowering
 in applications that accumulate high-resolution deltas; legacy applications that
 only handle whole notches need the default.
 
-Windows transparency effects are suspended while a client is connected and the
-setting is restored on disconnect (`suspend_transparency`, default on). Acrylic
-falls back to a solid colour whenever its surface loses focus, so the taskbar
-alternates between two appearances and the darker one reads as a shadow over a
-remote view; there is no supported way to hold acrylic in its focused state.
-Turning the effect off also stops a blurred backdrop from re-rendering, and
-having to be encoded and sent, whenever anything moves behind it. A host killed
-mid-session leaves the effect off until the next session restores it or the
-setting is changed by hand.
+Windows desktop effects are suspended while a client is connected and restored
+on disconnect: transparency (`suspend_transparency`) and the rest of what the
+Performance Options dialog calls "adjust for best performance"
+(`suspend_visual_effects`) - menu and tooltip animation, fades, gradient
+captions and window shadows. Both default on. Each of these renders differently
+depending on which window has focus, so the taskbar appears to gain and lose a
+shadow as focus moves, and there is no supported way to hold any of them in
+their focused state. Turning them off also stops each effect from re-rendering,
+and having to be encoded and sent, whenever something moves behind or beneath
+it; RDP disables desktop effects for the same reason. A host killed mid-session
+leaves them off until the next session restores them or they are changed by
+hand.
 
 Startup determines the video mode before starting NVENC; PNGs wait for playable
 video. Validated updates replace pixels atomically; quality recovery fades in

@@ -58,6 +58,13 @@ pub struct HostConfig {
     /// having to be encoded and sent - every time anything moves behind it.
     #[serde(default = "default_suspend_transparency")]
     pub suspend_transparency: bool,
+    /// Suspend the rest of the desktop effects for the same reasons and for the
+    /// same span: menu and tooltip animation, fades, gradient captions, and the
+    /// window shadow an active window casts onto the taskbar. This is what the
+    /// Performance Options dialog calls "adjust for best performance", applied
+    /// through `SystemParametersInfo` so it takes effect without a sign-out.
+    #[serde(default = "default_suspend_visual_effects")]
+    pub suspend_visual_effects: bool,
     #[serde(default)]
     pub monitor_index: usize,
     pub h264_file: Option<PathBuf>,
@@ -295,6 +302,9 @@ const fn default_wheel_step() -> u16 {
 const fn default_suspend_transparency() -> bool {
     true
 }
+const fn default_suspend_visual_effects() -> bool {
+    true
+}
 
 fn default_ffmpeg_encoder() -> String {
     "mf_h264".into()
@@ -325,6 +335,7 @@ mod tests {
             interaction_bitrate: default_interaction_bitrate(),
             wheel_step: default_wheel_step(),
             suspend_transparency: default_suspend_transparency(),
+            suspend_visual_effects: default_suspend_visual_effects(),
             monitor_index: 0,
             h264_file: None,
             ffmpeg_path: None,
