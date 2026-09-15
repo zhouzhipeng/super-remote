@@ -57,6 +57,23 @@ const STABLE_CONFIRM: Duration = Duration::from_millis(60);
 const MOTION_RANGE: isize = 1024;
 /// Below this, spawning encoder threads costs more than it saves.
 const PARALLEL_TILE_THRESHOLD: usize = 8;
+/// A refinement cycle slower than this cannot present motion: it caps the sharp
+/// layer at under 7 updates per second.
+const MOTION_CYCLE: Duration = Duration::from_millis(150);
+/// Consecutive cycles that were slow, large and already out of date on arrival
+/// before the scene counts as animating. One large change followed by a still
+/// screen - a window opening - never reaches this.
+const MOTION_STREAK: u32 = 3;
+/// An update must also re-encode at least this share of the desktop's tiles to
+/// count as motion. A video window is tens of tiles every frame; a keystroke or
+/// a caret is one or two, so typing keeps its sharp incremental updates even
+/// where the link is slow enough to make every cycle exceed `MOTION_CYCLE`.
+const MOTION_TILE_SHARE: usize = 8;
+/// While the scene is animating the sharp layer is not presented, so refinement
+/// only has to keep a baseline ready for when motion stops. Backing off this
+/// far stops full updates from competing for the link with the video stream the
+/// user is actually watching.
+const MOTION_INTERVAL: Duration = Duration::from_millis(1000);
 
 #[derive(Clone, Debug, serde::Serialize)]
 struct CopyRect {
@@ -358,6 +375,11 @@ fn changed_tiles(
     Ok(Some((output, encoded.len(), copies)))
 }
 
+/// Tiles one full refinement of this desktop would carry.
+fn desktop_tiles(desktop: &Desktop) -> usize {
+    desktop.width.div_ceil(TILE) * desktop.height.div_ceil(TILE)
+}
+
 /// Whether the screen still matches the committed baseline. The per-tile
 /// refinement mask is no longer transmitted, so the loop only needs the answer,
 /// not the list - and a whole-buffer comparison stops at the first difference
@@ -425,6 +447,12 @@ pub async fn serve(
     let mut committed_input = None;
     let mut shown = false;
     let mut stable_since: Option<std::time::Instant> = None;
+    // Consecutive updates that were stale before they could be presented, and
+    // the cost and size of the most recent one. Together they decide whether the
+    // scene is changing faster than this path can represent it.
+    let mut behind = 0u32;
+    let mut last_cycle = Duration::ZERO;
+    let mut last_tiles = 0usize;
     let state = || {
         let input = input.lock().unwrap_or_else(|e| e.into_inner());
         (input.activity().0, input.presentation_ready())
@@ -439,7 +467,14 @@ pub async fn serve(
             continue;
         }
         let (watermark, presentable) = state();
-        if !presentable {
+        // Video playback, and any other continuously changing scene, updates
+        // faster than capture -> encode -> transfer -> ACK can deliver. Holding
+        // the sharp layer over it turns smooth playback into a slideshow, and
+        // `can_restore_snapshot` keeps it there because an already-shown layer
+        // is never re-validated. Hand the scene to H.264, which exists for
+        // exactly this, until it settles.
+        let animating = behind >= MOTION_STREAK;
+        if !presentable || animating {
             // The sharp layer cannot claim to be a picture of now, so retract it.
             // Refinement itself continues below: a baseline left frozen for the
             // whole interaction is what turns the first update after a scroll
@@ -451,7 +486,9 @@ pub async fn serve(
             last_mask = None;
             stable_since = None;
         }
-        let interval = if presentable {
+        let interval = if animating {
+            MOTION_INTERVAL
+        } else if presentable {
             IDLE_INTERVAL
         } else {
             INTERACTION_INTERVAL
@@ -459,6 +496,7 @@ pub async fn serve(
         if last_refinement.elapsed() < interval {
             continue;
         }
+        let cycle_started = std::time::Instant::now();
         let reuse = std::mem::take(&mut spare);
         let current = tokio::task::spawn_blocking(move || capture(reuse)).await??;
         let mut unchanged = false;
@@ -466,6 +504,7 @@ pub async fn serve(
             unchanged = unchanged_desktop(baseline, &current);
             let mask = (committed, watermark, Vec::<usize>::new());
             if presentable
+                && !animating
                 && committed_input == Some(watermark)
                 && can_restore_snapshot(shown, baseline, &current)
                 && last_mask.as_ref() != Some(&mask) {
@@ -481,6 +520,11 @@ pub async fn serve(
             }
         }
         if unchanged {
+            // The scene caught up with its baseline, so nothing is outrunning
+            // refinement any more and the sharp layer may be earned back.
+            behind = 0;
+            last_cycle = Duration::ZERO;
+            last_tiles = 0;
             // A single capture can be taken before the application has repainted
             // the input that was just injected, and certifying the baseline from
             // that capture is what allowed a pre-scroll frame to be shown again.
@@ -492,6 +536,12 @@ pub async fn serve(
             }
             spare = current.rgb;
             continue;
+        }
+        // The previous update was already out of date when this capture arrived,
+        // and it was too slow and too large to have been motion this path could
+        // have presented anyway.
+        if last_cycle >= MOTION_CYCLE && last_tiles * MOTION_TILE_SHARE >= desktop_tiles(&current) {
+            behind = behind.saturating_add(1);
         }
         stable_since = None;
         // A first baseline is never optional: without it the browser has no
@@ -564,15 +614,21 @@ pub async fn serve(
             .await?
             .ok_or_else(|| anyhow::anyhow!("desktop channel closed"))??;
         anyhow::ensure!(ack == id, "unexpected refinement ACK");
+        // Capture through browser ACK: what one sharp update actually costs.
+        let cycle = cycle_started.elapsed();
         tracing::info!(
             id,
             bytes = payload.len(),
             tiles = count,
             copied_tiles = copies.len(),
             commit_rtt_ms = started.elapsed().as_millis(),
+            cycle_ms = cycle.as_millis(),
             interacting = !presentable,
+            animating,
             "desktop refinement committed"
         );
+        last_cycle = cycle;
+        last_tiles = count;
         committed = id;
         committed_input = Some(watermark);
         // Re-capture and validate AFTER transfer and ACK. A completed but stale
@@ -621,6 +677,26 @@ mod tests {
         after.rgb[(128 * 256 + 255) * 3] = 42;
         after.width = 128;
         assert!(!unchanged_desktop(&before, &after));
+    }
+
+    #[test]
+    fn motion_is_distinguished_from_typing_and_from_one_off_changes() {
+        // A 1920x1080 desktop carries 15 x 9 = 135 tiles.
+        let desktop = Desktop { width: 1920, height: 1080, rgb: vec![0; 1920 * 1080 * 3] };
+        assert_eq!(desktop_tiles(&desktop), 135);
+        let motion = |cycle: Duration, tiles: usize| {
+            cycle >= MOTION_CYCLE && tiles * MOTION_TILE_SHARE >= desktop_tiles(&desktop)
+        };
+        // A video window re-encoding a quarter of the screen too slowly to present.
+        assert!(motion(Duration::from_millis(300), 34));
+        // A keystroke or caret on a link slow enough to exceed the cycle anyway
+        // must keep its sharp incremental updates.
+        assert!(!motion(Duration::from_millis(300), 2));
+        // A large change this path can still deliver in time is not motion.
+        assert!(!motion(Duration::from_millis(40), 135));
+        // Exactly one eighth qualifies; just under does not.
+        assert!(motion(MOTION_CYCLE, 17));
+        assert!(!motion(MOTION_CYCLE, 16));
     }
 
     #[test]
