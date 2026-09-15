@@ -3,6 +3,17 @@ mod windows_input;
 
 use remote_protocol::input::TimedInputEvent;
 
+/// How long a mouse button suspends *presentation* of the sharp layer. It covers
+/// the asynchronous repaint that follows a click, not the refinement pipeline:
+/// capture and delta commits continue throughout, so the sharp layer is already
+/// current when the window closes.
+const BUTTON_PRESENTATION_WINDOW: std::time::Duration = std::time::Duration::from_millis(200);
+/// The wheel equivalent. This was 900 ms, chosen so a scroll could never re-show
+/// a pre-scroll baseline. Correctness now comes from evidence rather than from
+/// waiting: the refinement worker must observe the scene holding still against
+/// the committed baseline before that baseline may certify the input state.
+const WHEEL_PRESENTATION_WINDOW: std::time::Duration = std::time::Duration::from_millis(220);
+
 /// Shared by every transport in one session. The mutex must cover injection as
 /// well as the watermark: independent channels may run on different threads.
 #[derive(Default)]
@@ -16,9 +27,13 @@ pub struct SessionInput {
 }
 
 impl SessionInput {
-    pub fn refinement_ready(&self) -> bool {
-        self.activity().1 >= std::time::Duration::from_millis(250)
-            && self.wheel_at.is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(900))
+    /// Whether the lossless layer may be shown as a picture of *now*. It does
+    /// not gate capture or transmission; see `desktop_tiles::serve`.
+    pub fn presentation_ready(&self) -> bool {
+        self.activity().1 >= BUTTON_PRESENTATION_WINDOW
+            && self
+                .wheel_at
+                .is_none_or(|at| at.elapsed() >= WHEEL_PRESENTATION_WINDOW)
     }
 
     pub fn activity(&self) -> (u64, std::time::Duration) {
@@ -186,15 +201,19 @@ pub fn spawn_priority(
 mod worker_tests {
     #[test]
     fn scroll_gaps_keep_video_running_without_delaying_typing() {
+        let ago = |ms| Some(std::time::Instant::now() - std::time::Duration::from_millis(ms));
         let mut state = super::SessionInput::default();
-        assert!(state.refinement_ready());
-        state.input_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(500));
+        assert!(state.presentation_ready());
+        // Inside the wheel window the sharp layer stays suppressed even though
+        // the shared button window has already elapsed.
+        state.input_at = ago(210);
         state.wheel_at = state.input_at;
-        assert!(!state.refinement_ready());
-        state.wheel_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(950));
-        assert!(state.refinement_ready());
+        assert!(!state.presentation_ready());
+        state.wheel_at = ago(230);
+        assert!(state.presentation_ready());
+        // Any fresh button/wheel packet reopens the window immediately.
         state.input_at = Some(std::time::Instant::now());
-        assert!(!state.refinement_ready());
+        assert!(!state.presentation_ready());
     }
 
     #[test]

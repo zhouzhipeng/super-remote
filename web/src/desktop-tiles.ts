@@ -35,10 +35,22 @@ export function parseCopies(value: unknown, width: number, height: number): Copy
 type Update = { id: number; width: number; height: number; tiles: number; copies: CopyRect[];
   data: Uint8Array<ArrayBuffer>; offset: number; receivedAt: number };
 
+// Retracting the sharp layer is a hard cut from native pixels to a downscaled
+// video frame, and that step is the most visible part of the whole transition.
+// Handing the last sharp bitmap to a separate layer that fades out keeps
+// `.desktop-tiles` hidden synchronously - the input path depends on that - while
+// removing the step itself. A wheel fades faster than a button: the video
+// underneath is already moving, so a stale sharp frame held over it ghosts.
+const WHEEL_FADE_MS = 60;
+const BUTTON_FADE_MS = 120;
+
 export class DesktopTiles {
   #canvas = document.createElement("canvas");
   #back = document.createElement("canvas");
   #baseline = document.createElement("canvas");
+  #fade = document.createElement("canvas");
+  #fadeTransition: Animation | null = null;
+  #fadeToken = 0;
   #pending: Update | null = null;
   #closed = false;
   #committing = false;
@@ -57,10 +69,14 @@ export class DesktopTiles {
     this.video = video; this.channel = channel; this.ready = ready;
     this.#canvas.className = "desktop-tiles";
     this.#canvas.hidden = true;
-    video.parentElement!.append(this.#canvas);
+    this.#fade.className = "desktop-tiles-fade";
+    this.#fade.hidden = true;
+    video.parentElement!.append(this.#canvas, this.#fade);
     this.#resize = new ResizeObserver(() => {
-      Object.assign(this.#canvas.style, { left: `${video.offsetLeft}px`, top: `${video.offsetTop}px`,
-        width: `${video.offsetWidth}px`, height: `${video.offsetHeight}px` });
+      const box = { left: `${video.offsetLeft}px`, top: `${video.offsetTop}px`,
+        width: `${video.offsetWidth}px`, height: `${video.offsetHeight}px` };
+      Object.assign(this.#canvas.style, box);
+      Object.assign(this.#fade.style, box);
     });
     this.#resize.observe(video);
     video.addEventListener("remote-input", this.#hide);
@@ -70,10 +86,40 @@ export class DesktopTiles {
     channel.addEventListener("message", this.#message);
     channel.addEventListener("close", this.destroy);
   }
-  #hide = (): void => {
+  #hide = (event?: Event): void => {
     this.#qualityTransition?.cancel(); this.#qualityTransition = null;
+    // A zero-sized canvas has no bitmap to hand over and drawImage would throw.
+    if (!this.#canvas.hidden && this.#canvas.width > 0 && this.#canvas.height > 0) {
+      const detail = (event as CustomEvent<{ wheel?: boolean }> | undefined)?.detail;
+      this.#startFade(detail?.wheel ? WHEEL_FADE_MS : BUTTON_FADE_MS);
+    }
     this.#canvas.hidden = true;
     this.video.dataset.displayTransport = "hybrid-video";
+  };
+  #startFade(duration: number): void {
+    const token = ++this.#fadeToken;
+    this.#fadeTransition?.cancel();
+    this.#fadeTransition = null;
+    if (this.#fade.width !== this.#canvas.width || this.#fade.height !== this.#canvas.height) {
+      this.#fade.width = this.#canvas.width; this.#fade.height = this.#canvas.height;
+    }
+    const context = this.#fade.getContext("2d");
+    if (!context) return;
+    context.clearRect(0, 0, this.#fade.width, this.#fade.height);
+    context.drawImage(this.#canvas, 0, 0);
+    this.#fade.hidden = false;
+    const animation = this.#fade.animate([{ opacity: 1 }, { opacity: 0 }],
+      { duration, easing: "ease-out" });
+    this.#fadeTransition = animation;
+    // A superseded fade rejects; only the newest one may retire the layer.
+    void animation.finished.then(() => { if (this.#fadeToken === token) this.#stopFade(); },
+      () => undefined);
+  }
+  #stopFade = (): void => {
+    this.#fadeToken += 1;
+    this.#fadeTransition?.cancel();
+    this.#fadeTransition = null;
+    this.#fade.hidden = true;
   };
   #videoReady = (): void => {
     if (!this.#videoReadySent && this.channel.readyState === "open"
@@ -105,6 +151,9 @@ export class DesktopTiles {
           const hidden: number[] = message.hidden ?? [];
           if (!Array.isArray(hidden) || hidden.length > cols * rows || hidden.some(index =>
             !Number.isInteger(index) || index < 0 || index >= cols * rows)) throw new Error("Invalid refinement mask");
+          // The sharp layer is authoritative again; a fade-out of the previous
+          // one must not keep painting over it.
+          this.#stopFade();
           const resized = this.#canvas.width !== this.#baseline.width || this.#canvas.height !== this.#baseline.height;
           const reveal = this.#canvas.hidden || resized;
           // Resize only when validated pixels can be drawn in this same task.
@@ -221,6 +270,7 @@ export class DesktopTiles {
     if (this.#closed) return;
     this.#closed = true;
     this.#qualityTransition?.cancel(); this.#qualityTransition = null;
+    this.#stopFade();
     this.#pending = null;
     this.#queue.length = 0;
     this.channel.removeEventListener("open", this.#open);
@@ -231,8 +281,9 @@ export class DesktopTiles {
     this.channel.close();
     this.#resize.disconnect();
     this.#canvas.remove();
-    this.#canvas.width = this.#back.width = this.#baseline.width = 0;
-    this.#canvas.height = this.#back.height = this.#baseline.height = 0;
+    this.#fade.remove();
+    this.#canvas.width = this.#back.width = this.#baseline.width = this.#fade.width = 0;
+    this.#canvas.height = this.#back.height = this.#baseline.height = this.#fade.height = 0;
     for (const key of ["desktopWidth", "desktopHeight", "displayTransport", "tileCount", "tileBytes", "tileFrame", "tileCopies", "tileDecodeMs", "tileReceiveToCommitMs"]) delete this.video.dataset[key];
   };
 }

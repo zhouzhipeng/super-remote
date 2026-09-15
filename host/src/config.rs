@@ -29,6 +29,16 @@ pub struct HostConfig {
     pub fps: u16,
     #[serde(default = "default_bitrate")]
     pub bitrate: u32,
+    /// Longest edge of the interaction stream while hybrid refinement is active.
+    /// Native detail is restored by the lossless layer once input settles, so
+    /// this only bounds motion bandwidth - but it is also the entire quality of
+    /// what the user sees *during* input, so an aggressively small value is what
+    /// makes the sharp/blurred transition obvious. Tune to the deployed link.
+    #[serde(default = "default_interaction_max_edge")]
+    pub interaction_max_edge: u32,
+    /// Bitrate ceiling applied together with `interaction_max_edge`.
+    #[serde(default = "default_interaction_bitrate")]
+    pub interaction_bitrate: u32,
     #[serde(default)]
     pub monitor_index: usize,
     pub h264_file: Option<PathBuf>,
@@ -68,12 +78,13 @@ impl HostConfig {
     /// detail after input stops, without reinitializing NVENC on every key.
     pub fn interaction_video(&self) -> Self {
         let mut config = self.clone();
-        let longest = self.width.max(self.height).max(1);
-        if longest > 1280 {
-            config.width = ((u64::from(self.width) * 1280 / u64::from(longest)) as u32 & !1).max(2);
-            config.height = ((u64::from(self.height) * 1280 / u64::from(longest)) as u32 & !1).max(2);
+        let limit = u64::from(self.interaction_max_edge.max(2));
+        let longest = u64::from(self.width.max(self.height).max(1));
+        if longest > limit {
+            config.width = ((u64::from(self.width) * limit / longest) as u32 & !1).max(2);
+            config.height = ((u64::from(self.height) * limit / longest) as u32 & !1).max(2);
         }
-        config.bitrate = config.bitrate.min(2_000_000);
+        config.bitrate = config.bitrate.min(self.interaction_bitrate.max(1));
         config
     }
 
@@ -114,6 +125,12 @@ impl HostConfig {
         }
         if config.width == 0 || config.height == 0 {
             bail!("capture dimensions cannot be zero");
+        }
+        if config.interaction_max_edge < 2 {
+            bail!("interaction_max_edge must be at least 2");
+        }
+        if config.interaction_bitrate == 0 {
+            bail!("interaction_bitrate cannot be zero");
         }
         if let Some(path) = &config.h264_file {
             config.h264_file = Some(path.canonicalize().context("h264_file does not exist")?);
@@ -240,6 +257,14 @@ const fn default_fps() -> u16 {
 const fn default_bitrate() -> u32 {
     8_000_000
 }
+/// 1920 keeps a 2560/4K desktop within one downscale step instead of three, so
+/// the interaction stream stays readable rather than merely recognizable.
+const fn default_interaction_max_edge() -> u32 {
+    1920
+}
+const fn default_interaction_bitrate() -> u32 {
+    6_000_000
+}
 
 fn default_ffmpeg_encoder() -> String {
     "mf_h264".into()
@@ -266,6 +291,8 @@ mod tests {
             height: 1600,
             fps: 60,
             bitrate: 20_000_000,
+            interaction_max_edge: default_interaction_max_edge(),
+            interaction_bitrate: default_interaction_bitrate(),
             monitor_index: 0,
             h264_file: None,
             ffmpeg_path: None,
@@ -284,15 +311,27 @@ mod tests {
     fn interaction_video_caps_pixels_without_changing_capture_or_aspect() {
         let original = config().with_display_size(4000, 2560);
         let low = original.interaction_video();
-        assert_eq!((low.width, low.height, low.bitrate), (1280, 818, 2_000_000));
+        assert_eq!((low.width, low.height, low.bitrate), (1920, 1228, 6_000_000));
         assert_eq!((low.ffmpeg_capture_width, low.ffmpeg_capture_height), (4000, 2560));
         assert_eq!((original.width, original.height), (4000, 2560));
+        // A display already inside the ceiling keeps every pixel it captured.
         let portrait = config().with_display_size(1200, 1920).interaction_video();
-        assert_eq!((portrait.width, portrait.height), (800, 1280));
+        assert_eq!((portrait.width, portrait.height), (1200, 1920));
         let small = config().with_display_size(320, 200).interaction_video();
         assert_eq!((small.width, small.height), (320, 200));
+        // The encoder ceiling must follow the configured interaction bitrate
+        // instead of a second, lower limit hidden inside the argument builder.
         let args = crate::ffmpeg_options::hybrid_encoding_args("h264_nvenc", low.bitrate, low.fps);
-        assert_eq!(args[args.iter().position(|a| a == "-maxrate").unwrap() + 1], "2000000");
+        assert_eq!(args[args.iter().position(|a| a == "-maxrate").unwrap() + 1], "6000000");
+    }
+
+    #[test]
+    fn interaction_ceiling_is_configurable_for_constrained_links() {
+        let mut narrow = config().as_ref().clone();
+        narrow.interaction_max_edge = 1280;
+        narrow.interaction_bitrate = 2_000_000;
+        let low = Arc::new(narrow).with_display_size(4000, 2560).interaction_video();
+        assert_eq!((low.width, low.height, low.bitrate), (1280, 818, 2_000_000));
     }
 
     #[test]

@@ -1,4 +1,11 @@
-//! Idle-only lossless refinements over a continuously running video stream.
+//! Lossless refinements over a continuously running video stream.
+//!
+//! The refinement worker runs continuously, including while the user is
+//! interacting. Only *presentation* of the sharp layer is gated on input
+//! (`SessionInput::presentation_ready`): suspending capture as well used to
+//! leave the delta baseline frozen at the pre-interaction screen, so the first
+//! update after a scroll could not reuse any pixels and degenerated into a
+//! whole-desktop re-encode exactly when the user was waiting for it.
 use bytes::BytesMut;
 use std::{
     sync::{
@@ -12,6 +19,44 @@ use windows::Win32::{Graphics::Gdi::*, UI::WindowsAndMessaging::*};
 
 const TILE: usize = 128;
 const MAX_PIXELS: usize = 8192 * 4320;
+/// Capture cadence while the sharp layer is presentable.
+const IDLE_INTERVAL: Duration = Duration::from_millis(16);
+/// Capture cadence while the user is interacting. Updates keep flowing so the
+/// baseline (and its motion estimate) stays anchored to the live screen, but
+/// rarely enough to leave the interaction video its bandwidth. Measured from
+/// the *end* of the previous refinement, so a slow link throttles itself.
+const INTERACTION_INTERVAL: Duration = Duration::from_millis(200);
+/// PNG tiles encoded and sent in one update while interacting. A scroll is
+/// copy rectangles plus one or two newly exposed bands; a whole-desktop
+/// repaint is an order of magnitude more and waits for the window to close
+/// rather than competing with the video. Checked before encoding, so a
+/// rejected update costs damage detection only.
+const INTERACTION_TILE_LIMIT: usize = 96;
+/// Reliable bytes allowed in flight for one refinement. Refinement shares the
+/// media PeerConnection; input has its own transport, so this bounds only how
+/// much of a superseded update can still be on the wire - and how long queued
+/// refinement can delay video packets behind it. The previous 16 KiB capped
+/// throughput at roughly 16 KiB/RTT, which is what made a post-scroll recovery
+/// take seconds across a relay; this saturates any realistic relay while still
+/// draining in well under a second.
+const INFLIGHT_BYTES: usize = 192 * 1024;
+/// One reliable message. 16 KiB is the interoperable SCTP ceiling.
+const CHUNK: usize = 16 * 1024;
+/// New input abandons an in-flight update only while at least this much is
+/// still unsent. Finishing a nearly complete transfer keeps the baseline warm
+/// for less than it costs to redo it.
+const CANCEL_REMAINDER: usize = 256 * 1024;
+/// A capture taken immediately after injection can still show the pre-input
+/// screen, and presenting that is the "jump back to the old frame" artefact.
+/// Require the scene to hold still against the baseline for this long before
+/// the baseline may certify the current input state.
+const STABLE_CONFIRM: Duration = Duration::from_millis(60);
+/// Vertical motion search range. One skipped or slow capture during a fast
+/// scroll must not push the real offset outside the window and force every
+/// tile to be re-encoded.
+const MOTION_RANGE: isize = 1024;
+/// Below this, spawning encoder threads costs more than it saves.
+const PARALLEL_TILE_THRESHOLD: usize = 8;
 
 #[derive(Clone, Debug, serde::Serialize)]
 struct CopyRect {
@@ -44,7 +89,7 @@ fn scroll_offset(previous: &Desktop, current: &Desktop) -> Option<isize> {
         return None;
     }
     let mut best = (0, 0);
-    for dy in -512isize..=512 {
+    for dy in -MOTION_RANGE..=MOTION_RANGE {
         if dy == 0 {
             continue;
         }
@@ -74,7 +119,9 @@ struct Desktop {
     rgb: Vec<u8>,
 }
 
-fn capture() -> anyhow::Result<Desktop> {
+/// `rgb` is a buffer recycled from a retired `Desktop`. A fresh 3-byte-per-pixel
+/// allocation every tick churns tens of megabytes per second at 4K.
+fn capture(mut rgb: Vec<u8>) -> anyhow::Result<Desktop> {
     unsafe {
         // Tokio's blocking worker can have a different DPI context from main.
         // Capture physical pixels, never a DPI-virtualized desktop bitmap.
@@ -166,9 +213,16 @@ fn capture() -> anyhow::Result<Desktop> {
         GdiFlush().ok()?;
         let bgra =
             std::slice::from_raw_parts(bits.cast::<u8>(), width as usize * height as usize * 4);
-        let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
-        for pixel in bgra.chunks_exact(4) {
-            rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+        // Size the buffer once per resolution; every byte below is overwritten.
+        let needed = width as usize * height as usize * 3;
+        if rgb.len() != needed {
+            rgb.clear();
+            rgb.resize(needed, 0);
+        }
+        for (destination, pixel) in rgb.chunks_exact_mut(3).zip(bgra.chunks_exact(4)) {
+            destination[0] = pixel[2];
+            destination[1] = pixel[1];
+            destination[2] = pixel[0];
         }
         Ok(Desktop {
             width: width as usize,
@@ -178,14 +232,83 @@ fn capture() -> anyhow::Result<Desktop> {
     }
 }
 
+/// One tile's wire record: a 12-byte header followed by its PNG.
+fn encode_tile(
+    current: &Desktop,
+    (x, y, width, height): (usize, usize, usize, usize),
+) -> anyhow::Result<Vec<u8>> {
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    for dy in 0..height {
+        let start = ((y + dy) * current.width + x) * 3;
+        rgb.extend_from_slice(&current.rgb[start..start + width * 3]);
+    }
+    let mut png = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png, width as u32, height as u32);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        encoder.write_header()?.write_image_data(&rgb)?;
+    }
+    let mut record = Vec::with_capacity(12 + png.len());
+    for value in [x, y, width, height] {
+        record.extend_from_slice(&(value as u16).to_le_bytes());
+    }
+    record.extend_from_slice(&(png.len() as u32).to_le_bytes());
+    record.extend_from_slice(&png);
+    Ok(record)
+}
+
+/// PNG compression dominates a large update and every tile is independent, so
+/// a whole-desktop refinement is otherwise one core's serial work while the
+/// browser waits. Source order is preserved; the scoped threads cannot outlive
+/// the borrow of `current`.
+fn encode_tiles(
+    current: &Desktop,
+    pending: &[(usize, usize, usize, usize)],
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    if pending.len() < PARALLEL_TILE_THRESHOLD {
+        return pending.iter().map(|&tile| encode_tile(current, tile)).collect();
+    }
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |value| value.get())
+        .clamp(1, pending.len());
+    let batch = pending.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = pending
+            .chunks(batch)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|&tile| encode_tile(current, tile))
+                        .collect::<anyhow::Result<Vec<_>>>()
+                })
+            })
+            .collect();
+        let mut encoded = Vec::with_capacity(pending.len());
+        for worker in workers {
+            encoded.extend(
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("desktop tile encoder panicked"))??,
+            );
+        }
+        anyhow::Ok(encoded)
+    })
+}
+
+/// Returns `None` when more than `tile_limit` tiles would have to be encoded.
+/// The decision is made from damage detection alone: encoding a whole desktop
+/// only to discard it would cost more than the update it declines.
 fn changed_tiles(
     previous: Option<&Desktop>,
     current: &Desktop,
-) -> anyhow::Result<(Vec<u8>, usize, Vec<CopyRect>)> {
+    tile_limit: usize,
+) -> anyhow::Result<Option<(Vec<u8>, usize, Vec<CopyRect>)>> {
     let previous = previous.filter(|p| p.width == current.width && p.height == current.height);
-    let mut output = Vec::new();
-    let mut count = 0;
     let mut copies = Vec::new();
+    let mut pending = Vec::new();
     let motion = previous.and_then(|p| scroll_offset(p, current));
     for y in (0..current.height).step_by(TILE) {
         for x in (0..current.width).step_by(TILE) {
@@ -221,51 +344,28 @@ fn changed_tiles(
                     continue;
                 }
             }
-            let mut rgb = Vec::with_capacity(width * height * 3);
-            for dy in 0..height {
-                let start = row(dy);
-                rgb.extend_from_slice(&current.rgb[start..start + width * 3]);
-            }
-            let mut png = Vec::new();
-            {
-                let mut encoder = png::Encoder::new(&mut png, width as u32, height as u32);
-                encoder.set_color(png::ColorType::Rgb);
-                encoder.set_depth(png::BitDepth::Eight);
-                encoder.set_compression(png::Compression::Fast);
-                encoder.write_header()?.write_image_data(&rgb)?;
-            }
-            for value in [x, y, width, height] {
-                output.extend_from_slice(&(value as u16).to_le_bytes());
-            }
-            output.extend_from_slice(&(png.len() as u32).to_le_bytes());
-            output.extend(png);
-            count += 1;
+            pending.push((x, y, width, height));
         }
     }
-    Ok((output, count, copies))
+    if pending.len() > tile_limit {
+        return Ok(None);
+    }
+    let encoded = encode_tiles(current, &pending)?;
+    let mut output = Vec::with_capacity(encoded.iter().map(Vec::len).sum());
+    for record in &encoded {
+        output.extend_from_slice(record);
+    }
+    Ok(Some((output, encoded.len(), copies)))
 }
 
-// Tile indices whose old pixels must remain transparent over live video.
-fn invalid_tiles(previous: &Desktop, current: &Desktop) -> Vec<usize> {
-    let cols = previous.width.div_ceil(TILE);
-    let rows = previous.height.div_ceil(TILE);
-    if previous.width != current.width || previous.height != current.height {
-        return (0..cols * rows).collect();
-    }
-    let mut invalid = Vec::new();
-    for index in 0..cols * rows {
-        let x = index % cols * TILE;
-        let y = index / cols * TILE;
-        let width = TILE.min(previous.width - x);
-        let height = TILE.min(previous.height - y);
-        if (0..height).any(|dy| {
-            let start = ((y + dy) * previous.width + x) * 3;
-            previous.rgb[start..start + width * 3] != current.rgb[start..start + width * 3]
-        }) {
-            invalid.push(index);
-        }
-    }
-    invalid
+/// Whether the screen still matches the committed baseline. The per-tile
+/// refinement mask is no longer transmitted, so the loop only needs the answer,
+/// not the list - and a whole-buffer comparison stops at the first difference
+/// instead of scanning every remaining tile.
+fn unchanged_desktop(previous: &Desktop, current: &Desktop) -> bool {
+    previous.width == current.width
+        && previous.height == current.height
+        && previous.rgb == current.rgb
 }
 
 // Crossing from live video back to PNG must not replay an earlier layout.
@@ -316,13 +416,19 @@ pub async fn serve(
         }
     }));
     let mut previous: Option<Desktop> = None;
+    // Retired pixel buffers are handed back here instead of being reallocated.
+    let mut spare: Vec<u8> = Vec::new();
     let mut last_refinement = std::time::Instant::now() - Duration::from_secs(1);
     let mut last_mask: Option<(u32, u64, Vec<usize>)> = None;
     let mut id = 0u32;
     let mut committed = 0u32;
     let mut committed_input = None;
     let mut shown = false;
-    let activity = || input.lock().unwrap_or_else(|e| e.into_inner()).activity();
+    let mut stable_since: Option<std::time::Instant> = None;
+    let state = || {
+        let input = input.lock().unwrap_or_else(|e| e.into_inner());
+        (input.activity().0, input.presentation_ready())
+    };
     loop {
         if retired.load(Ordering::Acquire) {
             return Ok(());
@@ -332,22 +438,35 @@ pub async fn serve(
         if !active.load(Ordering::Acquire) {
             continue;
         }
-        let (watermark, _) = activity();
-        if !input.lock().unwrap_or_else(|e| e.into_inner()).refinement_ready() {
+        let (watermark, presentable) = state();
+        if !presentable {
+            // The sharp layer cannot claim to be a picture of now, so retract it.
+            // Refinement itself continues below: a baseline left frozen for the
+            // whole interaction is what turns the first update after a scroll
+            // into a whole-desktop re-encode.
             if shown {
                 channel.send_text("{\"type\":\"invalidate\"}").await?;
                 shown = false;
             }
             last_mask = None;
-            continue; // Do not capture/encode full RGB desktops during input.
+            stable_since = None;
         }
-        let current = tokio::task::spawn_blocking(capture).await??;
+        let interval = if presentable {
+            IDLE_INTERVAL
+        } else {
+            INTERACTION_INTERVAL
+        };
+        if last_refinement.elapsed() < interval {
+            continue;
+        }
+        let reuse = std::mem::take(&mut spare);
+        let current = tokio::task::spawn_blocking(move || capture(reuse)).await??;
         let mut unchanged = false;
         if let Some(baseline) = &previous {
-            let invalid = invalid_tiles(baseline, &current);
-            unchanged = invalid.is_empty();
+            unchanged = unchanged_desktop(baseline, &current);
             let mask = (committed, watermark, Vec::<usize>::new());
-            if committed_input == Some(watermark)
+            if presentable
+                && committed_input == Some(watermark)
                 && can_restore_snapshot(shown, baseline, &current)
                 && last_mask.as_ref() != Some(&mask) {
                 channel
@@ -362,23 +481,39 @@ pub async fn serve(
             }
         }
         if unchanged {
-            // An unchanged scene can safely reuse its baseline after a mouse event.
-            committed_input = Some(watermark);
+            // A single capture can be taken before the application has repainted
+            // the input that was just injected, and certifying the baseline from
+            // that capture is what allowed a pre-scroll frame to be shown again.
+            // Require the scene to hold still first; a commit certifies its own
+            // watermark below, so this only gates the no-op path.
+            let since = *stable_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= STABLE_CONFIRM {
+                committed_input = Some(watermark);
+            }
+            spare = current.rgb;
             continue;
         }
-        if last_refinement.elapsed() < Duration::from_millis(16) {
-            continue;
-        }
-        let (old, current, payload, count, copies) =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                let (payload, count, copies) = changed_tiles(previous.as_ref(), &current)?;
-                Ok((previous, current, payload, count, copies))
-            })
-            .await??;
+        stable_since = None;
+        // A first baseline is never optional: without it the browser has no
+        // pixels at all, so it is sent whatever the user is doing.
+        let tile_limit = if presentable || previous.is_none() {
+            usize::MAX
+        } else {
+            INTERACTION_TILE_LIMIT
+        };
+        let (old, current, update) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let update = changed_tiles(previous.as_ref(), &current, tile_limit)?;
+            Ok((previous, current, update))
+        })
+        .await??;
         previous = old;
-        if activity().0 != watermark {
+        let Some((payload, count, copies)) = update else {
+            // A whole repaint rather than a scroll delta. Leave the link to the
+            // video stream and retry once the interaction window closes.
+            spare = current.rgb;
+            last_refinement = std::time::Instant::now();
             continue;
-        }
+        };
         id = id
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("desktop sequence exhausted"))?;
@@ -392,20 +527,24 @@ pub async fn serve(
             .await?;
         let started = std::time::Instant::now();
         let completed = tokio::time::timeout(Duration::from_secs(30), async {
-            for chunk in payload.chunks(8 * 1024) {
-                loop {
+            let mut remaining = payload.len();
+            for chunk in payload.chunks(CHUNK) {
+                anyhow::ensure!(!retired.load(Ordering::Acquire), "session retired");
+                // A committed delta is a real historical screen state and
+                // presentation is gated separately, so new input no longer
+                // invalidates it. Only abandon an update whose remaining bytes
+                // would keep competing with the interaction video. Checked once
+                // per chunk: the input mutex is also held by injection on its
+                // high-priority thread and must not be contended in a spin.
+                if remaining > CANCEL_REMAINDER && state().0 != watermark {
+                    return anyhow::Ok(false);
+                }
+                while channel.outstanding_bytes().await? > INFLIGHT_BYTES {
                     anyhow::ensure!(!retired.load(Ordering::Acquire), "session retired");
-                    // Abandon refinement on new input before adding more reliable
-                    // traffic. At most 24 KiB can be ahead of the cancellation.
-                    if activity().0 != watermark {
-                        return anyhow::Ok(false);
-                    }
-                    if channel.outstanding_bytes().await? <= 16 * 1024 {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
                 channel.send(BytesMut::from(chunk)).await?;
+                remaining -= chunk.len();
             }
             anyhow::Ok(true)
         })
@@ -414,6 +553,7 @@ pub async fn serve(
             channel
                 .send_text(&serde_json::json!({"type":"cancel", "id":id}).to_string())
                 .await?;
+            spare = current.rgb;
             last_refinement = std::time::Instant::now();
             continue;
         }
@@ -430,13 +570,16 @@ pub async fn serve(
             tiles = count,
             copied_tiles = copies.len(),
             commit_rtt_ms = started.elapsed().as_millis(),
-            "idle desktop refinement committed"
+            interacting = !presentable,
+            "desktop refinement committed"
         );
         committed = id;
         committed_input = Some(watermark);
-        previous = Some(current);
         // Re-capture and validate AFTER transfer and ACK. A completed but stale
         // snapshot stays hidden; its pixels remain a valid delta baseline.
+        if let Some(retired_baseline) = previous.replace(current) {
+            spare = retired_baseline.rgb;
+        }
         last_mask = None;
         last_refinement = std::time::Instant::now();
     }
@@ -461,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn blinking_tile_does_not_prevent_other_regions_becoming_sharp() {
+    fn a_single_changed_pixel_or_a_resize_retires_the_baseline() {
         let before = Desktop {
             width: 256,
             height: 129,
@@ -472,11 +615,45 @@ mod tests {
             height: 129,
             rgb: before.rgb.clone(),
         };
+        assert!(unchanged_desktop(&before, &after));
         after.rgb[(128 * 256 + 255) * 3] = 43;
-        assert_eq!(invalid_tiles(&before, &after), vec![3]);
-        assert!(invalid_tiles(&before, &before).is_empty());
+        assert!(!unchanged_desktop(&before, &after));
+        after.rgb[(128 * 256 + 255) * 3] = 42;
         after.width = 128;
-        assert_eq!(invalid_tiles(&before, &after), vec![0, 1, 2, 3]);
+        assert!(!unchanged_desktop(&before, &after));
+    }
+
+    #[test]
+    fn parallel_and_serial_tile_encoding_produce_identical_bytes() {
+        let (width, height) = (512usize, 384usize);
+        let mut rgb = Vec::with_capacity(width * height * 3);
+        let mut seed = 99u32;
+        for _ in 0..width * height * 3 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            rgb.push(seed as u8);
+        }
+        let desktop = Desktop { width, height, rgb };
+        let pending: Vec<_> = (0..height)
+            .step_by(TILE)
+            .flat_map(|y| {
+                (0..width)
+                    .step_by(TILE)
+                    .map(move |x| (x, y, TILE.min(width - x), TILE.min(height - y)))
+            })
+            .collect();
+        assert!(pending.len() >= PARALLEL_TILE_THRESHOLD);
+        let parallel = encode_tiles(&desktop, &pending).unwrap();
+        let serial: Vec<_> = pending
+            .iter()
+            .map(|&tile| encode_tile(&desktop, tile).unwrap())
+            .collect();
+        assert_eq!(parallel, serial);
+        // The threshold path must agree on a batch too small to be split.
+        let small = &pending[..PARALLEL_TILE_THRESHOLD - 1];
+        assert_eq!(encode_tiles(&desktop, small).unwrap(), serial[..small.len()]);
+        assert!(encode_tiles(&desktop, &[]).unwrap().is_empty());
     }
 
     #[test]
@@ -497,9 +674,14 @@ mod tests {
             rgb: vec![249; width * height * 3],
         };
         after.rgb[..(height - 37) * width * 3].copy_from_slice(&before.rgb[37 * width * 3..]);
-        let (payload, count, copies) = changed_tiles(Some(&before), &after).unwrap();
+        let (payload, count, copies) = changed_tiles(Some(&before), &after, usize::MAX)
+            .unwrap()
+            .expect("an unlimited update is always produced");
         assert_eq!(copies.len(), 9);
         assert_eq!(count, 3);
+        // Damage detection alone decides an over-limit update; nothing is encoded.
+        assert!(changed_tiles(Some(&before), &after, 2).unwrap().is_none());
+        assert!(changed_tiles(Some(&before), &after, 3).unwrap().is_some());
         let mut actual = before.rgb.clone();
         for copy in copies {
             for row in 0..copy.height {
@@ -532,7 +714,7 @@ mod tests {
             offset += 12 + size;
         }
         assert_eq!(actual, after.rgb);
-        let full = changed_tiles(None, &after).unwrap().0.len();
+        let full = changed_tiles(None, &after, usize::MAX).unwrap().unwrap().0.len();
         assert!(
             payload.len() * 2 < full,
             "scroll damage should materially reduce wire bytes"
@@ -541,7 +723,7 @@ mod tests {
     #[test]
     #[ignore = "captures the current primary desktop; run explicitly for DPI validation"]
     fn capture_uses_physical_desktop_dimensions() {
-        let desktop = capture().unwrap();
+        let desktop = capture(Vec::new()).unwrap();
         unsafe {
             let mut mode = DEVMODEW::default();
             mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
@@ -559,7 +741,12 @@ mod tests {
             height: 129,
             rgb: vec![17; 130 * 129 * 3],
         };
-        assert_eq!(changed_tiles(Some(&before), &before).unwrap().1, 0);
+        let unlimited = |previous, current| {
+            changed_tiles(previous, current, usize::MAX)
+                .unwrap()
+                .expect("an unlimited update is always produced")
+        };
+        assert_eq!(unlimited(Some(&before), &before).1, 0);
         let mut after = Desktop {
             width: 130,
             height: 129,
@@ -567,13 +754,13 @@ mod tests {
         };
         let offset = (128 * 130 + 129) * 3;
         after.rgb[offset..offset + 3].copy_from_slice(&[1, 2, 255]);
-        let (data, count, _) = changed_tiles(Some(&before), &after).unwrap();
+        let (data, count, _) = unlimited(Some(&before), &after);
         assert_eq!(count, 1);
         assert_eq!(&data[..8], &[128, 0, 128, 0, 2, 0, 1, 0]);
         let mut decoder = png::Decoder::new(&data[12..]).read_info().unwrap();
         let mut rgb = vec![0; decoder.output_buffer_size()];
         decoder.next_frame(&mut rgb).unwrap();
         assert_eq!(rgb, [17, 17, 17, 1, 2, 255]);
-        assert_eq!(changed_tiles(None, &after).unwrap().1, 4);
+        assert_eq!(unlimited(None, &after).1, 4);
     }
 }
