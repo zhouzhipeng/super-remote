@@ -536,7 +536,9 @@ pub async fn accept_offer(
     let media_active = Arc::new(AtomicBool::new(false));
     let retired = Arc::new(AtomicBool::new(false));
     let (media_state, media_state_rx) = watch::channel(MediaState::WAITING);
-    let input_state = Arc::new(std::sync::Mutex::new(input::SessionInput::default()));
+    let input_state = Arc::new(std::sync::Mutex::new(input::SessionInput::with_wheel_step(
+        config.wheel_step,
+    )));
     let tile_eligible = config.local_cursor && config.h264_file.is_none() && config.monitor_index == 0;
     let (tile_mode, tile_mode_rx) = watch::channel(if tile_eligible { None } else { Some(false) });
     let handler = Arc::new(Handler {
@@ -702,23 +704,46 @@ pub async fn accept_offer(
     let (input_control, mut input_rx) = mpsc::channel::<Vec<u8>>(128);
     let input_retired = retired.clone();
     let input_active = media_active.clone();
+    // This task outlives every individual input channel, so it also owns paced
+    // wheel injection for the whole session. Wheel packets arrive on the RTC
+    // reliable channel, which is a different task: the wake keeps this one from
+    // polling an idle pointer without letting a queued burst stall.
+    let wheel_wake = input_state.lock().unwrap().wheel_wake();
     input::spawn_priority("remote-input-control".into(), async move {
-        while let Some(data) = input_rx.recv().await {
+        loop {
             if input_retired.load(Ordering::Acquire) {
                 break;
             }
-            if !input_active.load(Ordering::Acquire) {
-                continue;
-            }
-            let result = input_state.lock().unwrap().inject_control(&data);
-            match result {
-                Ok(Some(event)) => {
-                    if event.flags & 1 != 0 {
-                        let _ = outbound.try_send(ClientSignal::InputAck { session_id, data });
+            let pending = input_state.lock().unwrap().wheel_pending();
+            let wheel = async {
+                if pending {
+                    tokio::time::sleep(input::WHEEL_TICK).await;
+                } else {
+                    wheel_wake.notified().await;
+                }
+            };
+            tokio::select! {
+                data = input_rx.recv() => {
+                    let Some(data) = data else { break };
+                    if input_retired.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if !input_active.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let result = input_state.lock().unwrap().inject_control(&data);
+                    match result {
+                        Ok(Some(event)) => {
+                            if event.flags & 1 != 0 {
+                                let _ = outbound.try_send(ClientSignal::InputAck { session_id, data });
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => warn!(%error, "rejected control input packet"),
                     }
                 }
-                Ok(None) => {}
-                Err(error) => warn!(%error, "rejected control input packet"),
+                // A wake with nothing queued costs one lock and returns.
+                () = wheel => input_state.lock().unwrap().drain_wheel(),
             }
         }
         input_state.lock().unwrap().release_all();

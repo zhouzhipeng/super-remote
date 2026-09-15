@@ -39,6 +39,16 @@ pub struct HostConfig {
     /// Bitrate ceiling applied together with `interaction_max_edge`.
     #[serde(default = "default_interaction_bitrate")]
     pub interaction_bitrate: u32,
+    /// Largest wheel delta injected in one event, in Windows wheel units where
+    /// 120 is one notch. A fast flick arrives as a single multi-notch packet and
+    /// lands as one jump; pacing it into steps of this size is what turns it
+    /// back into motion. The default never subdivides a notch, so applications
+    /// that only handle whole notches behave exactly as before. Lowering it
+    /// (40, or 20) glides instead of stepping, but only in applications that
+    /// accumulate high-resolution deltas - browsers and modern apps do, some
+    /// legacy Win32 apps discard anything under one notch and would not scroll.
+    #[serde(default = "default_wheel_step")]
+    pub wheel_step: u16,
     #[serde(default)]
     pub monitor_index: usize,
     pub h264_file: Option<PathBuf>,
@@ -131,6 +141,10 @@ impl HostConfig {
         }
         if config.interaction_bitrate == 0 {
             bail!("interaction_bitrate cannot be zero");
+        }
+        // A slice is carried in the protocol's i16 wheel delta.
+        if !(1..=32767).contains(&config.wheel_step) {
+            bail!("wheel_step must be between 1 and 32767");
         }
         if let Some(path) = &config.h264_file {
             config.h264_file = Some(path.canonicalize().context("h264_file does not exist")?);
@@ -265,6 +279,10 @@ const fn default_interaction_max_edge() -> u32 {
 const fn default_interaction_bitrate() -> u32 {
     6_000_000
 }
+/// One Windows notch: pace multi-notch bursts, never subdivide what arrived.
+const fn default_wheel_step() -> u16 {
+    120
+}
 
 fn default_ffmpeg_encoder() -> String {
     "mf_h264".into()
@@ -293,6 +311,7 @@ mod tests {
             bitrate: 20_000_000,
             interaction_max_edge: default_interaction_max_edge(),
             interaction_bitrate: default_interaction_bitrate(),
+            wheel_step: default_wheel_step(),
             monitor_index: 0,
             h264_file: None,
             ffmpeg_path: None,

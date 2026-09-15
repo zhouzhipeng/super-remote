@@ -14,6 +14,79 @@ const BUTTON_PRESENTATION_WINDOW: std::time::Duration = std::time::Duration::fro
 /// the committed baseline before that baseline may certify the input state.
 const WHEEL_PRESENTATION_WINDOW: std::time::Duration = std::time::Duration::from_millis(220);
 
+/// How often a queued wheel slice is injected. 120 Hz is above any display's
+/// scroll cadence, so pacing is never what the eye sees.
+pub const WHEEL_TICK: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// Spreads a wheel burst over time instead of injecting it as one jump.
+///
+/// A browser coalesces wheel events per frame, so a fast flick reaches the Host
+/// as a single packet carrying several notches at once; Windows applies all of
+/// it in one step. Splitting that back into steps of at most `step` units - and
+/// never finer than the client itself sent, so precision-touchpad input that is
+/// already pixel-accurate passes straight through - is what makes a flick read
+/// as motion. Net displacement is preserved exactly: nothing is invented and
+/// nothing is dropped.
+#[derive(Debug)]
+pub struct WheelSmoother {
+    step: i32,
+    pending_x: i32,
+    pending_y: i32,
+    slice_x: i32,
+    slice_y: i32,
+}
+
+impl Default for WheelSmoother {
+    fn default() -> Self {
+        Self::new(120)
+    }
+}
+
+impl WheelSmoother {
+    pub fn new(step: u16) -> Self {
+        Self {
+            step: i32::from(step).max(1),
+            pending_x: 0,
+            pending_y: 0,
+            slice_x: 0,
+            slice_y: 0,
+        }
+    }
+
+    fn push(&mut self, delta_x: i16, delta_y: i16) {
+        self.pending_x = self.pending_x.saturating_add(i32::from(delta_x));
+        self.pending_y = self.pending_y.saturating_add(i32::from(delta_y));
+        if delta_x != 0 {
+            self.slice_x = self.step.min(i32::from(delta_x).abs());
+        }
+        if delta_y != 0 {
+            self.slice_y = self.step.min(i32::from(delta_y).abs());
+        }
+    }
+
+    /// The next delta to inject, or `None` once the burst has fully drained.
+    fn take(&mut self) -> Option<(i16, i16)> {
+        let x = take_axis(&mut self.pending_x, self.slice_x);
+        let y = take_axis(&mut self.pending_y, self.slice_y);
+        (x != 0 || y != 0).then_some((x, y))
+    }
+
+    fn pending(&self) -> bool {
+        self.pending_x != 0 || self.pending_y != 0
+    }
+}
+
+fn take_axis(pending: &mut i32, slice: i32) -> i16 {
+    if *pending == 0 || slice <= 0 {
+        return 0;
+    }
+    let delta = pending.abs().min(slice) * pending.signum();
+    *pending -= delta;
+    // `slice` is bounded by the configured step, which `HostConfig` keeps inside
+    // i16; the clamp only makes that dependency impossible to break silently.
+    delta.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+}
+
 /// Shared by every transport in one session. The mutex must cover injection as
 /// well as the watermark: independent channels may run on different threads.
 #[derive(Default)]
@@ -24,9 +97,43 @@ pub struct SessionInput {
     wheel_at: Option<std::time::Instant>,
     held: PressedInputs,
     using_control: bool,
+    wheel: WheelSmoother,
+    /// Woken when a burst leaves a remainder, so the session's paced injector
+    /// does not have to poll an idle pointer.
+    wheel_wake: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl SessionInput {
+    pub fn with_wheel_step(step: u16) -> Self {
+        Self {
+            wheel: WheelSmoother::new(step),
+            ..Default::default()
+        }
+    }
+
+    /// Signalled when a wheel burst still has slices to inject.
+    pub fn wheel_wake(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.wheel_wake.clone()
+    }
+
+    pub fn wheel_pending(&self) -> bool {
+        self.wheel.pending()
+    }
+
+    /// Inject the next queued wheel slice. A no-op once the burst has drained,
+    /// so a spurious wake costs one lock and nothing else.
+    pub fn drain_wheel(&mut self) {
+        if let Some((delta_x, delta_y)) = self.wheel.take()
+            && let Err(error) = inject_event(remote_protocol::input::InputEvent::MouseWheel {
+                delta_x,
+                delta_y,
+            })
+        {
+            tracing::warn!(%error, "paced wheel slice was rejected");
+            self.wheel = WheelSmoother::new(self.wheel.step.max(1) as u16);
+        }
+    }
+
     /// Whether the lossless layer may be shown as a picture of *now*. It does
     /// not gate capture or transmission; see `desktop_tiles::serve`.
     pub fn presentation_ready(&self) -> bool {
@@ -101,11 +208,22 @@ impl SessionInput {
     }
 
     fn inject_ordered(&mut self, packet: &[u8]) -> anyhow::Result<Option<TimedInputEvent>> {
+        use remote_protocol::input::InputEvent;
         let event = TimedInputEvent::decode(packet)?;
         if self.is_stale_move(&event) {
             return Ok(None);
         }
-        let event = inject_packet(packet)?;
+        if let InputEvent::MouseWheel { delta_x, delta_y } = event.event {
+            // The first slice goes out on this thread, so a scroll still starts
+            // with no added latency; only the tail of a burst is paced.
+            self.wheel.push(delta_x, delta_y);
+            self.drain_wheel();
+            if self.wheel.pending() {
+                self.wheel_wake.notify_one();
+            }
+        } else {
+            inject_event(event.event)?;
+        }
         self.observe(event);
         Ok(Some(event))
     }
@@ -214,6 +332,59 @@ mod worker_tests {
         // Any fresh button/wheel packet reopens the window immediately.
         state.input_at = Some(std::time::Instant::now());
         assert!(!state.presentation_ready());
+    }
+
+    #[test]
+    fn wheel_bursts_are_paced_without_inventing_or_losing_motion() {
+        let drain = |smoother: &mut super::WheelSmoother| {
+            let mut slices = Vec::new();
+            while let Some(slice) = smoother.take() {
+                slices.push(slice);
+                assert!(slices.len() < 64, "a burst must always drain");
+            }
+            slices
+        };
+        // One notch is injected whole: applications that only understand whole
+        // notches keep behaving exactly as they did.
+        let mut wheel = super::WheelSmoother::new(120);
+        wheel.push(0, 120);
+        assert_eq!(drain(&mut wheel), vec![(0, 120)]);
+        assert!(!wheel.pending());
+
+        // A flick coalesced into one five-notch packet becomes five steps.
+        wheel.push(0, -600);
+        assert_eq!(drain(&mut wheel), vec![(0, -120); 5]);
+
+        // Precision input is never subdivided below what the client sent.
+        wheel.push(0, 6);
+        assert_eq!(drain(&mut wheel), vec![(0, 6)]);
+
+        // A smaller step glides through a single notch instead of stepping it.
+        let mut fine = super::WheelSmoother::new(40);
+        fine.push(0, 120);
+        assert_eq!(drain(&mut fine), vec![(0, 40); 3]);
+        fine.push(0, 6);
+        assert_eq!(drain(&mut fine), vec![(0, 6)]);
+
+        // Net displacement is exact, including a reversal mid-burst and both
+        // axes draining together.
+        let mut mixed = super::WheelSmoother::new(120);
+        mixed.push(240, -360);
+        mixed.push(-120, 120);
+        let total = drain(&mut mixed)
+            .iter()
+            .fold((0i32, 0i32), |sum, slice| {
+                (sum.0 + i32::from(slice.0), sum.1 + i32::from(slice.1))
+            });
+        assert_eq!(total, (120, -240));
+        assert!(!mixed.pending());
+
+        // An extreme delta cannot produce a slice outside the protocol's i16.
+        let mut wide = super::WheelSmoother::new(32767);
+        wide.push(i16::MIN, i16::MAX);
+        for (x, y) in drain(&mut wide) {
+            assert!(i32::from(x).abs() <= 32767 && i32::from(y).abs() <= 32767);
+        }
     }
 
     #[test]
@@ -335,13 +506,20 @@ mod worker_tests {
 
 pub fn inject_packet(packet: &[u8]) -> anyhow::Result<TimedInputEvent> {
     let event = TimedInputEvent::decode(packet)?;
+    inject_event(event.event)?;
+    Ok(event)
+}
+
+pub fn inject_event(event: remote_protocol::input::InputEvent) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
-        windows_input::inject(event.event)?;
-        Ok(event)
+        windows_input::inject(event)
     }
     #[cfg(not(windows))]
-    anyhow::bail!("input injection is only supported on Windows")
+    {
+        let _ = event;
+        anyhow::bail!("input injection is only supported on Windows")
+    }
 }
 
 pub fn paste_text(text: &str) -> anyhow::Result<()> {

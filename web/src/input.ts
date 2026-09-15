@@ -50,6 +50,11 @@ export class InputController {
   #pendingMove = new LatestPointer();
   #lastRawPoint: { x: number; y: number; id: number } | null = null;
   #moveSequence = 0;
+  #wheelSequence = 0;
+  // The pointer position last sent on the ordered transport for a wheel. Any
+  // pointer motion clears it, so it only ever suppresses a repeat of a position
+  // the Host already has and nothing else could have moved since.
+  #lastWheelPoint: { x: number; y: number } | null = null;
   #wheelDelta = new WheelDelta();
   #pressed = new Set<string>();
   #clipboardShortcuts = new ClipboardShortcutRouter();
@@ -155,6 +160,9 @@ export class InputController {
   #sendFastMove(move: { x: number; y: number }): void {
     if (this.#fast.readyState !== "open") return;
     if (!this.#pendingMove.offer(move, this.#fast.bufferedAmount < FAST_BUFFER_LIMIT)) return;
+    // The unreliable path now owns the remote cursor; a later wheel must state
+    // its own position again rather than trust a packet that may have been lost.
+    this.#lastWheelPoint = null;
     this.#moveSequence += 1;
     const flags = this.#moveSequence % 16 === 0 ? ACK_REQUESTED : 0;
     const view = packet(InputType.MouseMove, 4, flags);
@@ -165,6 +173,7 @@ export class InputController {
 
   #pointerButton = (event: PointerEvent): void => {
     this.#pendingMove.take(); // click packet carries its own authoritative position
+    this.#lastWheelPoint = null;
     event.preventDefault();
     this.#video.focus();
     const point = this.#normalizedPoint(event.clientX, event.clientY);
@@ -185,15 +194,23 @@ export class InputController {
     if (delta.x === 0 && delta.y === 0) return;
     // Wheel can be the first interaction after connection. Send its target
     // position on the SAME ordered transport so it cannot hit the Host's old
-    // cursor position or race an unreliable pointer packet.
+    // cursor position or race an unreliable pointer packet. A continuing scroll
+    // repeats one position, and re-stating it every frame only doubles the
+    // ordered traffic a relay has to deliver in order - a queue this scroll is
+    // itself waiting behind.
     const point = this.#normalizedPoint(event.clientX, event.clientY);
-    if (point) {
+    if (point && (point.x !== this.#lastWheelPoint?.x || point.y !== this.#lastWheelPoint?.y)) {
       this.#pendingMove.take();
       const position = packet(InputType.MouseMove, 4);
       position.setUint16(12, point.x, true); position.setUint16(14, point.y, true);
       this.#sendReliable(bytes(position));
+      this.#lastWheelPoint = point;
     }
-    const view = packet(InputType.MouseWheel, 4, ACK_REQUESTED);
+    // Sample the latency echo the way pointer motion does. A continuous scroll
+    // is the highest-rate ordered traffic there is; an echo per event doubles it
+    // to report a number that has not meaningfully changed.
+    this.#wheelSequence += 1;
+    const view = packet(InputType.MouseWheel, 4, this.#wheelSequence % 8 === 0 ? ACK_REQUESTED : 0);
     view.setInt16(12, delta.x, true);
     view.setInt16(14, delta.y, true);
     this.#sendReliable(bytes(view));

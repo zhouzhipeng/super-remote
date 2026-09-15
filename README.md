@@ -42,6 +42,16 @@ The sharp layer is never presented while a scroll is still in progress — it ca
 only be a full pipeline round-trip behind, and showing that would trade blur for
 input lag.
 
+Wheel input is passed to `SendInput` unquantized, so a precision touchpad's
+sub-notch deltas reach Windows intact. A browser coalesces wheel events per
+frame, so a fast flick arrives as one multi-notch packet; the Host paces that
+back out in steps of at most `wheel_step` units (120 — one notch — by default)
+every 8 ms, never finer than the client sent, injecting the first step
+immediately so the scroll still starts without added latency. Lowering
+`wheel_step` to 40 or 20 glides through a notch instead of stepping it, but only
+in applications that accumulate high-resolution deltas; legacy applications that
+only handle whole notches need the default.
+
 Startup determines the video mode before starting NVENC; PNGs wait for playable
 video. Validated updates replace pixels atomically; quality recovery fades in
 over 100 ms without delaying new mouse input, and a retracted sharp layer fades
