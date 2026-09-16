@@ -6,7 +6,18 @@ export type ClipboardPasteRoute = "browser" | "host";
  * clipboard data channel after this page loses focus.
  */
 export class ClipboardShortcutRouter {
-  #preferHostForNextPaste = false;
+  /**
+   * Set by a copy inside the remote session and held until focus leaves the
+   * page, not consumed by the first paste that follows it.
+   *
+   * Copying once and pasting several times is ordinary, and the browser route
+   * does not merely read the wrong clipboard - it pushes the browser's contents
+   * to the Host, overwriting what was just copied there. The browser's own copy
+   * of the Host clipboard cannot be trusted to stand in for it either: it is
+   * read synchronously while the Ctrl+C keystroke is still being delivered, so
+   * it often holds whatever the Host had *before* the copy.
+   */
+  #preferHost = false;
   #activePaste: ClipboardPasteRoute | null = null;
 
   get pasteActive(): boolean {
@@ -14,14 +25,11 @@ export class ClipboardShortcutRouter {
   }
 
   markRemoteCopy(): void {
-    this.#preferHostForNextPaste = true;
+    this.#preferHost = true;
   }
 
   beginPaste(): ClipboardPasteRoute {
-    if (!this.#activePaste) {
-      this.#activePaste = this.#preferHostForNextPaste ? "host" : "browser";
-      this.#preferHostForNextPaste = false;
-    }
+    this.#activePaste ??= this.#preferHost ? "host" : "browser";
     return this.#activePaste;
   }
 
@@ -31,8 +39,9 @@ export class ClipboardShortcutRouter {
     return route;
   }
 
+  /** Focus left the page, so another application may have copied since. */
   reset(): void {
-    this.#preferHostForNextPaste = false;
+    this.#preferHost = false;
     this.#activePaste = null;
   }
 }
