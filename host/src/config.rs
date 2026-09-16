@@ -49,19 +49,6 @@ pub struct HostConfig {
     /// legacy Win32 apps discard anything under one notch and would not scroll.
     #[serde(default = "default_wheel_step")]
     pub wheel_step: u16,
-    /// Suspend Windows transparency effects while a client is connected, and
-    /// restore the setting on disconnect. Acrylic falls back to a solid colour
-    /// whenever its surface loses focus, so the taskbar alternates between two
-    /// appearances as focus moves.
-    #[serde(default = "default_suspend_transparency")]
-    pub suspend_transparency: bool,
-    /// Suspend "show shadows under windows" for the same span. An active window
-    /// casts a deeper shadow than an inactive one, and a window sitting near the
-    /// bottom of the screen casts it onto the taskbar. Selecting the custom
-    /// visual effects mode is part of this: an individual effect is overridden
-    /// under "let Windows choose".
-    #[serde(default = "default_suspend_window_shadows")]
-    pub suspend_window_shadows: bool,
     #[serde(default)]
     pub monitor_index: usize,
     pub h264_file: Option<PathBuf>,
@@ -296,12 +283,6 @@ const fn default_interaction_bitrate() -> u32 {
 const fn default_wheel_step() -> u16 {
     120
 }
-const fn default_suspend_transparency() -> bool {
-    true
-}
-const fn default_suspend_window_shadows() -> bool {
-    true
-}
 
 fn default_ffmpeg_encoder() -> String {
     "mf_h264".into()
@@ -331,8 +312,6 @@ mod tests {
             interaction_max_edge: default_interaction_max_edge(),
             interaction_bitrate: default_interaction_bitrate(),
             wheel_step: default_wheel_step(),
-            suspend_transparency: default_suspend_transparency(),
-            suspend_window_shadows: default_suspend_window_shadows(),
             monitor_index: 0,
             h264_file: None,
             ffmpeg_path: None,

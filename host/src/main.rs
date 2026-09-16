@@ -11,8 +11,6 @@ mod cursor;
 mod display_power;
 mod ffmpeg_options;
 #[cfg(windows)]
-mod desktop_effects;
-#[cfg(windows)]
 mod desktop_tiles;
 mod input;
 mod rtc;

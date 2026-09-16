@@ -52,17 +52,6 @@ immediately so the scroll still starts without added latency. Lowering
 in applications that accumulate high-resolution deltas; legacy applications that
 only handle whole notches need the default.
 
-Transparency and "show shadows under windows" are suspended while a client is
-connected and restored on disconnect (`suspend_transparency`,
-`suspend_window_shadows`, both default on). Acrylic falls back to a solid colour
-when its surface is not focused, and an active window casts a deeper shadow than
-an inactive one - onto the taskbar, when it sits near the bottom of the screen -
-so the taskbar alternates between two appearances as focus moves, and neither
-effect can be held in its focused state. Suspending the shadow also selects the
-custom visual effects mode, because an individual effect is overridden under
-"let Windows choose". A host killed mid-session leaves both off until the next
-session restores them or they are changed by hand.
-
 Startup determines the video mode before starting NVENC; PNGs wait for playable
 video. Validated updates replace pixels atomically; quality recovery fades in
 over 100 ms without delaying new mouse input, and a retracted sharp layer fades
